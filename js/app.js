@@ -1,0 +1,11229 @@
+/* ============================================================
+   RONALD PRIV — App Privada · app.js
+   Fase 2 · Módulo 1: Shell PWA + Login (documento + PIN) + Home por rol.
+   Misma arquitectura y patrón que la app pública (SEP-GROUP):
+   helpers api()/go()/$, gate de Instalar, auto-versión, PWA nativa.
+   Backend: RONALD CORE (mismo /exec), namespace priv.*
+   ============================================================ */
+
+/* URL del Web App del backend RONALD CORE (/exec) — el MISMO de la pública */
+/* Marca de la campaña: todo esto vive en marca.js, que se carga antes
+   que este archivo. Al replicar NO se toca nada de aquí. */
+const API_URL    = MARCA.API_URL;
+const APP_ICON   = MARCA.APP_ICON;
+const APP_BANNER = MARCA.APP_BANNER;
+
+/* ---------- Utilidades ---------- */
+const $ = (sel, root = document) => root.querySelector(sel);
+const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
+const app = $('#app');
+const layer = $('#layer');
+const h = (html) => { const t = document.createElement('template'); t.innerHTML = html.trim(); return t.content.firstElementChild; };
+
+/* ============================================================
+   VISOR DE IMAGEN CON ZOOM                            (Fase 9.2)
+   ------------------------------------------------------------
+   Portado TAL CUAL de la app pública (allí vive desde la Fase 1) para que
+   las dos apps se comporten igual: pinch en móvil, rueda y doble clic en PC,
+   arrastrar cuando está ampliada. El CSS (.imgzoom*) ya estaba en este
+   style.css desde el Módulo 9 — se había copiado y nunca se usó.
+   Cierra al tocar el fondo (e.target === ov): mismo patrón que arregló el
+   modal del video de la pública en esta misma fase.
+   ============================================================ */
+function zoomImagen(src) {
+  if (!src) return;
+  const ov = h(`<div class="imgzoom"><button class="imgzoom-close" aria-label="Cerrar">${I.x}</button><img src="${esc(src)}" alt="" draggable="false"/></div>`);
+  layer.appendChild(ov);
+  requestAnimationFrame(() => ov.classList.add('show'));
+  const img = ov.querySelector('img');
+  let scale = 1, tx = 0, ty = 0, startX = 0, startY = 0, dragging = false, lastDist = 0;
+  const apply = () => { img.style.transform = `translate(${tx}px,${ty}px) scale(${scale})`; };
+  const close = () => { document.removeEventListener('keydown', onEsc); ov.classList.remove('show'); setTimeout(() => ov.remove(), 250); };
+  const onEsc = e => { if (e.key === 'Escape') close(); };
+  document.addEventListener('keydown', onEsc);
+  ov.querySelector('.imgzoom-close').onclick = close;
+  ov.onclick = e => { if (e.target === ov) close(); };
+  img.ondblclick = () => { scale = scale > 1 ? 1 : 2.5; if (scale === 1) { tx = 0; ty = 0; } apply(); };
+  ov.onwheel = e => { e.preventDefault(); scale = Math.min(5, Math.max(1, scale + (e.deltaY < 0 ? 0.2 : -0.2))); if (scale === 1) { tx = 0; ty = 0; } apply(); };
+  img.onpointerdown = e => { if (scale === 1) return; dragging = true; startX = e.clientX - tx; startY = e.clientY - ty; try { img.setPointerCapture(e.pointerId); } catch {} };
+  img.onpointermove = e => { if (!dragging) return; tx = e.clientX - startX; ty = e.clientY - startY; apply(); };
+  img.onpointerup = () => { dragging = false; };
+  ov.ontouchmove = e => {
+    if (e.touches.length === 2) {
+      e.preventDefault();
+      const d = Math.hypot(e.touches[0].clientX - e.touches[1].clientX, e.touches[0].clientY - e.touches[1].clientY);
+      if (lastDist) { scale = Math.min(5, Math.max(1, scale + (d - lastDist) / 200)); if (scale === 1) { tx = 0; ty = 0; } apply(); }
+      lastDist = d;
+    }
+  };
+  ov.ontouchend = () => { lastDist = 0; };
+}
+const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
+const primerNombre = (n) => String(n || '').trim().split(/\s+/)[0] || '';
+const iniciales = (n) => { const p = String(n || '').trim().split(/\s+/); return ((p[0]||' ')[0] + (p[1]||'')[0] || '').toUpperCase() || 'JP'; };
+const val = id => (($('#' + id) || {}).value || '').trim();
+const onlyDig = s => String(s || '').replace(/\D/g, '');
+
+/* 10/11/2026 · red de seguridad: un texto crudo de red ("Failed to fetch", "Sin conexión…")
+   que llegue a un toast se traduce al aviso claro de falla-red.js */
+function toast(msg, kind = '') { if (kind === 'err' && window.FALLA && (FALLA.RAW_RED.test(String(msg)) || /^(Tiempo de espera agotado|Respuesta de Google no v[aá]lida|Respuesta no v[aá]lida del servidor)$/.test(String(msg)))) msg = FALLA.txt(); const t = h(`<div class="toast ${kind}">${esc(msg)}</div>`); layer.appendChild(t); setTimeout(() => t.remove(), Math.max(3200, String(msg).length * 55)); }
+
+/* ---------- Cliente API ---------- */
+let _apiActivas = 0;
+function loaderOn() { _apiActivas++; const b = document.getElementById('ios-loader'); if (b) b.classList.add('active'); }
+function loaderOff() { _apiActivas = Math.max(0, _apiActivas - 1); if (_apiActivas === 0) { const b = document.getElementById('ios-loader'); if (b) b.classList.remove('active'); } }
+/* opts.silent = true → NO enciende el loader de iOS. Es lo que permite el
+   refresco EN VIVO "en silencio": sin carga, sin spinner, sin loader.
+   Toda llamada normal sigue igual (silent llega undefined). */
+/* ---------- HUELLA DE ESTE NAVEGADOR (01/09/2026) ----------
+   Un identificador corto, aleatorio y anónimo que viaja en CADA llamada
+   (parámetro `dev`). NO dice quién eres: el CORE lo sella en el rev del EN
+   VIVO para que el dispositivo que acaba de guardar no se cierre a sí mismo
+   la hoja con el aviso "Se actualizó desde otro dispositivo". Ver
+   vivoCerrarHoja(). Vive en sessionStorage: una pestaña = un dev; si se
+   pierde, lo peor que pasa es volver al comportamiento de antes. */
+const VIVO_DEV = (() => {
+  const nuevo = () => 'd' + Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
+  try {
+    const k = nsKey('vivoDev');
+    let v = sessionStorage.getItem(k);
+    if (!v) { v = nuevo(); sessionStorage.setItem(k, v); }
+    return v;
+  } catch (e) { return nuevo(); }
+})();
+
+/* 12/10/2026 · Fase 1: el viaje lo hace red.js (pieza común del ecosistema):
+   token de sesión tomado al despachar, rid en escrituras, corte al cambiar de
+   vista, cola de fondo, reintento seguro y versión del backend. Aquí solo se
+   decide el loader y qué hacer con la respuesta.
+   Una lectura cortada (la vista se fue) devuelve una promesa que nunca se
+   resuelve: el código de la vista vieja simplemente no sigue. */
+async function api(action, params = {}, method = 'GET', body = null, opts = {}) {
+  if (API_URL.startsWith('PEGA_AQUI')) { toast('Falta configurar la URL del backend', 'err'); throw new Error('API_URL sin configurar'); }
+  const callado = !!opts.silent;
+  /* 08/11/2026 · sin conexión: lo que escribe se avisa al instante (no espera 60 s) */
+  /* 10/11/2026 · SIN SEÑAL (sin-red-vistas.js): las lecturas de vista salen de
+     la copia guardada en este equipo; las escrituras de la lista quedan como
+     pendientes por subir (rid fijo); lo demás se avisa al instante. */
+  const lectura = RED.esLectura(action);
+  const yoDoc = (getActive() || {}).documento || '';
+  const conCopia = lectura && (!callado || opts.ya) && window.SRV && SRV.copiaAplica(action);
+  const deCopia = async () => { const c = await SRV.copiaTomar(yoDoc, action, params); return c ? SRV.desdeCopia(c) : null; };
+  if (window.SINRED && !SINRED.enLinea() && !opts.forzar) {
+    if (conCopia) { const d = await deCopia(); if (d != null) return d; }
+    if (action === 'priv.contactoBuscar' && window.SRV) { const r = await SRV.buscarLocal(yoDoc, params.q); if (r) return r; }
+    if (!lectura && window.SRV && SRV.pendAplica(action) && !opts.sinPend) {
+      const it = SRV.pendAgregar(yoDoc, action, params, method, body);
+      if (it) { const pe = new Error(''); pe.pendiente = true; pe.red = true; pe.que = SRV.pendQue(action); pe.message = FALLA.txt(pe); if (window.FALLA) FALLA.anotar(pe, action); throw pe; }
+    }
+    const e = new Error('Sin conexión: esto necesita señal'); e.red = true; if (window.FALLA) FALLA.anotar(e, action); throw e;
+  }
+  if (!callado) loaderOn();
+  let json;
+  try {
+    json = await RED.pedir(API_URL, action, Object.assign({ dev: VIVO_DEV }, params),
+      { metodo: method, cuerpo: method === 'POST' ? (body || {}) : null, fondo: callado && lectura && !opts.ya, rid: opts.rid });   /* 09/11 · opts.ya: silenciosa pero sin cola (la intención de tocar Detalles) · 10/11 · rid fijo de un pendiente */
+  } catch (e) {
+    if (!callado) loaderOff();
+    if (e && e.cortado) return new Promise(() => {});
+    if (window.SINRED) SINRED.fallo(e);
+    /* La red se cayó a mitad (el teléfono aún no lo sabía): copia si la hay */
+    if (conCopia && e && (e.red || e.tiempo)) { const d = await deCopia(); if (d != null) return d; }
+    if (window.FALLA) FALLA.anotar(e, action);   /* 10/11/2026 · el aviso dice QUÉ no se pudo (falla-red.js) */
+    throw e;
+  }
+  if (!callado) loaderOff();
+  if (!json.ok) {
+    if (json.error === 'SESION_VENCIDA') { sesionVencida(); return new Promise(() => {}); }
+    const se = new Error(json.error || 'Error del servidor'); se.servidor = true;
+    if (window.FALLA) FALLA.anotar(se, action);
+    throw se;
+  }
+  /* 10/11/2026 · copia en este equipo de lo que pinta una vista (para verla sin señal) */
+  if (lectura && window.SRV && SRV.copiaAplica(action)) SRV.copiaGuardar(yoDoc, action, params, json.data, json.v);
+  /* 13/10/2026 · Fase 2: listado compacto (fmt=2) y comprimido (gz=1). Se
+     abre aquí, una vez, y la vista recibe los objetos de siempre. La forma
+     compacta se guarda aparte (no enumerable) para la caché de sesión. */
+  if (json.data && json.data.fmt === 2) {
+    const crudo = json.data;
+    const abierto = await RAP.abrir(crudo);
+    if (abierto && typeof abierto === 'object') { try { Object.defineProperty(abierto, '__rapCrudo', { value: crudo, enumerable: false }); } catch (e) {} }
+    return abierto;
+  }
+  return json.data;
+}
+
+/* ============================================================
+   CARGA ÚNICA POR SESIÓN (13/10/2026 · Fase 2 · patrón BD Predial)
+   ------------------------------------------------------------
+   rapCargar(accion, params, pintar):
+     · Si la lista ya se trajo en esta sesión (memoria o sessionStorage) se
+       pinta AL INSTANTE desde ahí. Luego se mira /meta en Firebase (una sola
+       lectura de todos los canales): si ningún canal cambió después de la
+       hora con que se armó la lista, NO hay viaje. Si cambió, se trae de
+       fondo y en silencio, y solo se repinta si de verdad es distinta.
+     · Si no hay nada guardado, va al servidor en primer plano (esqueleto).
+   pintar(data, desdeCache) debe poder correr dos veces (caché y fresco)
+   sin perder filtros ni búsqueda: lee los controles del DOM.
+   ============================================================ */
+let _rapMetaProm = null, _rapMetaT = 0;
+function rapMeta() {
+  if (_rapMetaProm && Date.now() - _rapMetaT < 3000) return _rapMetaProm;   // una lectura de /meta sirve 3 s
+  _rapMetaT = Date.now();
+  /* 08/11/2026 · el tope de 4 s cubre TODO (antes no cubría la carga del SDK
+     de Firebase: si se quedaba colgada, la vista esperaba para siempre y el
+     escudo dejaba el botón tocado —p. ej. Detalles— sin responder). */
+  _rapMetaProm = Promise.race([loadFirebase().then(fb => {
+    (fb.apps && fb.apps.length) ? fb.app() : fb.initializeApp(VOTO_FBCFG);
+    return fb.database().ref('meta').once('value').then(s => {
+      const v = s.val() || {}, o = {};
+      Object.keys(v).forEach(k => { if (/_rev$/.test(k)) o[k.replace(/_rev$/, '')] = v[k]; });
+      return o;
+    });
+  }), new Promise((_, no) => setTimeout(() => no(new Error('meta tarde')), 4000))]);
+  _rapMetaProm.catch(() => { _rapMetaProm = null; });
+  return _rapMetaProm;
+}
+RAP.lectorMeta(rapMeta);
+
+/* Tras una escritura que ya se aplicó en pantalla: la caché de sesión toma la
+   lista nueva (aunque sea otro arreglo) y se borra la copia local. */
+function rapSync(clave, items) {
+  const c = RAP.tomar(clave);
+  if (c && c.data) c.data.items = items;
+  RAP.tocar(clave);
+}
+
+function rapFirma(d) { try { return JSON.stringify(d); } catch (e) { return String(Math.random()); } }
+
+/* Rutas que, con un CORE todavía sin desplegar, se arman con las de antes
+   (front y backend se suben en cualquier orden). */
+const RAP_TRAER = {
+  'priv.analisis': async (p, op) => {
+    try { return await api('priv.analisis', p, 'GET', null, op); }
+    catch (e) {
+      if (!/no reconocida/i.test(String(e && e.message))) throw e;
+      const uno = a => api(a, { caller: p.caller }, 'GET', null, op).catch(x => ({ ok: false, msg: String(x && x.message || x) }));
+      const [serv, ideas, com, res] = await Promise.all(['priv.anServicios', 'priv.anIdeas', 'priv.anComercios', 'priv.anResenas'].map(uno));
+      return { ok: true, serv, ideas, com, res };
+    }
+  }
+};
+function rapTraer(accion, p, op) { return RAP_TRAER[accion] ? RAP_TRAER[accion](p, op) : api(accion, p, 'GET', null, op); }
+
+async function rapCargar(accion, params, pintar, clave, op) {   /* op: opciones de api para la 1.ª carga (11/11: SILENCIO cuando la vista ya pinta esqueleto) */
+  RAP.setUsuario((getActive() || {}).documento || '');
+  const k = clave || accion;
+  const p = Object.assign({}, params, RAP.params());
+  const c = RAP.tomar(k) || await RAP.revivir(k);
+  if (c) {
+    pintar(c.data, true);
+    const v = await RAP.vencida(k);
+    if (v === false) return c.data;
+    try {
+      const d = await rapTraer(accion, p, SILENCIO);
+      if (!d || d.ok === false) return c.data;
+      const cambio = rapFirma(d) !== rapFirma(c.data);
+      RAP.guardar(k, d, d.__rapCrudo || d);
+      if (cambio) pintar(d, false);
+      return d;
+    } catch (e) { return c.data; }
+  }
+  const d = await rapTraer(accion, p, op || {});
+  if (d && d.ok !== false && !d.__copia) RAP.guardar(k, d, d.__rapCrudo || d);   /* 10/11 · la copia del equipo no pasa por fresca */
+  pintar(d, false);
+  return d;
+}
+/* Sesión firmada vencida o inválida: se borra el token y se pide el PIN otra
+   vez (una sola vez, aunque lleguen varias respuestas juntas). */
+let _sesionVencidaAviso = false;
+function sesionVencida() {
+  const s = getActive();
+  if (s) { delete s.tk; saveSession(s); }
+  localStorage.removeItem(ACT_KEY);
+  if (!_sesionVencidaAviso) { _sesionVencidaAviso = true; toast('Tu sesión venció. Ingresa tu PIN de nuevo.', 'err'); setTimeout(() => { _sesionVencidaAviso = false; }, 4000); }
+  go('login');
+}
+
+/* ---------- Sesiones privadas en el dispositivo ----------
+   Guardamos hasta 6 usuarios del panel (documento/nombre/rol/correo).
+   El PIN NO se guarda: se pide en cada equipo nuevo. "Recordar" solo
+   conserva la lista para reingresar rápido eligiendo la cuenta. */
+const SS_KEY = nsKey('jpriv_sessions'), ACT_KEY = nsKey('jpriv_active');
+const getSessions = () => { try { return JSON.parse(localStorage.getItem(SS_KEY)) || []; } catch { return []; } };
+function saveSession(u) { const list = getSessions().filter(x => x.documento !== u.documento); list.unshift(u); localStorage.setItem(SS_KEY, JSON.stringify(list.slice(0, 6))); localStorage.setItem(ACT_KEY, u.documento); }
+const getActive = () => { const d = localStorage.getItem(ACT_KEY); return getSessions().find(x => x.documento === d) || null; };
+/* red.js toma el token de aquí AL DESPACHAR cada llamada (12/10/2026) */
+RED.sesion(() => { const u = getActive(); return u ? { tk: u.tk || '', id: u.documento } : null; });
+const setActive = (doc) => localStorage.setItem(ACT_KEY, doc);
+function forgetSession(doc) { const list = getSessions().filter(x => x.documento !== doc); localStorage.setItem(SS_KEY, JSON.stringify(list)); if (localStorage.getItem(ACT_KEY) === doc) localStorage.removeItem(ACT_KEY); }
+/* 08/11/2026 · con pendientes sin subir se avisa y se borran (celular compartido): pendientes.js */
+function logout() { if (window.PEND && PEND.logout) return PEND.logout(); logoutDirecto(); }
+function logoutDirecto() { try { if (window.SRV) SRV.salir(); } catch (e) {} localStorage.removeItem(ACT_KEY); try { RAP.olvidar(); } catch (e) {} go('login'); }
+
+/* ============================================================
+   PWA: INSTALACIÓN  (patrón SEP-GROUP, idéntico a la pública)
+   ============================================================ */
+let deferredPrompt = null;
+const isStandalone = () => window.matchMedia('(display-mode: standalone)').matches || window.matchMedia('(display-mode: installed)').matches || window.navigator.standalone === true;
+const isIOS = () => /(iphone|ipad|ipod)/i.test(navigator.userAgent || '');
+const esMovil = () => /android|iphone|ipad|ipod|mobile/i.test(navigator.userAgent || '');
+const isMarkedInstalled = () => { try { return localStorage.getItem(nsKey('pwaInstalledFlagPriv')) === '1'; } catch { return false; } };
+const markInstalled = () => { try { localStorage.setItem(nsKey('pwaInstalledFlagPriv'), '1'); } catch {} };
+async function detectInstalled() {
+  if (isStandalone()) return true;
+  if (typeof navigator.getInstalledRelatedApps === 'function') { try { const a = await navigator.getInstalledRelatedApps(); if (a.some(x => x.platform === 'webapp')) { markInstalled(); return true; } } catch {} }
+  return isMarkedInstalled();
+}
+window.addEventListener('beforeinstallprompt', (e) => { e.preventDefault(); deferredPrompt = e; if (location.hash === '#/instalar') updateInstallSection(); });
+window.addEventListener('appinstalled', () => { justInstalled = true; markInstalled(); deferredPrompt = null; toast('¡App instalada!', 'ok'); updateInstallSection(false); });
+
+/* 23/07/2026 · AVISO DE INSTALACION (3 casos, pliego del usuario)
+   1) No hay opcion de instalar (iPhone, o la app ya esta instalada):
+      iPhone  -> "busca la opcion Compartir y posteriormente Agregar al inicio"
+      PC/Andr -> "busca la App en el escritorio de tu dispositivo"
+      Se muestra SOLO la linea del dispositivo detectado.
+   2) Recien instalada en PC      -> "Actualiza esta vista Ctrl + R"
+   3) Recien instalada en Android -> "buscala en el escritorio de tu movil"
+   "Recien instalada" solo es detectable en la MISMA sesion, via el evento
+   appinstalled; tras recargar no hay senal fiable y se cae al caso 1, que es
+   exactamente lo pedido. */
+let justInstalled = false;
+const isAndroid = () => /android/i.test(navigator.userAgent || '');
+
+function avisoInstalarTxt() {
+  if (justInstalled && !isIOS()) {
+    return isAndroid()
+      ? 'La App se instaló en tu dispositivo, búscala en el escritorio de tu móvil.'
+      : 'La App se instaló en tu dispositivo, Actualiza esta vista Ctrl + R';
+  }
+  return isIOS()
+    ? 'Si estás desde iPhone, busca la opción Compartir y posteriormente Agregar al inicio'
+    : 'Si estás desde PC o Android, busca la App en el escritorio de tu dispositivo';
+}
+
+function updateInstallSection(esperar) {
+  const box = $('#install-aviso'), tx = $('#install-aviso-txt'), b = $('#btn-install');
+  if (!box || !tx) return;
+  const puedeInstalar = !!deferredPrompt && !justInstalled;
+  if (b) b.style.display = puedeInstalar ? '' : 'none';
+  if (puedeInstalar) { box.classList.add('hidden'); return; }
+  /* Chrome puede tardar unos ms en disparar beforeinstallprompt: no anunciamos
+     "no hay instalacion" antes de tiempo o el aviso parpadea. */
+  if (esperar && !isIOS() && !justInstalled) {
+    box.classList.add('hidden');
+    setTimeout(() => { if (location.hash === '#/instalar') updateInstallSection(false); }, 1200);
+    return;
+  }
+  tx.textContent = avisoInstalarTxt();
+  box.classList.remove('hidden');
+}
+
+/* ============================================================
+   VERSIÓN + AUTO-UPDATE  (lee version.js por texto — SEP-GROUP)
+   ============================================================ */
+let APP_VERSION_LOADED = '', __verInFlight = false;
+function paintVersion(v) { $$('.app-version-line').forEach(el => el.textContent = 'Versión ' + v); }
+/* 12/10/2026 · ENTRADA INSTANTÁNEA — la app abre desde la caché de su versión
+   y version.js se revisa en paralelo. Si cambió: se le avisa al service worker
+   (cambia de caché) y se hace UNA sola recarga (candado por versión en la
+   sesión, así nunca queda en bucle). Sin SW activo, se limpian las cachés. */
+async function recargarVersion(v) {
+  try { const k = nsKey('jp_recarga_' + v); if (sessionStorage.getItem(k)) return; sessionStorage.setItem(k, '1'); } catch (e) {}
+  try {
+    const c = navigator.serviceWorker && navigator.serviceWorker.controller;
+    if (c) await new Promise(res => { const ch = new MessageChannel(); ch.port1.onmessage = () => res(); c.postMessage({ tipo: 'version', v: v }, [ch.port2]); setTimeout(res, 1500); });
+    else { const ks = await caches.keys(); await Promise.all(ks.filter(nsCacheMia).map(k => caches.delete(k))); }
+  } catch (e) {}
+  location.reload();
+}
+async function checkVersion() {
+  if (__verInFlight) return; __verInFlight = true;
+  try {
+    const r = await fetch('./js/version.js?t=' + Date.now(), { cache: 'no-store' });
+    if (!r.ok) return;
+    const raw = await r.text();
+    const m = raw.match(/version['"]?\s*[:=]\s*['"]([^'"]+)['"]/i) || raw.match(/(\d{4}\.\d{2}\.\d{2}\.\d+|\d+\.\d+(?:\.\d+)?)/);
+    const v = m ? String(m[1]).trim() : '';
+    if (!v) return;
+    if (!APP_VERSION_LOADED) { APP_VERSION_LOADED = v; paintVersion(v); return; }
+    if (v !== APP_VERSION_LOADED) return recargarVersion(v);
+  } catch (e) { /* 10/11/2026 · sin señal: se revisa en la próxima vuelta */ } finally { __verInFlight = false; }
+}
+document.addEventListener('visibilitychange', () => { if (!document.hidden) checkVersion(); });
+
+/* ---------- Filtros de entrada ---------- */
+function onlyDigits(input) { if (input) input.addEventListener('input', () => { input.value = input.value.replace(/\D/g, ''); }); }
+
+/* ---------- Constructores de campos ---------- */
+function loadingBox(text) { return `<div class="loadbox"><span class="spinner spinner-brand"></span><span class="small muted">${esc(text || 'Cargando…')}</span></div>`; }
+function backbar(title) { return `<div class="appbar"><button class="icon-btn" id="backbtn">${I.back}</button><div class="who"><b>${esc(title)}</b><span>${esc(MV.candidato)} · Privada</span></div></div>`; }
+function field(label, inner) { return `<label class="field"><span>${esc(label)}</span>${inner}</label>`; }
+function inputEl(id, attrs = '') { return `<input class="input" id="${id}" autocomplete="off" ${attrs} />`; }
+function footBrand() { return `<img class="brand-banner" src="${APP_BANNER}" alt="" onerror="this.style.display='none'" /><p class="app-version-line">Versión —</p>`; }
+
+/* 17/07/2026 · El botón "Instalar la app" del login SE QUITÓ (lo pidió el
+   usuario): para eso está la vista Instalar, que es la primera pantalla.
+   Quedó también sin efecto su escucha de clic, así que se fue con él.
+   OJO: si alguien ya eligió "Continuar en el navegador" en esta sesión, la
+   única forma de volver a ver Instalar es abrir la app en una pestaña nueva
+   (el gate vuelve a salir en cada sesión nueva). */
+
+/* Confirmación (hoja inferior) */
+function crow(label, v) { return `<div class="crow"><span>${esc(label)}</span><b>${esc(v || '—')}</b></div>`; }
+function confirmar(title, rowsHtml) {
+  return new Promise(resolve => {
+    openSheet(`<div class="grip"></div><h2 class="h2" style="margin-bottom:10px;">${esc(title)}</h2><div class="confirm-list">${rowsHtml}</div><div class="stack" style="margin-top:18px;"><button class="btn btn-primary btn-block" data-yes>Confirmar</button><button class="btn btn-quiet btn-block" data-no>Cancelar</button></div>`);
+    layer.querySelector('[data-yes]').onclick = () => { closeLayer(); resolve(true); };
+    layer.querySelector('[data-no]').onclick = () => { closeLayer(); resolve(false); };
+  });
+}
+function saving(btn, on) { if (!btn) return; btn.disabled = on; btn.dataset.txt = btn.dataset.txt || btn.innerHTML; const azul = !btn.classList.contains('btn-primary'); btn.innerHTML = on ? `<span class="spinner${azul ? ' spinner-brand' : ''}"></span>` : btn.dataset.txt; }
+
+/* ---------- Íconos ---------- */
+const I = {
+  book:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6.5A2.5 2.5 0 0 0 4 21.5Z"/><path d="M19 19v3H6.5"/><path d="M8 7h7M8 11h5"/></svg>',
+  back:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5"/><path d="M12 19l-7-7 7-7"/></svg>',
+  logout:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="M16 17l5-5-5-5"/><path d="M21 12H9"/></svg>',
+  swap:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3 21 7l-4 4"/><path d="M21 7H9"/><path d="M7 21 3 17l4-4"/><path d="M3 17h12"/></svg>',
+  x:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>',
+  reload:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>',
+  eyeOn:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>',
+  eyeOff:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.7 5.1A10.6 10.6 0 0 1 12 5c6.5 0 10 7 10 7a13.2 13.2 0 0 1-2.2 3.1M6.6 6.6A13.3 13.3 0 0 0 2 12s3.5 7 10 7a10 10 0 0 0 5.4-1.6"/><path d="M9.9 9.9a3 3 0 0 0 4.2 4.2"/><path d="m2 2 20 20"/></svg>',
+  lock:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>',
+  db:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14a9 3 0 0 0 18 0V5"/><path d="M3 12a9 3 0 0 0 18 0"/></svg>',
+  star:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 15 8.5 22 9.3 17 14 18.2 21 12 17.5 5.8 21 7 14 2 9.3 9 8.5 12 2"/></svg>',
+  cal:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></svg>',
+  cal2:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/><path d="M8 14h.01M12 14h.01M16 14h.01M8 18h.01M12 18h.01"/></svg>',
+  check:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>',
+  bell:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/></svg>',
+  trend:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 17l6-6 4 4 8-8"/><path d="M15 7h6v6"/></svg>',
+  chart:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><rect x="7" y="12" width="3" height="6"/><rect x="12" y="8" width="3" height="10"/><rect x="17" y="4" width="3" height="14"/></svg>',
+  gear:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z"/></svg>',
+  bot:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="8" width="16" height="12" rx="3"/><path d="M12 8V4M8 4h8"/><circle cx="9" cy="14" r="1"/><circle cx="15" cy="14" r="1"/><path d="M2 13v3M22 13v3"/></svg>',
+  vote:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 12l2 2 4-4"/><rect x="3" y="4" width="18" height="14" rx="2"/><path d="M3 20h18"/></svg>',
+  download:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="M7 10l5 5 5-5"/><path d="M5 21h14"/></svg>',
+  upload:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 21V9"/><path d="M7 14l5-5 5 5"/><path d="M5 3h14"/></svg>',
+  sliders:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6"/></svg>',
+  pdf:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/><path d="M9 15h6M9 18h4"/></svg>',
+  wa:'<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12.04 2C6.58 2 2.13 6.45 2.13 11.91c0 1.75.46 3.45 1.32 4.95L2 22l5.25-1.38a9.9 9.9 0 0 0 4.79 1.22h.01c5.46 0 9.91-4.45 9.91-9.91 0-2.65-1.03-5.14-2.9-7.01A9.82 9.82 0 0 0 12.04 2Zm0 1.82c2.16 0 4.19.84 5.72 2.37a8.06 8.06 0 0 1 2.37 5.72c0 4.46-3.63 8.09-8.09 8.09a8.1 8.1 0 0 1-4.13-1.13l-.3-.18-3.12.82.83-3.04-.19-.31a8.05 8.05 0 0 1-1.26-4.35c0-4.46 3.63-8.09 8.09-8.09Zm-4.6 4.34c-.19 0-.5.07-.76.34-.26.28-1 .98-1 2.38 0 1.4 1.02 2.76 1.16 2.95.14.19 2 3.06 4.85 4.29.68.29 1.2.47 1.62.6.68.22 1.3.19 1.79.11.55-.08 1.68-.69 1.92-1.35.24-.66.24-1.23.17-1.35-.07-.11-.26-.19-.55-.33-.29-.14-1.68-.83-1.94-.92-.26-.1-.45-.14-.64.14-.19.28-.73.92-.9 1.11-.16.19-.33.21-.62.07-.29-.14-1.21-.45-2.3-1.42-.85-.76-1.42-1.69-1.59-1.97-.16-.28-.02-.44.12-.58.13-.13.29-.33.43-.5.14-.16.19-.28.29-.47.09-.19.05-.36-.03-.5-.07-.14-.63-1.55-.88-2.11-.23-.55-.46-.48-.63-.48-.16 0-.35-.02-.54-.02Z"/></svg>',
+  phone:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.8 19.8 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.8 19.8 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.13.96.36 1.9.7 2.81a2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.9.34 1.85.57 2.81.7A2 2 0 0 1 22 16.92Z"/></svg>',
+  pencil:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>',
+  dots:'<svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="19" cy="12" r="2"/></svg>',
+  copy:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>',
+  trash:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m2 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M10 11v6M14 11v6"/></svg>',
+  clock:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>',
+  pin:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 10c0 6-9 12-9 12s-9-6-9-12a9 9 0 0 1 18 0Z"/><circle cx="12" cy="10" r="3"/></svg>',
+  chevL:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"/></svg>',
+  chevR:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18l6-6-6-6"/></svg>',
+  users:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>',
+  plus:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg>',
+  form:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="3" width="14" height="18" rx="2"/><path d="M9 3v2h6V3"/><path d="M9 10h6M9 14h6M9 18h3"/></svg>',
+  repeat:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 2l4 4-4 4"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><path d="M7 22l-4-4 4-4"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></svg>'
+};
+
+/* ---------- Menú de la privada ----------
+   `ready` marca los módulos ya construidos (se van activando build a build).
+   `roles` restringe la visibilidad. */
+const MENU = [
+  { id:'bd',            icon:'db',    title:'Base de Datos',        desc:'Nuestros registros', wide:true },
+  { id:'lideres',       icon:'star',  title:'Líderes',              desc:'Coordinadores y referidos' },
+  { id:'eventos',       icon:'cal',   title:'Eventos',              desc:'Reuniones generales' },
+  { id:'agenda',        icon:'cal2',  title:'Agenda',               desc:'Calendario de reuniones' },
+  { id:'compromisos',   icon:'check', title:'Compromisos',          desc:'Seguimiento y estados' },
+  { id:'formularios',   icon:'form',  title:'Formularios',          desc:'Inscripciones y jornadas' },   /* 07/11/2026 */
+  { id:'notificaciones',icon:'bell',  title:'Notificaciones',       desc:'Publica en "Ponte al día"' },
+  { id:'analisis',      icon:'chart', title:'Análisis de Procesos', desc:'Servicios · Ideas · Comercio' },
+  { id:'config',        icon:'gear',  title:'Configuración',        desc:'Ajustes de todo el sistema' },
+  { id:'mibot',         icon:'bot',   title:'Mi Bot',               desc:'Tu asistente de WhatsApp' }
+];
+/* Módulos ya construidos (se activan build a build) */
+const READY = new Set(['bd', 'lideres', 'eventos', 'agenda', 'compromisos', 'formularios', 'notificaciones', 'analisis', 'config', 'mibot']);
+/* 06/08/2026 · INVITADO: ve solo los módulos cuya pastilla "Ver" tenga
+   marcada. Configuración y Mi Bot no están en su catálogo, así que nunca le
+   salen. permOk() responde que sí a todo para los demás roles.
+   27/08/2026 · el rol SEDE se retiró: lo reemplazó INVITADO. Ya no hay rama
+   para él; si alguna fila vieja quedara con ese rol vería el menú completo,
+   pero en la hoja USUARIOS no hay ninguna y desde Configuración ya no se
+   puede crear. */
+function menuParaRol(rol) {
+  const r = String(rol).toUpperCase();
+  if (r === 'INVITADO') return MENU.filter(m => permRuta(m.id));
+  return MENU.slice();
+}
+
+/* ============================================================
+   RÚTER
+   ============================================================ */
+function go(route) { location.hash = '#/' + route; }
+window.addEventListener('hashchange', render);
+function render() {
+  RED.nuevaVista();   /* 12/10/2026 · corta las lecturas de la vista que se va (salvo las que la nueva herede) */
+  if (window.__votoTeardown) { try { window.__votoTeardown(); } catch (e) {} window.__votoTeardown = null; }
+  /* EN VIVO: cada vista enciende su canal al montar; aquí se apaga el de la
+     vista que se deja. Va aparte de __votoTeardown a propósito: ese gancho ya
+     lo usan Votación y Mi Bot para sus propios sondeos y no se toca. */
+  vivoTeardown();
+  const route = (location.hash.replace(/^#\//, '') || '').split('?')[0];
+  const user = getActive();
+  appWide(false); // ancho normal por defecto; las vistas de grid lo reactivan
+  /* 23/07/2026 · Si la app YA corre instalada (ventana standalone), la vista
+     Instalar no tiene sentido y ademas dejaba la ventana muerta: Chrome abre la
+     PWA en la misma URL desde la que se instalo, y si esa URL traia #/instalar,
+     Ctrl+R la mantenia ahi para siempre. Se limpia el hash SIN dejar rastro en el
+     historial (replaceState no dispara hashchange, por eso se repinta a mano). */
+  if (route === 'instalar' && isStandalone()) { history.replaceState(null, '', location.pathname + location.search + '#/'); return render(); }
+  if (route === 'instalar') return viewInstalar();
+  if (!user && route !== 'login') return go('login');
+  if (route === 'login' || !user) return viewLogin();
+  /* 06/08/2026 · rol INVITADO. permSet deja listas sus pastillas y enciende
+     el vigía que esconde lo que no puede tocar (permisos.js). permRuta cierra
+     las rutas escritas a mano en la barra de direcciones: si no tiene la
+     pastilla "Ver" de esa vista, se le manda a la primera que sí pueda, y si
+     no puede a ninguna, al Inicio. Esto es solo la cara: el CORE vuelve a
+     comprobar cada llamada. */
+  permSet(user);
+  if (!permRuta(route)) {
+    const alt = permPrimeraRuta();
+    toast('No tienes permiso para esa vista', 'err');
+    return alt && alt !== route ? go(alt) : viewHome(user);
+  }
+  switch (route) {
+    case 'bd': return viewBaseDatos(user);
+    case 'lideres': return viewLideres(user);
+    case 'lidtablero':   /* 13/11/2026 · js/lid-tablero.js (si aún no cargó, se espera al DOM) */
+      if (window.viewLidTablero) return viewLidTablero(user);
+      if (document.readyState === 'loading') return document.addEventListener('DOMContentLoaded', render, { once: true });
+      return go('lideres');
+    case 'dashboard': return viewDashboard(user);
+    case 'simulador': return viewSimulador(user);
+    case 'votacion': return viewVotacion(user);
+    case 'eventos': return viewEventos(user);
+    case 'agenda': return viewAgenda(user);
+    case 'compromisos': return viewCompromisos(user);
+    case 'solicitudes': return viewSolicitudes(user);
+    case 'formularios': return viewFormularios(user);   /* 07/11/2026 · js/formularios.js */
+    case 'notificaciones': return viewNotificaciones(user);
+    case 'analisis': return viewAnalisis(user);
+    case 'config': return viewConfig(user);
+    case 'mibot': return viewMiBot(user);
+    default: return viewHome(user);
+  }
+}
+
+/* ============================================================
+   EN VIVO — refresco EN SILENCIO (17/07/2026)
+   ------------------------------------------------------------
+   CÓMO FUNCIONA
+     Cada vista, al terminar de montarse, llama vivoBind(canal, caller, load).
+     A partir de ahí:
+       · Se escucha /meta/<canal>_rev en Firebase → aviso instantáneo.
+       · Y en paralelo se pregunta por priv.rev cada 12 s (respaldo). Ese
+         endpoint solo devuelve sellos de tiempo, así que un dispositivo
+         quieto no gasta prácticamente nada.
+     Cuando el rev sube, se llama load(rev) y esa función recarga POR EL
+     ENDPOINT NORMAL (la hoja sigue siendo la única fuente de verdad).
+
+   POR QUÉ LAS DOS VÍAS
+     Si las reglas del Realtime Database no dejan leer sin autenticar, el
+     listener falla y no pasa nada: queda el sondeo de 12 s. Con reglas
+     abiertas, el sondeo casi nunca encuentra nada porque la señal llega
+     antes. Las dos están construidas a propósito.
+
+   EN SILENCIO, DE VERDAD
+     Todas las llamadas de este motor van con {silent:true}: sin loader, sin
+     spinner, sin loadingBox. El usuario no ve "cargando" nunca.
+
+   GUARDAS
+     · Con la app en segundo plano (document.hidden) no se recarga: se anota
+       y se hace al volver.
+     · No se solapan dos recargas (VIVO.corriendo).
+     · Debounce de 400 ms: diez cambios seguidos = una sola recarga.
+     · Se compara la firma de los datos y solo se repinta si cambió DE VERDAD.
+
+   REGLA PEDIDA POR EL USUARIO (a propósito, distinta de SEP-GROUP)
+     Si entra una actualización mientras alguien tiene una tarjeta ABIERTA
+     editando, la hoja SE CIERRA porque se actualiza. Quien estaba
+     escribiendo pierde lo tecleado. SEP-GROUP espera a que cierre el modal;
+     aquí NO: así lo pidió. Por eso se avisa con un toast al cerrar: si no,
+     la hoja desaparecería sin explicación.
+   ============================================================ */
+const VIVO_POLL_MS = 12000;     // igual que SEP-GROUP
+const VIVO_DEBOUNCE = 400;
+const SILENCIO = { silent: true };
+
+let VIVO = { canal: '', caller: '', load: null, firma: '', poll: null, ref: null, onVal: null,
+             t: null, ts: 0, base: false, corriendo: false, pend: null };
+
+function vivoTeardown() {
+  if (VIVO.poll) { clearInterval(VIVO.poll); VIVO.poll = null; }
+  if (VIVO.ref && VIVO.onVal) { try { VIVO.ref.off('value', VIVO.onVal); } catch (e) {} }
+  if (VIVO.t) { clearTimeout(VIVO.t); VIVO.t = null; }
+  if (VIVO.t0) { clearTimeout(VIVO.t0); VIVO.t0 = null; }
+  VIVO.fbOk = false;
+  VIVO.ref = null; VIVO.onVal = null; VIVO.canal = ''; VIVO.load = null;
+  VIVO.firma = ''; VIVO.ts = 0; VIVO.base = false; VIVO.corriendo = false; VIVO.pend = null;
+}
+
+/* La llama cada vista al final de su montaje */
+function vivoBind(canal, caller, load) {
+  vivoTeardown();
+  VIVO.canal = canal; VIVO.caller = caller; VIVO.load = load;
+  /* 12/10/2026 · Fase 1: con Firebase conectado NO hay reloj ni priv.rev
+     inicial (antes salían siempre: un viaje de ~3 s extra por vista y uno
+     cada 12 s). El sondeo queda SOLO como respaldo: si Firebase no entrega
+     su primer valor en 6 s, o sus reglas lo niegan. */
+  vivoEscuchar();
+  const canalAhora = canal;
+  VIVO.t0 = setTimeout(() => { if (VIVO.canal === canalAhora && !VIVO.fbOk) vivoRespaldo(); }, 6000);
+}
+function vivoRespaldo() {
+  if (VIVO.poll || !VIVO.canal) return;
+  vivoSondear(true);
+  VIVO.poll = setInterval(() => vivoSondear(false), VIVO_POLL_MS);
+}
+
+/* Respaldo: pregunta por los sellos de tiempo (no por los datos) */
+async function vivoSondear(inicial) {
+  if (!VIVO.canal) return;
+  if (document.hidden && !inicial) return;
+  const canal = VIVO.canal;
+  try {
+    const r = await api('priv.rev', { caller: VIVO.caller }, 'GET', null, SILENCIO);
+    if (VIVO.canal !== canal) return;                  // cambió de vista mientras iba en vuelo
+    const rev = (r.revs || {})[canal];
+    if (!VIVO.base) { VIVO.base = true; VIVO.ts = rev ? (rev.ts || 0) : 0; return; }
+    if (rev && rev.ts > VIVO.ts) vivoDisparar(rev);
+  } catch (e) { /* sin red: se reintenta en 12 s */ }
+}
+
+/* Señal instantánea. Reusa el Firebase que ya carga Votación. */
+function vivoEscuchar() {
+  const canal = VIVO.canal;
+  loadFirebase().then(fb => {
+    if (VIVO.canal !== canal) return;                  // ya se fue de la vista
+    (fb.apps && fb.apps.length) ? fb.app() : fb.initializeApp(VOTO_FBCFG);
+    VIVO.ref = fb.database().ref('meta/' + canal + '_rev');
+    VIVO.onVal = VIVO.ref.on('value', snap => {
+      if (VIVO.canal !== canal) return;
+      VIVO.fbOk = true;
+      const rev = snap && snap.val();
+      if (!rev || !rev.ts) { VIVO.base = true; return; }
+      if (!VIVO.base) { VIVO.base = true; VIVO.ts = rev.ts; return; }   // el primer disparo es el valor actual
+      /* 12/10/2026 · la señal pública ya no trae la cédula tocada: solo la
+         hora. Cuando cambia, el detalle (doc/prev) se pide con sesión a
+         priv.rev, que es quien decide si basta traer una tarjeta. */
+      if (rev.ts > VIVO.ts) (VIVO.canal === 'bd' ? vivoBdDirecto() : vivoSondear(true));   // true: también en segundo plano (vivoCorrer lo deja pendiente)
+    }, () => { if (VIVO.canal === canal) vivoRespaldo(); /* reglas cerradas: entra el sondeo de respaldo */ });
+  }).catch(() => { if (VIVO.canal === canal) vivoRespaldo(); });
+}
+
+/* 03/11/2026 · Base de datos: el sello y la tarjeta en UN viaje (priv.bdVivo).
+   Antes eran dos seguidos a Apps Script (priv.rev y luego priv.bdCard).
+   Con un CORE que aún no la tiene, se sigue por el camino de siempre. */
+let _bdVivoNo = false;
+async function vivoBdDirecto() {
+  if (_bdVivoNo) return vivoSondear(true);
+  const canal = VIVO.canal;
+  try {
+    const r = await api('priv.bdVivo', { caller: VIVO.caller }, 'GET', null, SILENCIO);
+    if (VIVO.canal !== canal) return;                  // cambió de vista mientras iba en vuelo
+    const rev = r && r.rev;
+    if (!rev || !(rev.ts > VIVO.ts)) return;
+    vivoDisparar(Object.assign({}, rev, { __pre: { card: r.card || null, borrado: !!r.borrado } }));
+  } catch (e) {
+    if (/no reconocida/i.test(String(e && e.message))) { _bdVivoNo = true; vivoSondear(true); }
+  }
+}
+
+function vivoDisparar(rev) {
+  VIVO.ts = Math.max(VIVO.ts || 0, rev.ts || 0);
+  if (VIVO.t) clearTimeout(VIVO.t);
+  VIVO.t = setTimeout(() => { VIVO.t = null; vivoCorrer(rev); }, VIVO_DEBOUNCE);
+}
+
+async function vivoCorrer(rev) {
+  if (!VIVO.load) return;
+  /* 03/11/2026 · una señal que llega mientras otra se aplica ya no se pierde:
+     queda pendiente y corre al terminar la que va en curso. */
+  if (VIVO.corriendo || document.hidden) { VIVO.pend = rev; return; }    // en segundo plano no se toca la pantalla
+  VIVO.corriendo = true;
+  const load = VIVO.load;
+  try { await load(rev); } catch (e) { /* en silencio: no se molesta al usuario */ }
+  finally { VIVO.corriendo = false; }
+  if (VIVO.load === load && VIVO.pend && !document.hidden) { const p = VIVO.pend; VIVO.pend = null; vivoCorrer(p); }
+}
+
+/* Al volver de segundo plano: lo pendiente, y de paso una comprobación. */
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden || !VIVO.canal) return;
+  const p = VIVO.pend; VIVO.pend = null;
+  if (p) vivoCorrer(p); else if (VIVO.poll) vivoSondear(false);   // con Firebase, la señal llega sola
+});
+
+/* ¿De verdad cambió algo? Evita repintar (y perder el scroll y el "Ver más")
+   cuando la señal sonó por algo que no altera lo que se está viendo. */
+function vivoCambio(firmaNueva) {
+  if (VIVO.firma === firmaNueva) return false;
+  VIVO.firma = firmaNueva;
+  return true;
+}
+
+/* Regla del usuario: si había una hoja abierta, se cierra porque se actualizó.
+
+   01/09/2026 · ARREGLO DEL FALSO AVISO
+   El rev NO decía quién escribió, así que tu propio guardado te cerraba el
+   modal diciendo que había sido "otro dispositivo" (no había ninguno). Ahora
+   cada llamada lleva la huella de este navegador (VIVO_DEV), el CORE la sella
+   en el rev (Vivo.gs · vivoBump_) y aquí se compara: si el cambio salió de
+   ESTA pestaña, la hoja se queda abierta y no se avisa nada. Los datos de
+   abajo sí se refrescan igual, eso no cambia.
+   Si el rev llega sin dev (app pública, escáner, bot, versión vieja del
+   CORE), se comporta EXACTAMENTE como antes: cierra y avisa. */
+function vivoCerrarHoja(rev) {
+  if (rev && rev.dev && rev.dev === VIVO_DEV) return;   // fui yo, en esta misma pestaña
+  if (layer && layer.innerHTML.trim()) { closeLayer(); toast('Se actualizó desde otro dispositivo'); }
+}
+
+/* ============================================================
+   VISTA INSTALAR  (patrón SEP-GROUP)
+   ============================================================ */
+function viewInstalar() {
+  app.innerHTML = `
+    <div class="login-wrap"><div class="login-card">
+      <img class="login-logo" src="${APP_ICON}" alt="${esc(MV.candidato)}" />
+      <h1 class="login-title">Panel privado</h1>
+      <p class="login-sub">Instala la aplicación para acceder más rápido y usarla como app nativa.</p>
+
+      <div id="install-box" style="margin-top:16px;">
+        <button id="btn-install" class="btn btn-primary btn-block" style="display:none;">📲 Instalar aplicación</button>
+        <div id="install-aviso" class="hidden ios-steps-wrap">
+          <p class="small" id="install-aviso-txt" style="text-align:left;color:var(--muted);"></p>
+        </div>
+        <button id="btn-cont-web" class="btn btn-ghost btn-block" style="margin-top:10px;">🌐 Continuar en el navegador</button>
+      </div>
+
+      ${footBrand()}
+    </div></div>`;
+  app.hidden = false; hideSplash(); paintVersion(APP_VERSION_LOADED || (typeof APP_VERSION !== 'undefined' ? APP_VERSION : ''));
+  updateInstallSection(true);
+  const cont = () => { sessionStorage.setItem(nsKey('continuedWeb'), '1'); go('login'); };
+  const bi = $('#btn-install');
+  if (bi) bi.onclick = async () => {
+    if (!deferredPrompt) { toast('La instalación aún no está disponible. Usa el menú del navegador.'); return; }
+    const dp = deferredPrompt; dp.prompt(); try { await dp.userChoice; } catch {} deferredPrompt = null; updateInstallSection();
+  };
+  const cw = $('#btn-cont-web'); if (cw) cw.onclick = cont;
+}
+
+/* ============================================================
+   LOGIN  (AJUSTE 17/07/2026 — SOLO PIN)
+   ------------------------------------------------------------
+   Un único método: el pad. Ya NO se pide el documento — el servidor
+   busca de quién es el PIN en USUARIOS (Auth.gs → privUsuariosPorPin_),
+   por eso el PIN tiene que ser único y Configuración lo exige al crear
+   o editar un usuario.
+   Tampoco va aquí el enlace a Instalar: la vista Instalar es la primera
+   pantalla y ahí se queda (lo pidió el usuario, 17/07).
+   ============================================================ */
+const PRIV_PIN_LEN = 4; // longitud del PIN de USUARIOS: el pad auto-envía al completarla.
+let pinBuffer = '';     // dígitos tecleados en el pad
+
+function viewLogin() { pinBuffer = ''; renderLogin(); }
+
+function renderLogin() {
+  app.innerHTML = `
+    <div class="login-wrap"><div class="login-card">
+      <img class="login-logo" src="${APP_ICON}" alt="${esc(MV.candidato)}" />
+      <h1 class="login-title">Panel privado</h1>
+      <p class="login-sub">Acceso del equipo · ${esc(MV.candidato)}</p>
+      <div id="login-body"></div>
+      ${footBrand()}
+    </div></div>`;
+  app.hidden = false; hideSplash(); paintVersion(APP_VERSION_LOADED || (typeof APP_VERSION !== 'undefined' ? APP_VERSION : ''));
+  renderLoginPin();
+}
+
+/* ---- Pad de PIN ----
+   No se pinta ninguna cuenta guardada: el PIN por sí solo dice quién
+   entra, así que enseñar aquí un nombre sería adivinar (y filtrar quién
+   usa este equipo). Las cuentas del equipo se manejan desde el botón
+   "Cambiar de cuenta" de la barra, ya adentro. */
+function renderLoginPin() {
+  $('#login-body').innerHTML = `
+    <p class="pin-hint" id="pin-hint">Ingresa tu PIN de acceso</p>
+    <div class="pin-pad" id="pin-pad">${pinDotsHtml()}</div>
+    <div class="pin-keypad">
+      ${[1,2,3,4,5,6,7,8,9].map(n => `<button class="pin-key" data-key="${n}">${n}</button>`).join('')}
+      <button class="pin-key action" data-key="clear">Borrar</button>
+      <button class="pin-key" data-key="0">0</button>
+      <button class="pin-key action" data-key="back">⌫</button>
+    </div>
+    <button class="btn btn-primary btn-block" id="pin-enter" style="margin-top:4px;">${I.lock} Entrar</button>`;
+  paintPin();
+  $$('.pin-key').forEach(k => k.onclick = () => onPinKey(k.dataset.key));
+  $('#pin-enter').onclick = () => submitPin();
+}
+function pinDotsHtml() {
+  const n = Math.max(PRIV_PIN_LEN, pinBuffer.length || 0);
+  let s = ''; for (let i = 0; i < n; i++) s += '<div class="pin-dot"></div>'; return s;
+}
+function paintPin() {
+  const pad = $('#pin-pad'); if (!pad) return;
+  pad.innerHTML = pinDotsHtml();
+  $$('#pin-pad .pin-dot').forEach((d, i) => d.classList.toggle('filled', i < pinBuffer.length));
+}
+function onPinKey(k) {
+  if (k === 'clear') { pinBuffer = ''; return paintPin(); }
+  if (k === 'back') { pinBuffer = pinBuffer.slice(0, -1); return paintPin(); }
+  if (pinBuffer.length >= 12) return;
+  pinBuffer += k; paintPin();
+  if (pinBuffer.length === PRIV_PIN_LEN) setTimeout(submitPin, 120); // auto-envía al completar la longitud esperada
+}
+function submitPin() {
+  if (pinBuffer.length < PRIV_PIN_LEN) return toast('Ingresa tu PIN', 'err');
+  loginCon(pinBuffer, $('#pin-enter'));
+}
+
+
+/* Solo viaja el PIN: quién es lo resuelve el servidor (17/07/2026). */
+async function loginCon(pin, btn) {
+  saving(btn, true);
+  try {
+    /* 12/10/2026 · si el CORE pidió el documento (tope global de intentos),
+       viaja también; si no hay campo, viaja solo el PIN como siempre. */
+    const docIn = $('#pin-doc');
+    const cuerpo = { pin };
+    if (docIn && onlyDig(docIn.value)) cuerpo.documento = onlyDig(docIn.value);
+    const r = await api('priv.login', {}, 'POST', cuerpo);
+    saving(btn, false);
+    if (!r.ok && r.pideDocumento && !docIn) {
+      const pad = $('#pin-pad');
+      if (pad) pad.insertAdjacentHTML('beforebegin', `<input class="input" id="pin-doc" inputmode="numeric" autocomplete="off" placeholder="Tu número de documento" style="margin:0 auto 12px;max-width:260px;text-align:center" />`);
+      onlyDigits($('#pin-doc'));
+    }
+    if (!r.ok) { pinBuffer = ''; paintPin(); return toast(r.msg || 'No se pudo iniciar sesión', 'err'); }
+    saveSession(r.user);
+    go('home');
+  } catch (e) { fallaRed(e); saving(btn, false); pinBuffer = ''; paintPin(); }
+}
+
+function rolLabel(rol) {
+  const r = String(rol || '').toUpperCase();
+  if (r === 'DESARROLLADOR') return 'Desarrollador';
+  if (r === 'ADMIN') return 'Administrador';
+  if (r === 'INVITADO') return 'Invitado';
+  return r || 'Usuario';
+}
+
+/* ============================================================
+   HOME  (menú por rol)
+   ============================================================ */
+function viewHome(user) {
+  const rol = String(user.rol || '').toUpperCase();
+  const menu = menuParaRol(rol);
+  app.innerHTML = `${appbar(user)}
+    <div class="pad stack">
+      <div>
+        <p class="eyebrow">Panel privado · ${esc(MV.lema)}</p>
+        <h1 class="h1">Hola, ${esc(primerNombre(user.nombre))} 👋🏾</h1>
+        <span class="rol-badge ${rol === 'DESARROLLADOR' ? 'dev' : rol === 'INVITADO' ? 'inv' : 'admin'}">${esc(rolLabel(rol))}</span>
+      </div>
+      <p class="eyebrow" style="margin-top:6px;">Módulos</p>
+      <div class="menu-grid">
+        ${menu.map(m => {
+          const ready = READY.has(m.id);
+          return `<button class="tile ${m.wide ? 'wide' : ''} ${ready ? '' : 'soon'}" data-id="${m.id}" ${ready ? '' : 'disabled'}>
+            <span class="ico">${I[m.icon]}</span>
+            <span class="txt"><b>${esc(m.title)}</b><br><span>${esc(m.desc)}</span></span>
+            ${ready ? '' : '<span class="soon-tag">Próximamente</span>'}
+          </button>`;
+        }).join('')}
+      </div>
+      <p class="center small muted" style="margin-top:10px;">${esc(MV.candidato)} · ${esc(MV.lugar)}</p>
+    </div>`;
+  app.hidden = false; hideSplash(); bindAppbar(user); appWide(true);   /* 23/07: Inicio tambien se expande en PC */
+  app.querySelectorAll('.tile:not(.soon)').forEach(t => t.onclick = () => openModulo(t.dataset.id, user));
+  refrescarMiFoto(user);
+}
+
+/* Trae la foto de la hoja si la sesión guardada no la tiene todavía (venía de
+   una versión anterior a la 9.2) o si cambió desde Configuración → Usuarios.
+   Silencioso: si falla, el Inicio se queda con las iniciales y ya. */
+async function refrescarMiFoto(user) {
+  try {
+    const r = await api('priv.miPerfil', {}, 'POST', { caller: user.documento });
+    if (!r || !r.ok) return;
+    /* 12/10/2026 · el CORE renueva la sesión firmada cuando le quedan < 7 días */
+    if (r.tk) { const sp = getSessions().find(x => x.documento === user.documento); if (sp) { sp.tk = r.tk; user.tk = r.tk; saveSession(sp); } }
+    /* 06/08/2026 · si a un invitado le cambiaron las pastillas mientras tenía
+       la sesión abierta, se le aplican aquí (el Inicio llama a este endpoint
+       en cada entrada) sin obligarlo a volver a entrar. */
+    if (r.permisos && JSON.stringify(r.permisos) !== JSON.stringify(user.permisos || null)) {
+      user.permisos = r.permisos; user.rol = r.rol || user.rol;
+      const sp = getSessions().find(x => x.documento === user.documento);
+      if (sp) { sp.permisos = r.permisos; sp.rol = user.rol; saveSession(sp); }
+      permSet(user);
+      return render();   // el menú cambia: se repinta el Inicio entero
+    }
+    const nueva = String(r.foto || '');
+    if (nueva === String(user.foto || '')) return;
+    user.foto = nueva;
+    const s = getSessions().find(x => x.documento === user.documento);
+    if (s) { s.foto = nueva; saveSession(s); }
+    pintarAvatarPriv(user);   // en el sitio: llamar a viewHome() aquí se muerde la cola
+  } catch (e) {}
+}
+
+/* Repinta solo el avatar de la barra (sin rearmar la vista entera) */
+function pintarAvatarPriv(user) {
+  const wrap = document.querySelector('.appbar .avatar-wrap');
+  if (!wrap) return;
+  wrap.outerHTML = avatarHtmlPriv(user);
+  const box = $('#avatarBox');
+  if (box) box.onclick = () => { const f = fotoUsuarioPriv(user); if (f) zoomImagen(f); else miFotoMenu(user); };
+  const ed = $('#avatarEdit'); if (ed) ed.onclick = () => miFotoMenu(user);
+}
+
+/* Se irá ampliando módulo a módulo (Módulo 2: Base de Datos, etc.) */
+function openModulo(id, user) {
+  switch (id) {
+    case 'bd': return go('bd');
+    case 'lideres': return go('lideres');
+    case 'eventos': return go('eventos');
+    case 'agenda': return go('agenda');
+    case 'compromisos': return go('compromisos');
+    case 'formularios': return go('formularios');
+    case 'notificaciones': return go('notificaciones');
+    case 'analisis': return go('analisis');
+    case 'config': return go('config');
+    case 'mibot': return go('mibot');
+    default: toast('Este módulo se activa en el próximo build.');
+  }
+}
+/* Ensancha el contenedor en vistas con grid/tarjetas (PC sin desborde) */
+function appWide(on, xl) { document.body.classList.toggle('wide', !!on); document.body.classList.toggle('wide-xl', !!(on && xl)); }
+
+/* ============================================================
+   AVATAR (13/10/2026 · Fase 2) — foto o iniciales
+   ------------------------------------------------------------
+   La foto viene como ID de Drive (o URL) en el campo foto de la lista
+   compacta. Se pide en miniatura (=s96), perezosa, y si falla se queda la
+   inicial que ya está pintada debajo: nunca un hueco ni un ícono roto.
+   El color de las iniciales sale del nombre: la misma persona siempre igual.
+   ============================================================ */
+const AV_COLORES = ['#2563eb', '#7c3aed', '#db2777', '#ea580c', '#059669', '#0891b2', '#4f46e5', '#b45309', '#be123c', '#0d9488'];
+function avIniciales(nombre) {
+  const p = String(nombre || '').trim().split(/\s+/).filter(w => w && !/^(de|del|la|las|los|y)$/i.test(w));
+  if (!p.length) return '?';
+  return ((p[0][0] || '') + (p.length > 1 ? (p[1][0] || '') : '')).toUpperCase();
+}
+function avColor(nombre) {
+  let h = 0; const s = String(nombre || '');
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
+  return AV_COLORES[h % AV_COLORES.length];
+}
+function avFotoMini(foto) {
+  const u = bdFotoUrl(foto);
+  if (!u) return '';
+  return /^https:\/\/lh3\.googleusercontent\.com\/d\/[-\w]+$/.test(u) ? u + '=s96' : u;
+}
+function avatarHtml(nombre, foto, extra) {
+  const src = avFotoMini(foto);
+  const grande = src ? bdFotoUrl(foto) : '';
+  return `<span class="av ${extra || ''}${src ? ' av-zoom' : ''}" style="--av:${avColor(nombre)}"${src ? ` data-zoom="${esc(grande)}" role="button" tabindex="0" title="Ver foto" aria-label="Ver foto de ${esc(nombre || '')}"` : ' aria-hidden="true"'}><b>${esc(avIniciales(nombre))}</b>${src ? `<img src="${esc(src)}" alt="" loading="lazy" decoding="async" referrerpolicy="no-referrer" onerror="this.parentNode.classList.remove('av-zoom');this.remove()">` : ''}</span>`;
+}
+/* Tocar la foto de una tarjeta la abre en el visor con zoom (el mismo de
+   Detalles), a tamaño completo. Va en fase de captura para que el toque no
+   dispare además la acción de la tarjeta (seleccionar, abrir, etc.). Si la
+   foto no cargó, se quedan las iniciales y el toque sigue de largo. */
+function avZoomDe(ev) {
+  const a = ev.target && ev.target.closest ? ev.target.closest('.av[data-zoom]') : null;
+  if (!a || !a.querySelector('img')) return;
+  ev.preventDefault(); ev.stopPropagation();
+  zoomImagen(a.dataset.zoom);
+}
+document.addEventListener('click', avZoomDe, true);
+document.addEventListener('keydown', ev => { if ((ev.key === 'Enter' || ev.key === ' ') && ev.target && ev.target.matches && ev.target.matches('.av[data-zoom]')) avZoomDe(ev); }, true);
+
+/* ============================================================
+   SELECTOR DE FECHA ESTILO iOS  (ruedas · portado de SEP-GROUP)
+   ------------------------------------------------------------
+   Mismo comportamiento que el de SEP-GROUP: ruedas con scroll-snap en
+   móvil, clic directo y flechas ▲▼ en PC. Aquí es SOLO FECHA (las horas
+   siguen con los inputs nativos, que ya funcionan bien).
+
+   abrirRuedaFecha(iso, onOk, opts)
+     opts.minHoy  → true en AGENDA: de hoy en adelante, año actual
+                    automático (no se programa nada para ayer).
+     opts.anios   → true en EVENTOS: agrega la rueda de AÑO y quita el
+                    tope, porque hay 173 eventos históricos que se editan.
+     opts.anioMin / opts.anioMax → acotan la rueda de AÑO (17/07/2026).
+                    Los usa la fecha de las ELECCIONES, que mira años
+                    ADELANTE: con el rango de Eventos (2019 → año+1) no se
+                    podría programar una elección de 2030.
+   Lecciones ya aprendidas en SEP-GROUP y respetadas aquí:
+     · el picker se muestra ANTES de construir las columnas (con
+       display:none, asignar scrollTop no surte efecto);
+     · las columnas se LEEN antes de ocultarlo (si no, devuelven 0).
+   ============================================================ */
+const IOSP_MESES = ['enero','febrero','marzo','abril','mayo','junio','julio','agosto','septiembre','octubre','noviembre','diciembre'];
+const IOSP_H = 42;
+const IOSP = { onOk: null, anio: new Date().getFullYear(), meses: [], dias: [], anios: [], minMes: 0, minDia: 1, conAnio: false, minHoy: false };
+
+function iospDiasMes(mesIdx, anio) { return new Date(anio, mesIdx + 1, 0).getDate(); }
+function iospSelCol(colEl) { return Math.max(0, Math.round(colEl.scrollTop / IOSP_H)); }
+function iospMarcar(colEl) { const i = iospSelCol(colEl); $$('.iosp-item', colEl).forEach(el => el.classList.toggle('sel', +el.dataset.i === i)); }
+
+function iospBuildCol(colEl, items, initIdx, onSettle) {
+  colEl.innerHTML = `<div class="iosp-pad"></div>` +
+    items.map((t, i) => `<div class="iosp-item" data-i="${i}">${esc(t)}</div>`).join('') +
+    `<div class="iosp-pad"></div>`;
+  colEl.scrollTop = Math.max(0, initIdx) * IOSP_H;
+  iospMarcar(colEl);
+  let to = null;
+  colEl.onscroll = () => {
+    iospMarcar(colEl);
+    if (to) clearTimeout(to);
+    to = setTimeout(() => { const i = iospSelCol(colEl); colEl.scrollTo({ top: i * IOSP_H, behavior: 'smooth' }); if (onSettle) onSettle(i); }, 90);
+  };
+  // PC: clic directo en la fila (además del arrastre en móvil)
+  $$('.iosp-item', colEl).forEach(el => el.onclick = () => {
+    const i = +el.dataset.i;
+    colEl.scrollTop = i * IOSP_H;   // instantáneo → lectura fiable
+    iospMarcar(colEl);
+    if (onSettle) onSettle(i);
+  });
+}
+
+/* Meses disponibles para el año que esté elegido */
+function iospMesesArr() {
+  const out = [];
+  const desde = (IOSP.minHoy && IOSP.anio === new Date().getFullYear()) ? IOSP.minMes : 0;
+  for (let m = desde; m <= 11; m++) out.push(m);
+  return out;
+}
+/* Días del mes elegido (con la cota de hoy si aplica) */
+function iospDiasArr(mesIdx) {
+  const total = iospDiasMes(mesIdx, IOSP.anio);
+  const hoyMes = IOSP.minHoy && IOSP.anio === new Date().getFullYear() && mesIdx === IOSP.minMes;
+  const desde = hoyMes ? IOSP.minDia : 1;
+  const out = [];
+  for (let d = desde; d <= total; d++) out.push(d);
+  return out;
+}
+function iospRebuildDias(mesPos) {
+  const mesIdx = IOSP.meses[Math.min(mesPos, IOSP.meses.length - 1)];
+  const cur = IOSP.dias[Math.min(iospSelCol($('#iosp-dia')), IOSP.dias.length - 1)];
+  IOSP.dias = iospDiasArr(mesIdx);
+  const pos = Math.max(0, IOSP.dias.indexOf(cur));
+  iospBuildCol($('#iosp-dia'), IOSP.dias.map(String), pos);
+}
+function iospRebuildMeses() {
+  const cur = IOSP.meses[Math.min(iospSelCol($('#iosp-mes')), IOSP.meses.length - 1)];
+  IOSP.meses = iospMesesArr();
+  let pos = IOSP.meses.indexOf(cur); if (pos < 0) pos = 0;
+  iospBuildCol($('#iosp-mes'), IOSP.meses.map(m => IOSP_MESES[m][0].toUpperCase() + IOSP_MESES[m].slice(1)), pos, iospRebuildDias);
+  iospRebuildDias(pos);
+}
+/* Flechas ▲▼ (PC) */
+function iospNudge(colId, delta) {
+  const colEl = $('#' + colId); if (!colEl) return;
+  const n = $$('.iosp-item', colEl).length;
+  const i = Math.min(Math.max(iospSelCol(colEl) + delta, 0), n - 1);
+  colEl.scrollTop = i * IOSP_H;
+  iospMarcar(colEl);
+  if (colId === 'iosp-anio') { IOSP.anio = IOSP.anios[i]; $('#iosp-titulo').textContent = IOSP.anio; iospRebuildMeses(); }
+  if (colId === 'iosp-mes') iospRebuildDias(i);
+}
+
+function abrirRuedaFecha(iso, onOk, opts) {
+  opts = opts || {};
+  IOSP.onOk = onOk;
+  IOSP.conAnio = !!opts.anios;
+  IOSP.minHoy = !!opts.minHoy;
+
+  const hoy = new Date();
+  IOSP.minMes = hoy.getMonth();
+  IOSP.minDia = hoy.getDate();
+
+  let d = null;
+  const m = String(iso || '').match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (m) d = new Date(+m[1], +m[2] - 1, +m[3]);
+  if (!d || isNaN(d.getTime())) d = hoy;
+
+  IOSP.anio = IOSP.conAnio ? d.getFullYear() : hoy.getFullYear();
+  if (IOSP.minHoy && IOSP.anio < hoy.getFullYear()) IOSP.anio = hoy.getFullYear();
+  IOSP.anios = [];
+  if (IOSP.conAnio) {
+    const desde = opts.anioMin || Math.min(2019, d.getFullYear());
+    const hasta = opts.anioMax || (hoy.getFullYear() + 1);
+    for (let y = desde; y <= hasta; y++) IOSP.anios.push(y);
+    if (IOSP.anios.indexOf(IOSP.anio) === -1) IOSP.anio = Math.max(desde, Math.min(hasta, hoy.getFullYear()));
+  }
+
+  const ov = h(`<div class="iosp-overlay">
+    <div class="iosp-card">
+      <div class="iosp-head">
+        <button type="button" class="iosp-btn" id="iosp-cancel">Cancelar</button>
+        <span class="iosp-year" id="iosp-titulo">${IOSP.conAnio ? 'Fecha' : IOSP.anio}</span>
+        <button type="button" class="iosp-btn ok" id="iosp-ok">Listo</button>
+      </div>
+      <div class="iosp-nav iosp-nav--up">
+        <button type="button" class="iosp-arrow" data-col="iosp-dia" data-d="-1" aria-label="Día arriba">▲</button>
+        <button type="button" class="iosp-arrow" data-col="iosp-mes" data-d="-1" aria-label="Mes arriba">▲</button>
+        ${IOSP.conAnio ? `<button type="button" class="iosp-arrow" data-col="iosp-anio" data-d="-1" aria-label="Año arriba">▲</button>` : ''}
+      </div>
+      <div class="iosp-wheels">
+        <div class="iosp-highlight"></div>
+        <div class="iosp-col" id="iosp-dia"></div>
+        <div class="iosp-col" id="iosp-mes"></div>
+        ${IOSP.conAnio ? `<div class="iosp-col" id="iosp-anio"></div>` : ''}
+      </div>
+      <div class="iosp-nav iosp-nav--down">
+        <button type="button" class="iosp-arrow" data-col="iosp-dia" data-d="1" aria-label="Día abajo">▼</button>
+        <button type="button" class="iosp-arrow" data-col="iosp-mes" data-d="1" aria-label="Mes abajo">▼</button>
+        ${IOSP.conAnio ? `<button type="button" class="iosp-arrow" data-col="iosp-anio" data-d="1" aria-label="Año abajo">▼</button>` : ''}
+      </div>
+    </div>
+  </div>`);
+  layer.appendChild(ov);   // se muestra ANTES de construir las columnas
+
+  IOSP.meses = iospMesesArr();
+  let mesIdx = d.getMonth();
+  if (IOSP.meses.indexOf(mesIdx) === -1) mesIdx = IOSP.meses[0];
+  const mesPos = Math.max(0, IOSP.meses.indexOf(mesIdx));
+  IOSP.dias = iospDiasArr(mesIdx);
+  let dia = d.getDate();
+  if (IOSP.dias.indexOf(dia) === -1) dia = IOSP.dias[0];
+
+  iospBuildCol($('#iosp-dia'), IOSP.dias.map(String), Math.max(0, IOSP.dias.indexOf(dia)));
+  iospBuildCol($('#iosp-mes'), IOSP.meses.map(x => IOSP_MESES[x][0].toUpperCase() + IOSP_MESES[x].slice(1)), mesPos, iospRebuildDias);
+  if (IOSP.conAnio) {
+    iospBuildCol($('#iosp-anio'), IOSP.anios.map(String), Math.max(0, IOSP.anios.indexOf(IOSP.anio)), (pos) => {
+      IOSP.anio = IOSP.anios[pos]; iospRebuildMeses();
+    });
+  }
+
+  const cerrar = () => { document.removeEventListener('keydown', onEsc); ov.remove(); };
+  const onEsc = e => { if (e.key === 'Escape') cerrar(); };
+  document.addEventListener('keydown', onEsc);
+  ov.onclick = e => { if (e.target === ov) cerrar(); };
+  $('#iosp-cancel', ov).onclick = cerrar;
+  $$('.iosp-arrow', ov).forEach(b => b.onclick = () => iospNudge(b.dataset.col, +b.dataset.d));
+  $('#iosp-ok', ov).onclick = () => {
+    // LEER todo antes de cerrar: en un contenedor oculto, scrollTop vale 0
+    const mes = IOSP.meses[Math.min(iospSelCol($('#iosp-mes')), IOSP.meses.length - 1)];
+    const dd = IOSP.dias[Math.min(iospSelCol($('#iosp-dia')), IOSP.dias.length - 1)];
+    const yy = IOSP.conAnio ? IOSP.anios[Math.min(iospSelCol($('#iosp-anio')), IOSP.anios.length - 1)] : IOSP.anio;
+    cerrar();
+    const p = n => String(n).padStart(2, '0');
+    if (IOSP.onOk) IOSP.onOk(`${yy}-${p(mes + 1)}-${p(dd)}`, `${dd} de ${IOSP_MESES[mes]} de ${yy}`);
+  };
+}
+
+/* ---- Campo de fecha con rueda (reemplaza a <input type="date">) ----
+   Guarda el valor en un input oculto con el MISMO id de antes, así el
+   resto del módulo (evReadForm/agReadForm/…) no cambia. */
+function campoFecha(id, label, opts) {
+  const o = opts || {};
+  return `<div class="field">
+      <span>${esc(label)}</span>
+      <button type="button" class="input datebtn" id="${id}-btn" data-minhoy="${o.minHoy ? 1 : 0}" data-anios="${o.anios ? 1 : 0}" data-aniomin="${o.anioMin || ''}" data-aniomax="${o.anioMax || ''}">
+        <span class="datebtn-tx">Selecciona la fecha</span><span class="datebtn-ic">📅</span>
+      </button>
+      <input type="hidden" id="${id}" />
+    </div>`;
+}
+function fechaLargaISO(iso) {
+  const m = String(iso || '').match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (!m) return '';
+  return `${+m[3]} de ${IOSP_MESES[+m[2] - 1]} de ${m[1]}`;
+}
+/* Pinta el texto del botón según el valor actual del input oculto */
+function fechaSync(id) {
+  const b = $(`#${id}-btn`), i = $(`#${id}`); if (!b || !i) return;
+  const tx = fechaLargaISO(i.value);
+  $('.datebtn-tx', b).textContent = tx || 'Selecciona la fecha';
+  b.classList.toggle('vacio', !tx);
+}
+/* Engancha el botón a la rueda. Llamar después de pintar el formulario. */
+function bindCampoFecha(id) {
+  const b = $(`#${id}-btn`), i = $(`#${id}`); if (!b || !i) return;
+  fechaSync(id);
+  b.onclick = () => abrirRuedaFecha(i.value, (iso) => { i.value = iso; fechaSync(id); },
+    { minHoy: b.dataset.minhoy === '1', anios: b.dataset.anios === '1',
+      anioMin: +b.dataset.aniomin || 0, anioMax: +b.dataset.aniomax || 0 });
+}
+
+/* ============================================================
+   AJUSTES 17/07/2026 · piezas compartidas
+   ------------------------------------------------------------
+   · elecCrono: el conteo regresivo del Simulador y de la Votación.
+   · pctES: porcentajes con coma y máximo 2 decimales (0,1 · 26,51).
+   · copiarTexto: portapapeles con plan B.
+   ============================================================ */
+
+/* Porcentaje en es-CO, máximo 2 decimales. El backend ya redondeó; aquí solo
+   se escribe. Sin base contra qué medir se dice "—", no un 0% mentiroso. */
+function pctES(n) { return Number(n || 0).toLocaleString('es-CO', { maximumFractionDigits: 2 }) + '%'; }
+function pctBase(x) { return x && x.base ? pctES(x.pct) : '—'; }
+
+/* Portapapeles. navigator.clipboard necesita contexto seguro; la app va por
+   https (GitHub Pages), pero si el navegador lo niega se cae al textarea de
+   toda la vida en vez de dejar al usuario sin nada. */
+async function copiarTexto(txt, msgOk) {
+  try {
+    await navigator.clipboard.writeText(txt);
+    toast(msgOk || 'Copiado', 'ok'); return true;
+  } catch (e) {
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = txt; ta.setAttribute('readonly', '');
+      ta.style.cssText = 'position:fixed;top:-1000px;opacity:0;';
+      document.body.appendChild(ta); ta.select(); ta.setSelectionRange(0, ta.value.length);
+      const ok = document.execCommand('copy'); ta.remove();
+      toast(ok ? (msgOk || 'Copiado') : 'No se pudo copiar', ok ? 'ok' : 'err');
+      return ok;
+    } catch (e2) { toast('No se pudo copiar', 'err'); return false; }
+  }
+}
+
+/* ---------- CONTEO REGRESIVO ----------
+   Fuente de la hora: el SERVIDOR. El backend manda eleccion.now junto con
+   iniMs/finMs; aquí se guarda el desfase contra el reloj del equipo y se
+   cuenta con la hora buena. Un celular con la hora corrida mostraría otra
+   cuenta distinta a la del equipo de al lado, y en esto no puede haber dos
+   verdades. El desfase se refresca solo: el Simulador y la Votación vuelven
+   a pedir sus datos (EN VIVO / sondeo de 7 s) y con ellos llega un `now`
+   nuevo. */
+const ELEC = { off: 0, ini: 0, fin: 0, listo: false, timer: null };
+const ELEC_DIAS = ['domingo', 'lunes', 'martes', 'miércoles', 'jueves', 'viernes', 'sábado'];
+
+function elecSet(e) {
+  if (!e) return;
+  ELEC.off = (typeof e.now === 'number' ? e.now : Date.now()) - Date.now();
+  ELEC.ini = e.iniMs || 0;
+  ELEC.fin = e.finMs || 0;
+  ELEC.listo = !!e.configurada;
+}
+function elecAhora() { return Date.now() + ELEC.off; }
+/* Estado: 'sin' (no configurada) · 'antes' · 'curso' · 'cerrada' */
+function elecEstado() {
+  if (!ELEC.listo) return 'sin';
+  const t = elecAhora();
+  if (t < ELEC.ini) return 'antes';
+  if (t < ELEC.fin) return 'curso';
+  return 'cerrada';
+}
+/* ms → {d,h,m,s} ya en dos dígitos (los días, tal cual) */
+function elecPartes(ms) {
+  const t = Math.max(0, Math.floor(ms / 1000));
+  return {
+    d: Math.floor(t / 86400),
+    h: pad2(Math.floor(t % 86400 / 3600)),
+    m: pad2(Math.floor(t % 3600 / 60)),
+    s: pad2(t % 60),
+    hTot: pad2(Math.floor(t / 3600))   // horas TOTALES (Votación no muestra días)
+  };
+}
+/* "domingo, 31 de octubre de 2027 a las 8:00 a. m." */
+function elecFechaLarga() {
+  if (!ELEC.ini) return '';
+  const d = new Date(ELEC.ini);
+  const hora = d.toLocaleTimeString('es-CO', { hour: 'numeric', minute: '2-digit' });
+  return `${ELEC_DIAS[d.getDay()]}, ${d.getDate()} de ${IOSP_MESES[d.getMonth()]} de ${d.getFullYear()} a las ${hora}`;
+}
+
+/* Pinta el regresivo dentro de #<id>. modo 'dias' (Simulador) o 'horas' (Votación).
+   Devuelve el HTML del armazón; los números los mueve elecTick. */
+function elecCronoHtml(id, modo) {
+  const cel = (k, l) => `<div class="crono-cel"><b id="${id}-${k}">00</b><span>${l}</span></div>`;
+  return `<div class="crono" id="${id}">
+      <div class="crono-tit" id="${id}-tit">—</div>
+      <div class="crono-celdas">
+        ${modo === 'dias' ? cel('d', 'días') : ''}
+        ${cel('h', 'horas')}${cel('m', 'min')}${cel('s', 'seg')}
+      </div>
+      <div class="crono-pie" id="${id}-pie"></div>
+    </div>`;
+}
+
+function elecTick(id, modo) {
+  const box = $('#' + id);
+  if (!box) { if (ELEC.timer) { clearInterval(ELEC.timer); ELEC.timer = null; } return; }
+  const est = elecEstado();
+  const set = (k, v) => { const el = $(`#${id}-${k}`); if (el && el.textContent !== v) el.textContent = v; };
+  const tit = $(`#${id}-tit`), pie = $(`#${id}-pie`);
+
+  let p = { d: 0, h: '00', m: '00', s: '00', hTot: '00' }, titulo = '', pieTx = '', cls = '';
+
+  if (est === 'sin') {
+    titulo = 'Sin fecha de elecciones';
+    pieTx = 'La pone el desarrollador en Configuración → Avanzado.';
+    cls = 'crono--sin';
+  } else if (est === 'antes') {
+    /* El Simulador cuenta lo que falta para ABRIR. La Votación, mientras no
+       sea el día ni la hora, va en CEROS y solo anuncia cuándo abre (lo pidió
+       así el usuario). */
+    if (modo === 'dias') { p = elecPartes(ELEC.ini - elecAhora()); titulo = 'Faltan para las elecciones'; }
+    else { titulo = `LA VOTACIÓN INICIARÁ EL ${elecFechaLarga().toUpperCase()}`; }
+    pieTx = modo === 'dias' ? elecFechaLarga().replace(/^./, c => c.toUpperCase()) : 'El registro de votos sigue abierto para pruebas.';
+    cls = 'crono--antes';
+  } else if (est === 'curso') {
+    p = elecPartes(ELEC.fin - elecAhora());
+    if (modo !== 'dias') p.h = p.hTot;
+    titulo = modo === 'dias' ? 'VOTACIÓN EN CURSO · falta para el cierre' : 'Falta para el cierre de la votación';
+    pieTx = 'Cierra a las ' + new Date(ELEC.fin).toLocaleTimeString('es-CO', { hour: 'numeric', minute: '2-digit' });
+    cls = 'crono--curso';
+  } else {
+    titulo = 'VOTACIÓN CERRADA';
+    pieTx = elecFechaLarga().replace(/^./, c => c.toUpperCase());
+    cls = 'crono--cerrada';
+  }
+
+  if (modo === 'dias') set('d', String(p.d));
+  set('h', p.h); set('m', p.m); set('s', p.s);
+  if (tit && tit.textContent !== titulo) tit.textContent = titulo;
+  if (pie && pie.textContent !== pieTx) pie.textContent = pieTx;
+  box.className = 'crono ' + cls + (modo === 'dias' ? ' crono--largo' : '');
+}
+
+/* Arranca (o reengancha) el reloj de una vista. Uno solo a la vez: al cambiar
+   de vista el elemento desaparece y elecTick se apaga solo. */
+function elecCronoBind(id, modo) {
+  if (ELEC.timer) { clearInterval(ELEC.timer); ELEC.timer = null; }
+  elecTick(id, modo);
+  ELEC.timer = setInterval(() => elecTick(id, modo), 1000);
+}
+
+/* ============================================================
+   BASE DE DATOS  (Nuestros registros · hoja PRINCIPAL)
+   ============================================================ */
+let BD_ALL = [], BD_ME = '', BD_REG_URL = '', BD_SHOWN = 0, BD_FILT = [];
+const BD_INT = new Set(); // intenciones seleccionadas (multi, combinables con municipio)
+/* AJUSTES 16/07: filtro por líder + exportación de LO FILTRADO */
+let BD_LIDERES = [], BD_COLS = [], BD_LID = '';   // BD_LID = código del líder ('' = todos, 'SIN' = sin líder)
+const BD_BATCH = 60;
+let _resiCache = null;
+async function getResidencias() { if (!_resiCache) { try { _resiCache = await api('pub.residencias'); } catch { _resiCache = []; } } return _resiCache; }
+
+/* Grupo de municipio → clase de color de tarjeta */
+function bdColor(mun) {
+  const m = String(mun || '').trim().toUpperCase();
+  if (MV.esMunicipio(m)) return 'bd-flandes';
+  if (m === 'SIN CONSULTAR') return 'bd-sin';
+  if (m === 'A LA ESPERA') return 'bd-espera';
+  if (m === 'POR CONFIRMAR') return 'bd-confirmar';
+  return 'bd-otro';
+}
+
+/* URL de la foto de la persona (mismo esquema Drive de la pública).
+   Acepta URL completa, ID de Drive suelto o enlace /d/ID. Devuelve '' si no
+   hay foto o es la imagen por defecto.
+
+   30/07/2026 · ANTES ERA UN SOLO TROZO DE NOMBRE DE ARCHIVO ('user_zefosv').
+   Al mover las imágenes de hosting el archivo cambia de nombre, y con una
+   sola marca la app empezaría a tratar la silueta por defecto como si fuera
+   la foto real de la persona. Ahora es una LISTA y se acepta cualquiera:
+   las filas viejas de la hoja siguen guardando la URL antigua y tienen que
+   seguir reconociéndose, así que las marcas NO se reemplazan, se suman.
+   Al añadir un hosting nuevo, se añade su marca aquí. */
+const FOTO_DEFAULT_MARCAS = ['user_zefosv', 'marca/user.png', 'data:image/svg+xml'];
+function esFotoDefault(v) {
+  const s = String(v || '').trim().toLowerCase();
+  return !s || FOTO_DEFAULT_MARCAS.some(m => s.indexOf(m) !== -1);
+}
+function bdFotoUrl(v) {
+  const s = String(v || '').trim();
+  if (esFotoDefault(s)) return '';
+  const m = s.match(/\/d\/([-\w]{20,})|[?&]id=([-\w]{20,})/);          // enlace de Drive (file/d/ID o ?id=ID)
+  if (m) return 'https://lh3.googleusercontent.com/d/' + (m[1] || m[2]);
+  if (/^[-\w]{20,}$/.test(s)) return 'https://lh3.googleusercontent.com/d/' + s; // ID de Drive suelto
+  if (/^https?:\/\//i.test(s)) return s;                              // cualquier otra URL directa
+  return s;
+}
+
+/* Fecha larga en español: "Domingo, 12 de julio de 2026 – 3:45 pm" */
+const BD_DIAS = ['Domingo','Lunes','Martes','Miércoles','Jueves','Viernes','Sábado'];
+const BD_MESES = ['enero','febrero','marzo','abril','mayo','junio','julio','agosto','septiembre','octubre','noviembre','diciembre'];
+function fmtFechaLarga(s) {
+  const m = String(s || '').trim().match(/^(\d{2})\/(\d{2})\/(\d{4})(?:[ T](\d{1,2}):(\d{2}))?/);
+  if (!m) return String(s || '');
+  const d = new Date(+m[3], +m[2] - 1, +m[1], +(m[4] || 0), +(m[5] || 0));
+  let hh = +(m[4] || 0), mm = m[5] || '00'; const ampm = hh >= 12 ? 'pm' : 'am'; hh = hh % 12 || 12;
+  const hora = (m[4] != null) ? ` – ${hh}:${mm} ${ampm}` : '';
+  return `${BD_DIAS[d.getDay()]}, ${+m[1]} de ${BD_MESES[+m[2] - 1]} de ${m[3]}${hora}`;
+}
+
+function bdCardHtml(c) {
+  const inact = c.estado === 'INACTIVO';
+  const fechaTxt = c.fechaActualizacion
+    ? `Actualizado ${fmtFechaLarga(c.fechaActualizacion)}`
+    : (c.fechaRegistro ? `Creado ${fmtFechaLarga(c.fechaRegistro)}` : '');
+  return `<article class="bd-card ${bdColor(c.municipio)} ${inact ? 'bd-inact' : ''}" data-doc="${esc(c.documento)}">
+    <div class="bd-top">
+      ${avatarHtml(c.nombre, c.foto)}
+      <div class="bd-id">
+        <b class="bd-nombre">${c.esLider ? `<span class="bd-star" title="Líder">★</span> ` : ''}${esc(c.nombre || 'Sin nombre')}</b>
+        <span class="bd-doc bd-doc-copy" data-copy="${esc(c.documento)}" title="Tocar para copiar">CC ${esc(c.documento)}</span>
+      </div>
+      ${inact ? '<span class="bd-pill-inact">Inactivo</span>' : `<span class="bd-mun ${bdColor(c.municipio)}">${esc(c.municipio || '—')}</span>`}
+    </div>
+    ${bdSelloMotivo(c)}
+    <div class="bd-meta">
+      <span><span class="bd-k">Residencia</span> ${esc(c.residencia || '—')}</span>
+      <span><span class="bd-k">Intención</span> ${esc(c.intencion || '—')}</span>
+    </div>
+    ${fechaTxt ? `<div class="bd-fecha">${esc(fechaTxt)}</div>` : ''}
+    <div class="bd-acts">
+      <button class="bd-btn" data-a="detalles">Detalles</button>
+      <button class="bd-btn" data-a="editar">Editar</button>
+      <button class="bd-btn" data-a="consultar">Consultar</button>
+      ${bdPorEliminar(c)
+        ? '<button class="bd-btn bd-btn-danger" data-a="eliminar">Eliminar</button>'
+        : `<button class="bd-btn bd-btn-danger" data-a="inactivar" ${inact ? 'disabled' : ''}>Inactivar</button>`}
+    </div>
+  </article>`;
+}
+
+/* 09/11/2026 · VALIDACIÓN DE REGISTROS: sello con el motivo de POR CONFIRMAR
+   (uno de CONS_MOTIVOS) y el fallecimiento confirmado por el líder. */
+function bdSelloMotivo(c) {
+  const m = String(c.motivo || '').toUpperCase();
+  if (!m) return '';
+  const mun = String(c.municipio || '').toUpperCase();
+  if (/FALLECIDO/.test(m)) return bdPorEliminar(c)
+    ? `<div class="bd-sello bd-sello-elim">Fallecido · confirmado por el líder · <b>pendiente por eliminar</b></div>`
+    : `<div class="bd-sello bd-sello-muerte">${esc(m)}</div>`;
+  if (mun !== 'POR CONFIRMAR') return '';
+  /* 11/11/2026 · motivos de Configuración (js/motivos-pc.js): el de la acción
+     de fallecimiento sale en gris; el texto, el título corto del motivo. */
+  const mo = window.MOTIVOS_PC ? MOTIVOS_PC.de(m) : null;
+  const muerte = mo ? !!mo.muerte : m === 'MUERTE';
+  const txt = mo ? String(mo.t || mo.v).toUpperCase() : (m === 'MUERTE' ? 'POSIBLE FALLECIMIENTO' : m);
+  return `<div class="bd-sello ${muerte ? 'bd-sello-muerte' : ''}">Motivo: ${esc(txt)}</div>`;
+}
+
+async function viewBaseDatos(user) {
+  BD_ME = user.documento;
+  appWide(true, true);
+  app.innerHTML = `${backbar('Base de Datos')}
+    <div class="pad">
+      <div class="bd-toolbar">
+        <div class="bd-search">
+          <input class="input" id="bd-q" placeholder="Buscar por nombre, documento o residencia…" autocomplete="off" />
+        </div>
+        <button class="btn btn-primary bd-add" id="bd-add">+ Agregar</button>
+        <button class="btn btn-ghost bd-add bd-pend" id="bd-pend" title="Lo anotado sin señal o pegado, para revisar y subir">${I.upload} Pendientes <span class="sr-badge" data-pend-n ${window.SINRED && SINRED.contar(user.documento) ? '' : 'hidden'}>${window.SINRED ? (SINRED.contar(user.documento) || '') : ''}</span></button>
+      </div>
+      <div class="bd-nav">
+        <button class="btn btn-ghost bd-nav-btn" id="bd-dashboard">${I.chart} Dashboard</button>
+        <button class="btn btn-ghost bd-nav-btn" id="bd-simulador">${I.sliders} Simulador</button>
+        <button class="btn btn-ghost bd-nav-btn bd-nav-vote" id="bd-votacion">${I.vote} Votación</button>
+        <button class="btn btn-ghost bd-nav-btn bd-nav-val" id="bd-validacion" title="Enviar a los líderes el enlace para validar los documentos POR CONFIRMAR">${I.wa} Validación <span class="bd-val-n" data-val-n>0</span></button>
+      </div>
+      <div class="bd-chips" id="bd-chips">
+        ${['Todos',MV.municipio,'Sin consultar','A la espera','Por confirmar','Otros','Inactivos'].map((t,i)=>`<button class="bd-chip ${i===0?'active':''}" data-f="${esc(t)}">${esc(t)} <span class="bd-chip-n" data-n></span></button>`).join('')}
+        <button class="bd-chip bd-chip-elim" data-f="Por eliminar" hidden title="Fallecidos confirmados por el líder: revisa y elimina">Por eliminar <span class="bd-chip-n" data-n></span></button>
+      </div>
+      <div class="bd-chips bd-chips-int" id="bd-chips-int"></div>
+      <div class="bd-lidbar">
+        <div class="bd-lidsel">
+          <span class="bd-chips-lbl">Líder:</span>
+          ${comboboxHtml('bd-lid', 'Todos los líderes…')}
+        </div>
+        <div class="bd-exp">
+          <button class="btn btn-ghost" id="bd-excel">${I.download} Excel</button>
+          <button class="btn btn-ghost" id="bd-pdf">${I.download} PDF</button>
+          <button class="btn btn-ghost" id="bd-subir">${I.upload} Subir</button>
+        </div>
+      </div>
+      <div class="bd-tend" id="bd-tend" hidden></div>
+      <div class="bd-count" id="bd-count"></div>
+      <div id="bd-body">${loadingBox('Cargando registros…')}</div>
+      <div class="center" id="bd-more" style="margin-top:12px;"></div>
+    </div>`;
+  app.hidden = false; hideSplash();
+  $('#backbtn').onclick = () => go('home');
+  $('#bd-add').onclick = () => bdAgregar();
+  { const bp = $('#bd-pend'); if (bp) bp.onclick = () => window.PEND && PEND.bdPendientes(user); }   /* 08/11/2026 */
+  $('#bd-dashboard').onclick = () => go('dashboard');
+  $('#bd-simulador').onclick = () => go('simulador');
+  $('#bd-votacion').onclick = () => go('votacion');
+  { const bv = $('#bd-validacion'); if (bv) bv.onclick = () => window.bdValEnviar && bdValEnviar(); }   /* 09/11/2026 */
+
+  /* 13/10/2026 · carga única por sesión: la segunda visita pinta al instante
+     desde la caché y solo vuelve al servidor si /meta dice que algo cambió. */
+  let primera = true;
+  /* 18/11/2026 · al entrar (o volver) TODOS los filtros arrancan en blanco,
+     igual que lo que se ve: antes BD_LID guardaba el líder elegido en la
+     visita anterior mientras la casilla decía "Todos" (filtro escondido). */
+  BD_INT.clear(); BD_LID = '';
+  if (window.bdActReiniciar) bdActReiniciar();
+  try {
+    /* act=1 (09/11/2026): la lista trae quién tiene servicios, compromisos,
+       eventos y formularios (fila de filtros por actividad, bd-actividad.js) */
+    await rapCargar('priv.baseDatos', { caller: BD_ME, act: '1' }, (r) => {
+      if (!$('#bd-body')) return;                         // ya salió de la vista
+      if (!r || r.ok === false) { if (primera) $('#bd-body').innerHTML = `<p class="muted center">No se pudo cargar.</p>`; return; }
+      BD_ALL = r.items || []; BD_REG_URL = r.registraduriaUrl || ''; if (r.pc) window.BD_PC = r.pc;
+      BD_LIDERES = r.lideres || []; BD_COLS = r.columnas || []; BD_DASH = r.dash || BD_DASH;
+      if (window.bdActDato) bdActDato(r.act);
+      bdBuildIntChips();
+      if (primera) bdBindLiderCombo();                    // el combo solo se arma una vez (no pierde lo elegido)
+      primera = false;
+      bdApplyFilter();
+    });
+  } catch (e) { if ($('#bd-body') && primera) $('#bd-body').innerHTML = `${fallaHtml(e)}`; }
+
+  const q = $('#bd-q'); let t;
+  q.oninput = () => { clearTimeout(t); t = setTimeout(bdApplyFilter, 160); };
+  $$('#bd-chips .bd-chip').forEach(ch => ch.onclick = () => { $$('#bd-chips .bd-chip').forEach(x => x.classList.remove('active')); ch.classList.add('active'); bdApplyFilter(); });
+  $('#bd-excel').onclick = () => bdExportar('excel');
+  $('#bd-pdf').onclick = () => bdExportar('pdf');
+  $('#bd-subir').onclick = () => bdSubir();
+
+  vivoBind('bd', BD_ME, vivoBd);   // EN VIVO
+}
+
+/* ---- EN VIVO · Base de Datos ----
+   La lista completa son ~705 KB (2.414 filas): NO se vuelve a pedir salvo que
+   no sepamos qué cambió. Si el rev trae el documento, se trae SOLO esa
+   tarjeta con priv.bdCard (~200 bytes) y se reemplaza en sitio con
+   bdUpsertCard, que ya existía. rev.prev cubre el caso de que le hayan
+   cambiado el documento a alguien: se quita la tarjeta vieja. */
+/* 03/11/2026 · Las rutas del líder en la app pública (alta, edición y marca
+   de un referido) traían en rev.doc la cédula del LÍDER: aquí se pedía su
+   tarjeta, no cambiaba nada y el referido nuevo nunca entraba a la lista.
+   El CORE 2026.11.03.1 ya manda la del referido. Si llega una de esas
+   señales y la tarjeta no movió nada (CORE anterior), se trae la lista. */
+const VIVO_BD_DEL_LIDER = /^(referido-|marca$|lider-asignado|alta-publica|edicion-publica)/;
+let VIVO_MED = [];   // traza EN VIVO de esta pestaña: {accion, via, ms}
+async function vivoBd(rev) {
+  const t0 = performance.now();
+  const doc = rev && rev.doc ? normDocJs(rev.doc) : '';
+  const medir = via => { VIVO_MED.push({ accion: (rev && rev.accion) || '', via, ms: Math.round(performance.now() - t0) }); if (VIVO_MED.length > 30) VIVO_MED.shift(); };
+
+  if (doc) {
+    const r = rev.__pre || await api('priv.bdCard', { caller: BD_ME, documento: doc }, 'GET', null, SILENCIO);
+    const prev = rev.prev ? normDocJs(rev.prev) : '';
+    let cambio = false;
+
+    if (prev && prev !== doc) {
+      const ip = BD_ALL.findIndex(x => normDocJs(x.documento) === prev);
+      if (ip >= 0) { BD_ALL.splice(ip, 1); cambio = true; }
+    }
+    const i = BD_ALL.findIndex(x => normDocJs(x.documento) === doc);
+    if (r.card) bdCompletarCard(r.card);
+    if (r.card) {
+      if (i < 0 || JSON.stringify(BD_ALL[i]) !== JSON.stringify(r.card)) {
+        bdUpsertCard(r.card, true); cambio = true;
+      }
+    } else if (i >= 0) { BD_ALL.splice(i, 1); cambio = true; }
+
+    if (cambio || !VIVO_BD_DEL_LIDER.test(String(rev.accion || ''))) {
+      RAP.tocar('priv.baseDatos', 'bd', rev.ts);   // la caché de sesión ya tiene este cambio
+      if (!cambio) { medir('tarjeta-sin-cambio'); return; }   // sonó por algo que no altera la tarjeta
+      if (prev || !r.card) bdApplyFilter(); // se quitó una tarjeta: hay que repintar la lista
+      bdBuildIntChips();
+      vivoCerrarHoja(rev);
+      medir('tarjeta');
+      return;
+    }
+    /* sigue abajo: la señal del líder no trajo al referido → lista */
+  }
+
+  /* No sabemos qué cambió: recarga completa (rara) */
+  const r = await api('priv.baseDatos', Object.assign({ caller: BD_ME, act: '1' }, RAP.params()), 'GET', null, SILENCIO);
+  if (!r || r.ok === false) return;
+  RAP.guardar('priv.baseDatos', r, r.__rapCrudo);
+  if (r.pc) window.BD_PC = r.pc;
+  if (!vivoCambio(JSON.stringify(r.items))) { medir('lista-sin-cambio'); return; }
+  BD_ALL = r.items || []; BD_COLS = r.columnas || []; BD_DASH = r.dash || BD_DASH;
+  if (window.bdActDato) bdActDato(r.act);
+  bdBuildIntChips(); bdApplyFilter(); vivoCerrarHoja(rev);
+  medir('lista');
+}
+
+/* ---- AJUSTES 16/07 · filtro por LÍDER ----
+   Se filtra por REFERENCIA (el código), no por el texto de la columna
+   LIDER: el código es el que vincula de verdad al referido con su líder. */
+function bdLiderLabel(l) { return `#${l.codigo} · ${l.nombre}`; }
+/* 18/11/2026 · UNA sola regla del filtro de líder (lista, conteos, tendencia
+   y la gráfica por líder de bd-tablero.js). lid: '' = todos, 'SIN', código. */
+function bdPasaLid(c, lid) {
+  if (lid === 'SIN') return !String(c.referencia || '');
+  if (lid) return String(c.referencia || '') === String(lid);
+  return true;
+}
+/* Texto que debe mostrar la casilla para un código de líder ('' = vacía). */
+function bdLidTexto(lid) {
+  if (lid === 'SIN') return 'Sin líder asignado';
+  if (!lid) return '';
+  const l = BD_LIDERES.find(x => String(x.codigo) === String(lid));
+  return l ? bdLiderLabel(l) : '#' + lid;
+}
+/* Lee la casilla → código. null = texto a medio escribir (no cambia nada):
+   solo vale una opción COMPLETA de la lista ("#1" no es el líder 1 mientras
+   se escribe "#13"). */
+function bdLidDeTexto(v) {
+  v = String(v || '').trim();
+  if (!v || /^todos los l/i.test(v)) return '';
+  if (/^sin l[ií]der asignado$/i.test(v)) return 'SIN';
+  const m = v.match(/^#(\d+) · /); if (!m) return null;
+  const l = BD_LIDERES.find(x => String(x.codigo) === m[1]);
+  return l && bdLiderLabel(l).toLowerCase() === v.toLowerCase() ? m[1] : null;
+}
+function bdBindLiderCombo() {
+  const lista = ['Todos los líderes', 'Sin líder asignado'].concat(BD_LIDERES.map(bdLiderLabel));
+  bindCombobox('bd-lid', lista);
+  const inp = $('#bd-lid'), list = $('#bd-lid-list'); if (!inp) return;
+  inp.value = bdLidTexto(BD_LID);   // la casilla SIEMPRE dice lo que se filtra
+  const leer = () => {
+    if (!$('#bd-count')) return;   // se salió de la vista con el debounce en vuelo
+    const nuevo = bdLidDeTexto(inp.value);
+    if (nuevo === null || nuevo === BD_LID) return;   // a medio escribir o sin cambio
+    BD_LID = nuevo;
+    bdApplyFilter();
+  };
+  /* Al salir de la casilla con texto a medias se devuelve el líder vigente:
+     nunca queda escrito algo distinto de lo que filtra la lista. */
+  inp.addEventListener('blur', () => setTimeout(() => {
+    if (document.activeElement === inp) return;
+    const v = bdLidDeTexto(inp.value);
+    if (v === null) inp.value = bdLidTexto(BD_LID);
+
+  }, 200));
+  /* bindCombobox pisa .oninput y NO dispara 'change' al elegir una opción:
+     por eso se escucha el clic en la lista (delegado, así corre DESPUÉS de
+     que la opción escribe el valor) y el tecleo con addEventListener. */
+  if (list) list.addEventListener('click', () => setTimeout(leer, 0));
+  let t = null;
+  inp.addEventListener('input', () => { clearTimeout(t); t = setTimeout(leer, 250); });
+}
+
+/* ---- AJUSTES 16/07 · exportar SOLO lo filtrado, eligiendo columnas ---- */
+function bdFiltroTxt() {
+  const p = [];
+  const f = bdActiveFilter(); if (f && f !== 'Todos') p.push(f);
+  if (BD_LID === 'SIN') p.push('Sin líder asignado');
+  else if (BD_LID) p.push('Líder: ' + bdLidTexto(BD_LID));
+  if (BD_INT.size) p.push('Intención: ' + Array.from(BD_INT).join(', '));
+  if (window.bdActTxt && bdActTxt()) p.push('Con ' + bdActTxt());
+  const q = (($('#bd-q') || {}).value || '').trim(); if (q) p.push('Búsqueda: “' + q + '”');
+  return p.length ? p.join(' · ') : 'Todos los registros';
+}
+/* 05/08/2026 · dos marcas EXCLUYENTES que recortan FILAS (no columnas):
+   SOLO ASISTENCIA = filas con algo en la columna O · SOLO INTENCIÓN = filas
+   con algo en la columna P. El conteo se calcula aquí para que se vea ANTES
+   de descargar, pero el recorte de verdad lo vuelve a hacer el CORE. */
+function bdExpTiene(c, campo) {
+  return String((campo === 'ASISTENCIA' ? c.asistencia : c.intencion) || '').trim() !== '';
+}
+/* ============================================================
+   REINICIAR LA MARCACIÓN DE ASISTENCIA  (06/08/2026)
+   Borra la columna ASISTENCIA de TODA la hoja PRINCIPAL — no del filtro que
+   haya en pantalla (decisión del usuario, 06/08). INTENCIÓN no se toca.
+
+   Ojo con la memoria mensual: el cierre de mes (Balance_Priv.gs) archiva y
+   SOLO DESPUÉS borra. Reiniciar a mano borra sin archivar, así que esas marcas
+   no van a quedar en ningún balance. Por eso la confirmación lo dice con
+   todas las letras. Sin clave, por decisión del usuario.
+   ============================================================ */
+async function bdReiniciarAsistencia() {
+  /* Si el CORE viejo aún no manda ASISTENCIA en la tarjeta no se puede contar
+     aquí; se dice "los que tengan dato" y el servidor hace el trabajo igual. */
+  const sabe = BD_ALL.some(c => c.asistencia !== undefined);
+  const n = BD_ALL.filter(c => bdExpTiene(c, 'ASISTENCIA')).length;
+  const ok = await confirmar('¿Reiniciar la marcación de asistencia?',
+    crow('Qué se borra', 'La columna ASISTENCIA de la hoja PRINCIPAL') +
+    crow('Cuántos registros', sabe ? n.toLocaleString('es-CO') + ' con asistencia marcada' : 'Todos los que tengan dato') +
+    crow('Alcance', 'TODOS los registros, aunque la vista esté filtrada') +
+    crow('Memoria mensual', 'Estos registros NO quedarán guardados') +
+    crow('Intención', 'No se toca') +
+    '<p class="muted small" style="margin-top:10px;">Esta acción no se puede deshacer.</p>');
+  if (!ok) return;
+  try {
+    const r = await api('priv.bdReiniciarAsis', {}, 'POST', { caller: BD_ME });
+    if (!r || !r.ok) return toast((r && r.msg) || 'No se pudo reiniciar', 'err');
+    toast(r.borradas ? 'Asistencia reiniciada · ' + Number(r.borradas).toLocaleString('es-CO') + ' registro(s)' : 'No había asistencias marcadas', 'ok');
+    await bdLoteRecargar();   // la lista queda vieja: se vuelve a pedir entera
+  } catch (e) { fallaRed(e); }
+}
+
+function bdExportar(tipo) {
+  const docs = BD_FILT.map(c => c.documento).filter(Boolean);
+  if (!docs.length) return toast('No hay registros en el filtro actual', 'err');
+  const cols = BD_COLS.length ? BD_COLS : ['NOMBRE', 'DOCUMENTO', 'CONTACTO', 'RESIDENCIA', 'MUNICIPIO', 'PUESTO', 'MESA', 'INTENCION'];
+  const pref = ['NOMBRE', 'DOCUMENTO', 'CONTACTO', 'RESIDENCIA', 'REFERENCIA', 'LIDER', 'MUNICIPIO', 'PUESTO', 'MESA', 'INTENCION', 'ASISTENCIA'];
+  const marcadas = new Set(cols.filter(c => pref.indexOf(String(c).toUpperCase()) !== -1));
+  const filtroTxt = bdFiltroTxt();
+  /* ¿el CORE ya manda ASISTENCIA en la tarjeta? Si aún no (se pegó primero el
+     frontend), no se puede contar aquí: se manda todo y recorta el servidor. */
+  const sabeAsis = BD_FILT.some(c => c.asistencia !== undefined);
+  const nAsis = BD_FILT.filter(c => bdExpTiene(c, 'ASISTENCIA')).length;
+  const nInt = BD_FILT.filter(c => bdExpTiene(c, 'INTENCION')).length;
+  const num = (n, ok) => ok ? n.toLocaleString('es-CO') + ' registro(s)' : 'los que tengan dato';
+  let solo = '';
+  openSheet(`<div class="grip"></div>
+    <div class="bd-exp-head">
+      <h2 class="h2">Exportar a ${tipo === 'excel' ? 'Excel' : 'PDF'}</h2>
+      <button class="icon-btn bd-exp-reset" type="button" id="bd-reset" title="Reiniciar la marcación de asistencia" aria-label="Reiniciar la marcación de asistencia">${I.reload}</button>
+    </div>
+    <p class="muted small" id="bd-expn">${docs.length.toLocaleString('es-CO')} registro(s) · ${esc(filtroTxt)}</p>
+    <div class="cons-marks" id="bd-marks">
+      <button class="cons-mark" type="button" data-solo="ASISTENCIA"><span class="cm-box"></span><span class="cm-txt"><b>SOLO ASISTENCIA</b><small>Descarga únicamente las filas que ya tengan ASISTENCIA registrada · ${num(nAsis, sabeAsis)}</small></span></button>
+      <button class="cons-mark" type="button" data-solo="INTENCION"><span class="cm-box"></span><span class="cm-txt"><b>SOLO INTENCIÓN</b><small>Descarga únicamente las filas que ya tengan INTENCIÓN registrada · ${num(nInt, sabeAsis)}</small></span></button>
+    </div>
+    <p class="muted small" style="margin-top:2px;">Elige las columnas:</p>
+    <div class="col-pick" id="bd-colpick">
+      ${cols.map(c => `<label class="col-opt"><input type="checkbox" data-c="${esc(c)}" ${marcadas.has(c) ? 'checked' : ''}/> <span>${esc(String(c).replace(/_/g, ' '))}</span></label>`).join('')}
+    </div>
+    <button class="btn btn-primary btn-block" id="bd-colgo" style="margin-top:12px;">${I.download} Descargar ${tipo === 'excel' ? 'Excel' : 'PDF'}</button>`);
+
+  const pinta = () => {
+    $$('#bd-marks .cons-mark').forEach(b => b.classList.toggle('on', b.dataset.solo === solo));
+    const n = !solo ? docs.length : (solo === 'ASISTENCIA' ? nAsis : nInt);
+    const txt = (!solo || sabeAsis) ? n.toLocaleString('es-CO') + ' registro(s)' : 'Selección del servidor';
+    $('#bd-expn').textContent = `${txt} · ${filtroTxt}${solo ? ' · Solo con ' + (solo === 'ASISTENCIA' ? 'ASISTENCIA' : 'INTENCIÓN') : ''}`;
+    const btn = $('#bd-colgo');
+    const vacio = !!solo && sabeAsis && n === 0;
+    btn.disabled = vacio;
+    btn.style.opacity = vacio ? .5 : '';
+  };
+  { const br = $('#bd-reset'); if (br) br.onclick = () => bdReiniciarAsistencia(); }
+  $$('#bd-marks .cons-mark').forEach(b => b.onclick = () => {
+    solo = (solo === b.dataset.solo) ? '' : b.dataset.solo;   // re-toque = quitar la marca
+    /* si se pide "solo X", que la columna X venga marcada: si no, el archivo
+       sale filtrado por algo que no se ve por ninguna parte. */
+    if (solo) {
+      const ch = $$('#bd-colpick input').filter(i => String(i.dataset.c).toUpperCase() === solo)[0];
+      if (ch) ch.checked = true;
+    }
+    pinta();
+  });
+  pinta();
+
+  $('#bd-colgo').onclick = async () => {
+    const columnas = $$('#bd-colpick input:checked').map(i => i.dataset.c);
+    if (!columnas.length) return toast('Elige al menos una columna', 'err');
+    const btn = $('#bd-colgo'); saving(btn, true);
+    try {
+      const r = await api(tipo === 'excel' ? 'priv.bdExcel' : 'priv.bdPdf', {}, 'POST',
+        { caller: BD_ME, documentos: docs, columnas, filtroTxt, soloCon: solo });
+      saving(btn, false);
+      if (!r.ok) return toast(r.msg || 'No se pudo generar', 'err');
+      downloadB64(r.base64, r.mime, r.filename);
+      closeLayer(); toast('Archivo generado', 'ok');
+    } catch (e) { saving(btn, false); toast('Error al generar el archivo', 'err'); }
+  };
+}
+
+function bdActiveFilter() { const a = $('#bd-chips .bd-chip.active'); return a ? a.dataset.f : 'Todos'; }
+
+/* Construye las pastillas de INTENCIÓN dinámicamente: solo con los valores que
+   EXISTAN en la columna (activos), ordenados por frecuencia. Multi-selección,
+   combinables con el filtro de municipio. */
+function bdBuildIntChips() {
+  const cont = $('#bd-chips-int'); if (!cont) return;
+  const conteo = {};
+  BD_ALL.forEach(c => {
+    if (c.estado === 'INACTIVO') return;
+    const v = String(c.intencion || '').trim();
+    if (v) conteo[v] = (conteo[v] || 0) + 1;
+  });
+  /* 18/11/2026 · una intención MARCADA se queda en pantalla aunque ya no
+     tenga registros (EN VIVO): si desapareciera, filtraría sin verse. */
+  BD_INT.forEach(v => { if (!(v in conteo)) conteo[v] = 0; });
+  const valores = Object.keys(conteo).sort((a, b) => conteo[b] - conteo[a]);
+  if (!valores.length) { cont.innerHTML = ''; return; }
+  cont.innerHTML = `<span class="bd-chips-lbl">Intención:</span>` +
+    valores.map(v => `<button class="bd-chip bd-chip-int" data-int="${esc(v)}">${esc(v)} <span class="bd-chip-n">${conteo[v].toLocaleString('es-CO')}</span></button>`).join('');
+  $$('#bd-chips-int .bd-chip-int').forEach(ch => ch.onclick = () => {
+    const v = ch.dataset.int;
+    if (BD_INT.has(v)) BD_INT.delete(v); else BD_INT.add(v);
+    ch.classList.toggle('active', BD_INT.has(v));
+    bdApplyFilter();
+  });
+  /* EN VIVO: al repintar las pastillas hay que devolverles lo que el usuario
+     tenía marcado; si no, un refresco de fondo le borraría el filtro de la
+     pantalla (BD_INT sí lo conserva, pero el botón se veía apagado). */
+  $$('#bd-chips-int .bd-chip-int').forEach(ch => ch.classList.toggle('active', BD_INT.has(ch.dataset.int)));
+  if (window.bdTablero) bdTablero();   // 08/11/2026 · el número de cada intención respeta los demás filtros
+}
+
+/* Milisegundos de FECHA_REGISTRO (dd/MM/yyyy HH:mm:ss). Sin fecha → 0 (el más
+   antiguo, va primero). En PRINCIPAL está al 100%, pero se blinda por si acaso. */
+function bdRegMs(c) {
+  const m = /^(\d{2})\/(\d{2})\/(\d{4})(?:[ T](\d{1,2}):(\d{2})(?::(\d{2}))?)?/.exec(String((c && c.fechaRegistro) || '').trim());
+  if (!m) return 0;
+  return new Date(+m[3], +m[2] - 1, +m[1], +(m[4] || 0), +(m[5] || 0), +(m[6] || 0)).getTime() || 0;
+}
+/* 08/11/2026 · Las reglas de cada filtro quedan en dos funciones para que la
+   lista, los conteos de las pastillas y la tendencia por mes (bd-tablero.js)
+   cuenten EXACTAMENTE lo mismo. bdPasaChip = pastilla de municipio/estado;
+   bdPasaResto = búsqueda, líder e intención (sinInt: sin mirar intención). */
+/* 12/11/2026 · PENDIENTE POR ELIMINAR: el líder confirmó el fallecimiento en
+   SUAREZ → Mis referidos (pub.pcFallecido: ESTADO INACTIVO + MOTIVO_CONFIRMAR
+   «FALLECIDO (CONFIRMADO POR EL LÍDER)»). Aquí se ven en su pastilla y se
+   eliminan con la clave de eliminación (bd.eliminar). */
+function bdPorEliminar(c) { return c && c.estado === 'INACTIVO' && /FALLECIDO/.test(String(c.motivo || '').toUpperCase()); }
+function bdPasaChip(c, f) {
+  if (f === 'Por eliminar') return bdPorEliminar(c);
+  if (f === 'Inactivos') return c.estado === 'INACTIVO';
+  if (c.estado === 'INACTIVO') return false;            /* ocultos salvo en pestaña Inactivos */
+  const mun = String(c.municipio || '').trim().toUpperCase();
+  if (f === MV.municipio) return MV.esMunicipio(mun);
+  if (f === 'Sin consultar') return mun === 'SIN CONSULTAR';
+  if (f === 'A la espera') return mun === 'A LA ESPERA';
+  if (f === 'Por confirmar') return mun === 'POR CONFIRMAR';
+  if (f === 'Otros') return !(MV.esMunicipio(mun) || ['SIN CONSULTAR','A LA ESPERA','POR CONFIRMAR'].indexOf(mun) !== -1);
+  return true;                                          // Todos
+}
+function bdPasaResto(c, q, sinInt, sinAct, sinLid) {
+  if (!sinAct && window.bdActPasa && !bdActPasa(c)) return false;   /* 09/11/2026 · Servicios/Compromisos/Eventos/Formularios */
+  if (!sinInt && BD_INT.size && !BD_INT.has(String(c.intencion || '').trim())) return false;
+  if (!sinLid && !bdPasaLid(c, BD_LID)) return false;   /* 18/11/2026 · sinLid: la gráfica por líder */
+  if (q) {
+    const hay = (String(c.nombre||'') + ' ' + String(c.documento||'') + ' ' + String(c.residencia||'')).toLowerCase();
+    if (!hay.includes(q)) return false;
+  }
+  return true;
+}
+function bdQ() { return (($('#bd-q') || {}).value || '').trim().toLowerCase(); }
+function bdApplyFilter() {
+  const q = bdQ();
+  const f = bdActiveFilter();
+  BD_FILT = BD_ALL.filter(c => bdPasaChip(c, f) && bdPasaResto(c, q));
+  BD_FILT.sort((a, b) => bdRegMs(b) - bdRegMs(a));   // 21/07 (2ª): de la más RECIENTE a la más antigua (sort estable → empates conservan orden de hoja)
+  BD_SHOWN = 0;
+  $('#bd-count').textContent = `${BD_FILT.length.toLocaleString('es-CO')} registro(s)`;
+  $('#bd-body').innerHTML = `<div class="bd-grid" id="bd-grid"></div>`;
+  bdRenderMore();
+  if (window.bdTablero) bdTablero();   // 08/11/2026 · conteos de pastillas + tendencia por mes
+  if (window.bdValContar) bdValContar();   /* 09/11/2026 · número del botón VALIDACIÓN */
+}
+function bdRenderMore() {
+  const grid = $('#bd-grid'); if (!grid) return;
+  const next = BD_FILT.slice(BD_SHOWN, BD_SHOWN + BD_BATCH);
+  grid.insertAdjacentHTML('beforeend', next.map(bdCardHtml).join(''));
+  BD_SHOWN += next.length;
+  // enlaza acciones de las tarjetas recién pintadas
+  $$('#bd-grid .bd-card').forEach(card => { if (card._wired) return; card._wired = true;
+    card.querySelectorAll('.bd-btn').forEach(b => b.onclick = () => bdAccion(b.dataset.a, card.dataset.doc));
+    bdDocCopiable(card);   // 01/08: tocar el documento lo copia
+  });
+  const more = $('#bd-more');
+  if (BD_SHOWN < BD_FILT.length) {
+    more.innerHTML = `<button class="btn btn-ghost" id="bd-more-btn">Ver más (${(BD_FILT.length - BD_SHOWN).toLocaleString('es-CO')} restantes)</button>`;
+    $('#bd-more-btn').onclick = bdRenderMore;
+  } else { more.innerHTML = ''; }
+}
+
+/* Actualiza (o inserta) una tarjeta en memoria + en el DOM */
+/* 13/10/2026 · la tarjeta suelta (editar, agregar, EN VIVO) trae el puesto
+   CRUDO; la etiqueta del Dashboard se saca aquí con el mismo catálogo y la
+   misma regla que pvEtiqueta_ (Puestos.gs) para que el tablero, que sale de
+   esta misma lista, no quede con un puesto viejo. */
+let BD_DASH = null;
+const pvNorm = s => String(s == null ? '' : s).normalize('NFD').replace(/[\u0300-\u036f]/g, '').toUpperCase().replace(/[^A-Z0-9_]/g, '').trim();
+function bdPuestoEtiqueta(crudo) {
+  const p = String(crudo == null ? '' : crudo).trim();
+  const d = BD_DASH || {};
+  if (!p) return d.puestoSin || '(Sin puesto)';
+  const cat = d.puestos || [];
+  if (!cat.length) return p;
+  const n = pvNorm(p);
+  const hit = cat.find(x => pvNorm(x) === n);
+  return hit || d.puestoOtro || 'Otro municipio';
+}
+function bdCompletarCard(card) {
+  if (card && card.puesto === undefined && card.puestoCrudo !== undefined) card.puesto = bdPuestoEtiqueta(card.puestoCrudo);
+  return card;
+}
+function bdUpsertCard(card, _prepend) {
+  bdCompletarCard(card);
+  RAP.tocar('priv.baseDatos');   // la copia local ya no coincide: se rehace en la próxima visita
+  const i = BD_ALL.findIndex(x => normDocJs(x.documento) === normDocJs(card.documento));
+  const nuevo = i < 0;
+  if (i >= 0) BD_ALL[i] = card; else BD_ALL.push(card);
+  // 21/07 (2ª): con orden por recencia, un registro NUEVO se reordena y repinta
+  // para caer en su sitio (el más reciente, arriba); no se antepone a ciegas.
+  if (nuevo) return bdApplyFilter();
+  const node = $(`#bd-grid .bd-card[data-doc="${cssq(card.documento)}"]`);
+  if (node) { const nn = h(bdCardHtml(card)); nn._wired = true; nn.querySelectorAll('.bd-btn').forEach(b => b.onclick = () => bdAccion(b.dataset.a, card.documento)); bdDocCopiable(nn); node.replaceWith(nn); if (window.bdTablero) bdTablero(); if (window.bdValContar) bdValContar(); }
+  else bdApplyFilter();   // en memoria pero fuera de la página pintada: repinta
+}
+const normDocJs = s => String(s == null ? '' : s).replace(/\D/g, '');
+const cssq = s => String(s).replace(/"/g, '\\"');
+
+/* 01/08 · El documento de la tarjeta se copia al tocarlo. Va aquí y no en
+   un listener global porque las tarjetas se pintan por tandas (bdRenderMore)
+   y se reemplazan una a una (bdUpsertCard): los dos sitios lo llaman. */
+function bdDocCopiable(card) {
+  const d = card.querySelector('.bd-doc-copy');
+  if (d) d.onclick = () => copiarTexto(d.dataset.copy, 'Copiado');
+}
+
+function bdAccion(a, doc) {
+  const card = BD_ALL.find(x => normDocJs(x.documento) === normDocJs(doc));
+  /* 08/11/2026 · Detalles es una LECTURA: no se le devuelve la promesa al
+     escudo antidoble (capa 12). Si esa lectura quedaba esperando, el botón
+     se quedaba "ocupado" y los toques siguientes se tragaban sin aviso. */
+  if (a === 'detalles') { (window.tzDetalles ? tzDetalles(doc) : bdDetalles(doc)); return; }   // 07/11/2026: Trazabilidad
+  if (a === 'editar') return bdEditar(doc);
+  if (a === 'consultar') return bdConsultar(doc, card);
+  if (a === 'inactivar') return bdInactivar(doc, card);
+  if (a === 'eliminar') return bdEliminar(doc, card);   /* 12/11/2026 · pendiente por eliminar */
+}
+
+/* ---- DETALLES ---- */
+async function bdDetalles(doc) {
+  openSheet(`<div class="grip"></div><h2 class="h2">Detalles</h2>${loadingBox('Cargando…')}`);
+  try {
+    const r = await api('priv.persona', { documento: doc, ...auth() });
+    if (!r.ok) { closeLayer(); return toast(r.msg || 'No se pudo cargar', 'err'); }
+    const p = r.persona;
+    const orden = ['NOMBRE','DOCUMENTO','CONTACTO','RESIDENCIA','REFERENCIA','LIDER','DEPARTAMENTO','MUNICIPIO','PUESTO','DIRECCION','MESA','ESTADO','INTENCION','ASISTENCIA','FECHA_REGISTRO','FECHA_ACTUALIZACION','ID_USUARIO'];
+    const ocultas = ['FOTO','QR_FILE']; // no se listan como texto (se muestran de otra forma)
+    const keys = orden.filter(k => (k in p) && ocultas.indexOf(k) === -1)
+      .concat(Object.keys(p).filter(k => orden.indexOf(k) === -1 && ocultas.indexOf(k) === -1));
+    const rows = keys.map(k => `<div class="det-row"><span>${esc(k.replace(/_/g,' '))}</span><b>${esc(p[k] || '—')}</b></div>`).join('');
+    const fotoUrl = bdFotoUrl(p['FOTO']);
+    const fotoHtml = fotoUrl
+      ? `<div class="det-foto"><img src="${esc(fotoUrl)}" alt="Foto" onerror="this.closest('.det-foto').remove()" /></div>`
+      : '';
+    openSheet(`<div class="grip"></div>
+      <div class="det-head"><h2 class="h2">${r.esLider ? '★ ' : ''}${esc(p['NOMBRE'] || 'Detalles')}</h2><span class="bd-mun ${bdColor(p['MUNICIPIO'])}">${esc(p['MUNICIPIO'] || '—')}</span></div>
+      ${fotoHtml}
+      <div class="det-list">${rows}</div>
+      <div class="stack" style="margin-top:16px;">
+        <button class="btn btn-primary btn-block" id="det-edit">Editar</button>
+        <button class="btn btn-quiet btn-block bd-btn-danger" id="det-inact" ${String(p['ESTADO']).toUpperCase()==='INACTIVO'?'disabled':''}>Inactivar</button>
+        <button class="btn btn-quiet btn-block bd-btn-danger" id="det-elim">Eliminar</button>
+      </div>`);
+    /* Fase 9.2: la foto de Detalles se abre con el mismo visor de la pública */
+    const fz = layer.querySelector('.det-foto img');
+    if (fz) { fz.classList.add('zoomable'); fz.onclick = () => zoomImagen(fotoUrl); }
+    $('#det-edit').onclick = () => { closeLayer(); bdEditar(doc); };
+    $('#det-inact').onclick = () => { closeLayer(); bdInactivar(doc, BD_ALL.find(x => normDocJs(x.documento) === normDocJs(doc))); };
+    $('#det-elim').onclick = () => { closeLayer(); bdEliminar(doc, BD_ALL.find(x => normDocJs(x.documento) === normDocJs(doc))); };
+  } catch (e) { closeLayer(); fallaRed(e); }
+}
+
+/* ---- EDITAR ---- */
+async function bdEditar(doc) {
+  openSheet(`<div class="grip"></div><h2 class="h2">Editar</h2>${loadingBox('Cargando…')}`);
+  let p;
+  try { const r = await api('priv.persona', { documento: doc, ...auth() }); if (!r.ok) { closeLayer(); return toast(r.msg, 'err'); } p = r.persona; }
+  catch (e) { closeLayer(); return fallaRed(e); }
+  openSheet(`<div class="grip"></div><h2 class="h2" style="margin-bottom:10px;">Editar registro</h2>
+    <div class="stack">
+      ${field('Documento', inputEl('e-doc', 'inputmode="numeric"'))}
+      ${field('Nombre completo', inputEl('e-nombre'))}
+      ${field('Contacto (WhatsApp)', inputEl('e-contacto', 'inputmode="numeric" maxlength="10"'))}
+      ${field('Residencia', comboboxHtml('e-resi', 'Escribe para buscar…'))}
+      ${field('Referencia (N° de líder)', inputEl('e-ref', 'inputmode="numeric" placeholder="Código del líder que refirió"'))}
+      <button class="btn btn-primary btn-block" id="e-save">Guardar cambios</button>
+    </div>`);
+  $('#e-doc').value = p['DOCUMENTO'] || ''; $('#e-nombre').value = p['NOMBRE'] || '';
+  $('#e-contacto').value = onlyDig(p['CONTACTO'] || ''); $('#e-ref').value = onlyDig(p['REFERENCIA'] || '');
+  onlyDigits($('#e-doc')); onlyDigits($('#e-contacto')); onlyDigits($('#e-ref'));
+  getResidencias().then(l => { bindCombobox('e-resi', l); $('#e-resi').value = p['RESIDENCIA'] || ''; });
+  $('#e-save').onclick = async () => {
+    const body = { ...auth(), documentoOriginal: doc, documento: onlyDig(val('e-doc')), nombre: val('e-nombre'), contacto: onlyDig(val('e-contacto')), residencia: val('e-resi'), referencia: onlyDig(val('e-ref')) };
+    if (!/^\d{5,10}$/.test(body.documento)) return toast('Documento inválido', 'err');
+    if (body.nombre.split(/\s+/).filter(Boolean).length < 2) return toast('Nombre: al menos 2 palabras', 'err');
+    const btn = $('#e-save'); saving(btn, true);
+    try {
+      const r = await api('priv.personaEditar', {}, 'POST', body); saving(btn, false);
+      if (!r.ok) return toast(r.msg || 'No se pudo guardar', 'err');
+      closeLayer(); toast('Registro actualizado', 'ok'); bdUpsertCard(r.card);
+    } catch (e) { fallaRed(e); saving(btn, false); }
+  };
+}
+
+/* ---- ELIMINAR (21/07) · borra la fila; pide la clave de eliminación ----
+   Borra de PRINCIPAL y, si es líder, de LIDERES (sus referidos pasan al
+   líder 1). El QR vuelve a la reserva. Distinto de Inactivar: es permanente. */
+async function bdEliminar(doc, card) {
+  card = card || BD_ALL.find(x => normDocJs(x.documento) === normDocJs(doc));
+  const nombre = (card && card.nombre) || '';
+  openSheet(`<div class="grip"></div>
+    <h2 class="h2" style="margin-bottom:6px;">Eliminar registro</h2>
+    <p class="muted small" style="margin-top:0;">${esc(nombre)} · CC ${esc(doc)}</p>
+    <p class="muted small" style="color:var(--danger,#c0392b);margin-top:8px;">Esto <b>borra la fila</b> de forma permanente${card && card.esLider ? ' y también de <b>Líderes</b> (sus referidos pasan al líder 1)' : ''}. No se puede deshacer.</p>
+    <label class="field" style="margin-top:12px;"><span>Clave de eliminación</span>
+      <input class="input" id="elim-clave" inputmode="numeric" maxlength="6" placeholder="6 dígitos" autocomplete="off" /></label>
+    <div class="stack" style="margin-top:14px;">
+      <button class="btn btn-primary btn-block bd-btn-danger" id="elim-go">Eliminar definitivamente</button>
+      <button class="btn btn-quiet btn-block" data-close>Cancelar</button>
+    </div>`, 'elim-sheet');
+  const inp = $('#elim-clave'); if (inp) { onlyDigits(inp); inp.focus(); }
+  $('#elim-go').onclick = async () => {
+    const clave = String((inp && inp.value) || '').replace(/\D/g, '');
+    if (!/^\d{6}$/.test(clave)) return toast('La clave es de 6 dígitos', 'err');
+    const btn = $('#elim-go'); saving(btn, true);
+    try {
+      const r = await api('priv.personaEliminar', {}, 'POST', { ...auth(), documento: doc, clave });
+      saving(btn, false);
+      if (!r.ok) return toast(r.msg || 'No se pudo eliminar', 'err');
+      closeLayer(); toast('Registro eliminado', 'ok'); bdRemoveCard(doc);
+    } catch (e) { fallaRed(e); saving(btn, false); }
+  };
+}
+
+/* Quita una tarjeta de la lista en memoria y repinta (borrado en vivo). */
+function bdRemoveCard(doc) {
+  /* En sitio (no un arreglo nuevo): la caché de sesión apunta a este mismo */
+  for (let i = BD_ALL.length - 1; i >= 0; i--) if (normDocJs(BD_ALL[i].documento) === normDocJs(doc)) BD_ALL.splice(i, 1);
+  RAP.tocar('priv.baseDatos');
+  const node = $(`#bd-grid .bd-card[data-doc="${cssq(doc)}"]`);
+  if (node) node.remove();
+  bdApplyFilter();
+}
+
+/* ---- INACTIVAR ---- */
+async function bdInactivar(doc, card) {
+  const ok = await confirmar('Inactivar registro', crow('Nombre', card && card.nombre) + crow('Documento', doc) + `<p class="muted small" style="margin-top:8px;">El registro quedará como INACTIVO y no podrá iniciar sesión en la app pública.</p>`);
+  if (!ok) return;
+  try {
+    const r = await api('priv.personaInactivar', {}, 'POST', { ...auth(), documento: doc });
+    if (!r.ok) return toast(r.msg || 'No se pudo inactivar', 'err');
+    toast('Registro inactivado', 'ok'); bdUpsertCard(r.card);
+  } catch (e) { fallaRed(e); }
+}
+
+/* ---- CONSULTAR PUESTO (pegar de la Registraduría) ---- */
+function bdConsultar(doc, card) {
+  const url = BD_REG_URL || 'https://wsp.registraduria.gov.co/censo/consultar/';
+  openSheet(`<div class="grip"></div><h2 class="h2" style="margin-bottom:6px;">Consultar puesto de votación</h2>
+    <p class="muted small">La Registraduría no permite consulta automática. Copia el documento, ábrela, pega aquí el resultado y guárdalo.</p>
+    <div class="cons-doc">
+      <div><span class="bd-k">Documento</span><b id="cons-doc">${esc(doc)}</b></div>
+      <button class="btn btn-ghost cons-copy" id="cons-copy">Copiar</button>
+    </div>
+    <a class="btn btn-ghost btn-block" id="cons-open" href="${esc(url)}" target="_blank" rel="noopener">Abrir Registraduría ↗</a>
+    <div id="cons-marks" data-doc="${esc(doc)}"></div>
+    <label class="field" style="margin-top:12px;" id="cons-paste-wrap"><span>Pega aquí lo que copiaste de la tabla</span>
+      <textarea class="input area" id="cons-paste" rows="4" placeholder="NUIP  DEPARTAMENTO  MUNICIPIO  PUESTO  DIRECCIÓN  MESA&#10;${esc(doc)}  ${esc(MV.departamento.toUpperCase())}  ${esc(MV.municipio.toUpperCase())}  IE ...  AV ...  33"></textarea></label>
+    <button class="btn btn-primary btn-block" id="cons-read">Leer datos</button>
+    <div id="cons-step2"></div>`);
+  $('#cons-copy').onclick = async () => { try { await navigator.clipboard.writeText(doc); toast('Documento copiado', 'ok'); } catch { toast('Copia manual: ' + doc); } };
+  $('#cons-read').onclick = () => {
+    const parsed = parseRegistraduria($('#cons-paste').value, doc);
+    const v = parsed || { departamento:'', municipio:'', puesto:'', direccion:'', mesa:'' };
+    $('#cons-step2').innerHTML = `
+      <p class="eyebrow" style="margin:14px 0 6px;">Revisa y guarda</p>
+      ${field('Departamento', inputEl('cn-dep'))}
+      ${field('Municipio', inputEl('cn-mun'))}
+      ${field('Puesto', inputEl('cn-pue'))}
+      ${field('Dirección', inputEl('cn-dir'))}
+      ${field('Mesa', inputEl('cn-mesa', 'inputmode="numeric"'))}
+      <button class="btn btn-primary btn-block" id="cn-save" style="margin-top:8px;">Guardar puesto</button>`;
+    $('#cn-dep').value = v.departamento; $('#cn-mun').value = v.municipio; $('#cn-pue').value = v.puesto; $('#cn-dir').value = v.direccion; $('#cn-mesa').value = v.mesa;
+    if (!parsed) toast('No reconocí la tabla; escribe o corrige los campos.', 'err');
+    $('#cn-save').onclick = async () => {
+      const body = { ...auth(), documento: doc, departamento: val('cn-dep'), municipio: val('cn-mun'), puesto: val('cn-pue'), direccion: val('cn-dir'), mesa: val('cn-mesa') };
+      if (!body.puesto && !body.mesa) return toast('Faltan datos del puesto', 'err');
+      const btn = $('#cn-save'); saving(btn, true);
+      try { const r = await api('priv.puestoGuardar', {}, 'POST', body); saving(btn, false);
+        if (!r.ok) return toast(r.msg || 'No se pudo guardar', 'err');
+        closeLayer(); toast('Puesto guardado', 'ok'); bdUpsertCard(r.card);
+      } catch (e) { fallaRed(e); saving(btn, false); }
+    };
+  };
+  consMarcas(doc, card);   // 25/07: checks POR CONFIRMAR / A LA ESPERA (solo casos nuevos) · 11/11: al instante con la tarjeta
+}
+
+/* ---- 25/07 · Checks de estado en "Consultar puesto de votación" ----
+   Dos opciones EXCLUYENTES entre sí y excluyentes con la consulta pegada:
+     POR CONFIRMAR  → validar con el líder si el documento es correcto
+     A LA ESPERA    → no aparece aún en el censo de Registraduría
+   Solo se ofrecen si el registro NO tiene todavía consulta de la
+   Registraduría (sin DEPARTAMENTO/PUESTO/DIRECCION/MESA). Al marcar uno se
+   bloquea el área de pegado; al guardar solo se escribe la columna
+   MUNICIPIO (H) con ese texto, nada más. */
+/* 09/11/2026 · POR CONFIRMAR exige el motivo. Lo ve el líder en SUAREZ →
+   Mis referidos (antes RONALD-POSTCONSULTA) y queda en la trazabilidad. */
+/* 11/11/2026 · los motivos ya no están fijos: salen de Configuración →
+   Avanzado (CORE Motivos_PC.gs, llegan en priv.baseDatos · pc.motivos).
+   Sin ellos, los 4 de fábrica (js/motivos-pc.js). Solo los ACTIVOS. */
+function consMotivos() {
+  return (window.MOTIVOS_PC ? MOTIVOS_PC.activos() : []).map(m => ({ v: m.v, t: m.t || m.v, d: m.d || '' }));
+}
+const CONS_MARCAS = [
+  { v: 'POR CONFIRMAR', d: 'Validar con el líder si el documento es correcto' },
+  { v: 'A LA ESPERA',   d: 'No aparece aún en el censo de Registraduría' }
+];
+/* 11/11/2026 · AL INSTANTE: la tarjeta ya trae municipio, puesto, mesa y
+   motivo (priv.baseDatos fmt=2), así que las opciones se pintan sin esperar
+   priv.persona (medido 3,2-4,3 s). El CORE revisa la fila fresca al guardar
+   (puestoSinConsulta_). Solo una tarjeta vieja sin esos campos va al servidor. */
+async function consMarcas(doc, card) {
+  let p = null;
+  const t0 = performance.now();
+  if (card && card.puestoCrudo !== undefined && card.mesa !== undefined) {
+    p = { MUNICIPIO: card.municipio, PUESTO: card.puestoCrudo, MESA: card.mesa, MOTIVO_CONFIRMAR: card.motivo };
+  } else {
+    try { const r = await api('priv.persona', { documento: doc, ...auth() }); if (r && r.ok) p = r.persona; } catch (e) { return; }
+  }
+  if (!p) return;
+  const box = $('#cons-marks');
+  if (!box || box.dataset.doc !== String(doc)) return;            // el modal se cerró o ya es el de otra persona
+  const lleno = (k) => String(p[k] || '').trim() !== '';
+  if (lleno('DEPARTAMENTO') || lleno('PUESTO') || lleno('DIRECCION') || lleno('MESA')) return;  // ya consultado
+  const actual = String(p['MUNICIPIO'] || '').trim().toUpperCase();
+  const motObj = window.MOTIVOS_PC ? MOTIVOS_PC.de(p['MOTIVO_CONFIRMAR']) : null;   /* 09/11/2026 · 11/11: también por texto anterior */
+  const actualMot = motObj ? motObj.v : String(p['MOTIVO_CONFIRMAR'] || '').trim().toUpperCase();
+  const CONS_MOTIVOS = consMotivos();
+
+  box.innerHTML = `<div class="cons-marks">
+    <p class="eyebrow" style="margin:14px 0 6px;">O márcalo sin consultar</p>
+    ${CONS_MARCAS.map(m => `<button type="button" class="cons-mark ${actual === m.v ? 'on' : ''}" data-m="${esc(m.v)}">
+      <span class="cm-box"></span><span class="cm-txt"><b>${esc(m.v)}</b><small>${esc(m.d)}</small></span></button>`).join('')}
+    <div class="cons-motivo" id="cons-motivo" hidden>
+      <p class="eyebrow" style="margin:12px 0 6px;">Motivo (obligatorio)</p>
+      ${CONS_MOTIVOS.map(m => `<button type="button" class="cons-mot ${actualMot === m.v ? 'on' : ''}" data-v="${esc(m.v)}"><span class="cm-box"></span><span class="cm-txt"><b>${esc(m.t)}</b><small>${esc(m.d)}</small></span></button>`).join('')}
+      <p class="small muted" style="margin:6px 2px 0;">El líder de esta persona lo verá en la web de Validación de registros con esta explicación.</p>
+    </div>
+    <button class="btn btn-primary btn-block cons-mark-save" id="cons-mk-save">Guardar estado</button>
+  </div>`;
+
+  const btns = $$('#cons-marks .cons-mark');
+  const mots = $$('#cons-marks .cons-mot');
+  const save = $('#cons-mk-save');
+  mots.forEach(b => b.onclick = () => { mots.forEach(x => x.classList.remove('on')); b.classList.add('on'); pintar(); });
+  const motSel = () => { const m = mots.filter(b => b.classList.contains('on'))[0]; return m ? m.dataset.v : ''; };
+  const pintar = () => {
+    const sel = btns.filter(b => b.classList.contains('on'))[0];
+    const pideMot = !!sel && sel.dataset.m === 'POR CONFIRMAR';
+    const caja = $('#cons-motivo'); if (caja) caja.hidden = !pideMot;
+    save.disabled = pideMot && !motSel();
+    const wrap = $('#cons-paste-wrap'), read = $('#cons-read'), ta = $('#cons-paste');
+    if (wrap) wrap.classList.toggle('cons-off', !!sel);
+    if (ta) ta.disabled = !!sel;
+    if (read) read.disabled = !!sel;
+    if (sel) { const s2 = $('#cons-step2'); if (s2) s2.innerHTML = ''; }
+    save.style.display = sel ? '' : 'none';
+    delete save.dataset.txt;                          // el rótulo cambia: que saving() no restaure el viejo
+    save.textContent = sel ? ('Guardar “' + sel.dataset.m + '”') : 'Guardar estado';
+  };
+  btns.forEach(b => b.onclick = () => {
+    const yaEstaba = b.classList.contains('on');
+    btns.forEach(x => x.classList.remove('on'));       // 1 sola a la vez
+    if (!yaEstaba) b.classList.add('on');              // re-toque = desmarcar
+    pintar();
+  });
+  save.onclick = async () => {
+    const sel = btns.filter(b => b.classList.contains('on'))[0];
+    if (!sel) return;
+    const motivo = sel.dataset.m === 'POR CONFIRMAR' ? motSel() : '';
+    if (sel.dataset.m === 'POR CONFIRMAR' && !motivo) return toast('Elige el motivo', 'err');
+    saving(save, true);
+    try {
+      const r = await api('priv.puestoGuardar', {}, 'POST', { ...auth(), documento: doc, marca: sel.dataset.m, motivo });
+      saving(save, false);
+      if (!r.ok) return toast(r.msg || 'No se pudo guardar', 'err');
+      closeLayer(); toast('Estado guardado', 'ok'); bdUpsertCard(r.card);
+    } catch (e) { fallaRed(e); saving(save, false); }
+  };
+  pintar();
+  if (window.RED && RED.pantalla) RED.pantalla('bd.consultarMarcas', performance.now() - t0);
+}
+
+/* Parser tolerante del texto pegado de la Registraduría.
+   Prioriza filas separadas por TAB (copia de tabla). Devuelve la fila cuyo
+   primer campo (NUIP) coincide con el documento, o la última fila de datos. */
+function parseRegistraduria(text, targetDoc) {
+  const t = String(text || '').replace(/\r/g, '');
+  const tgt = normDocJs(targetDoc);
+  const lines = t.split('\n').map(l => l.trim()).filter(Boolean);
+  let best = null, fallback = null;
+  for (const line of lines) {
+    let cells = line.split('\t').map(c => c.trim()).filter(c => c !== '');
+    if (cells.length < 6) cells = line.split(/\s{2,}/).map(c => c.trim()).filter(Boolean); // 2+ espacios
+    if (cells.length < 6) continue;
+    const nuip = normDocJs(cells[0]);
+    if (!/^\d{3,12}$/.test(nuip)) continue; // encabezado u otra línea
+    const rec = { departamento: cells[1], municipio: cells[2], puesto: cells[3], direccion: cells[4], mesa: normDocJs(cells[cells.length - 1]) };
+    fallback = rec;
+    if (nuip === tgt) { best = rec; break; }
+  }
+  return best || fallback;
+}
+
+/* ============================================================
+   01/08 · SUBIR — CARGA MASIVA DE PUESTO DE VOTACIÓN
+   ------------------------------------------------------------
+   El archivo se lee AQUÍ, en el navegador (vendor/xlsx.mini.min.js, que se
+   carga solo la primera vez que se toca "Subir": no pesa en el arranque de
+   la app). Así se puede mostrar la vista previa —cuántos se actualizan,
+   cuáles no están en la base, cuáles se quedan sin puesto— ANTES de tocar
+   la hoja. El CORE solo recibe filas ya limpias.
+
+   Formato esperado (el de la consulta de la Registraduría, tal cual):
+     A documento · B departamento · C municipio · D puesto · E dirección · F mesa
+   Con o sin fila de encabezados: una fila cuya primera celda no tenga
+   dígitos se descarta sola.
+
+   REGLAS acordadas el 01/08:
+     • lo que trae el archivo MANDA: celda vacía BORRA lo que hubiera;
+     • un documento que no esté en la base se ignora y se reporta;
+     • documento repetido en el archivo: vale el último.
+
+   Antes de escribir nada el CORE devuelve el estado ANTERIOR de las 5
+   columnas de cada fila tocada: con eso se arma el Excel de respaldo, que
+   tiene el MISMO formato y se puede volver a subir para deshacer.
+   ============================================================ */
+const BD_LOTE_TANDA = 300;          // filas por llamada (el CORE tolera hasta 500)
+const BD_LOTE_COLS = ['DOCUMENTO', 'DEPARTAMENTO', 'MUNICIPIO', 'PUESTO', 'DIRECCION', 'MESA', 'MOTIVO'];
+/* 09/11/2026 · columna G MOTIVO (solo para POR CONFIRMAR) y C con fórmula:
+   al pegar un documento en A, C queda POR CONFIRMAR. */
+/* 11/11/2026 · los ACTIVOS de Configuración (js/motivos-pc.js) */
+function bdLoteMotivos() { return window.MOTIVOS_PC ? MOTIVOS_PC.activos().map(m => m.v) : []; }
+const BD_LOTE_FILAS = 3000;   // filas con fórmula y lista en la plantilla
+function bdLoteMotivoNorm(v) { return window.MOTIVOS_PC ? MOTIVOS_PC.norm(v) : (String(v || '').trim() ? '?' : ''); }   /* 11/11/2026 · igual que pcMotivoNorm_ */
+/* Plantilla: SheetJS arma el libro; la lista desplegable de G se inyecta en
+   el XML de la hoja (SheetJS no escribe validaciones) con su propio CFB. */
+function bdLotePlantillaBin(X) {
+  const ws = X.utils.aoa_to_sheet([BD_LOTE_COLS.slice()]);
+  for (let r = 2; r <= BD_LOTE_FILAS; r++) ws['C' + r] = { t: 's', v: '', f: `IF(A${r}<>"","POR CONFIRMAR","")` };
+  ws['!ref'] = 'A1:G' + BD_LOTE_FILAS;
+  ws['!cols'] = BD_LOTE_COLS.map(c => ({ wch: c === 'MOTIVO' ? 40 : (c === 'DIRECCION' || c === 'PUESTO' ? 28 : 16) }));
+  const wb = X.utils.book_new();
+  X.utils.book_append_sheet(wb, ws, 'PUESTOS');
+  /* 11/11/2026 · la lista vive en una hoja oculta MOTIVOS: los motivos salen de
+     Configuración y en línea Excel no admite más de 255 caracteres ni comas. */
+  const mots = bdLoteMotivos();
+  X.utils.book_append_sheet(wb, X.utils.aoa_to_sheet(mots.map(m => [m])), 'MOTIVOS');
+  wb.Workbook = { Sheets: [{ Hidden: 0 }, { Hidden: 1 }] };
+  const bin = X.write(wb, { bookType: 'xlsx', type: 'array' });
+  const z = X.CFB.read(new Uint8Array(bin), { type: 'array' });
+  const ruta = z.FullPaths.find(p => /xl\/worksheets\/sheet1\.xml$/.test(p));
+  let xml = new TextDecoder().decode(z.FileIndex[z.FullPaths.indexOf(ruta)].content);
+  const dv = `<dataValidations count="1"><dataValidation type="list" allowBlank="1" showInputMessage="1" showErrorMessage="1" errorStyle="stop" errorTitle="Motivo no válido" error="Elige uno de los motivos de la lista." promptTitle="Motivo" prompt="Solo si MUNICIPIO (C) es POR CONFIRMAR." sqref="G2:G${BD_LOTE_FILAS}"><formula1>MOTIVOS!$A$1:$A$${Math.max(1, mots.length)}</formula1></dataValidation></dataValidations>`;
+  /* Excel exige el ORDEN del esquema (CT_Worksheet): dataValidations va antes
+     de todo esto. SheetJS escribe ignoredErrors al final; si la lista queda
+     después, Excel declara el archivo dañado (09/11/2026). */
+  const tras = /<(hyperlinks|printOptions|pageMargins|pageSetup|headerFooter|rowBreaks|colBreaks|customProperties|cellWatches|ignoredErrors|smartTags|drawing|legacyDrawing|legacyDrawingHF|picture|oleObjects|controls|webPublishItems|tableParts|extLst)([ >\/])/;
+  /* 11/11/2026 · reemplazo con función: dv lleva $A$1 y replace lo tomaría como grupo */
+  xml = tras.test(xml) ? xml.replace(tras, (m0, g1, g2) => dv + '<' + g1 + g2) : xml.replace('</worksheet>', () => dv + '</worksheet>');
+  X.CFB.utils.cfb_add(z, ruta, new TextEncoder().encode(xml));
+  return X.CFB.write(z, { fileType: 'zip', type: 'array', compression: true });
+}
+let BD_XLSX_LIB = null;
+
+/* Carga perezosa del lector de Excel. Una sola vez por sesión. */
+function cargarXlsx() {
+  if (window.XLSX) return Promise.resolve(window.XLSX);
+  if (BD_XLSX_LIB) return BD_XLSX_LIB;
+  BD_XLSX_LIB = new Promise((res, rej) => {
+    const s = document.createElement('script');
+    s.src = 'js/vendor/xlsx.mini.min.js';
+    s.onload = () => window.XLSX ? res(window.XLSX) : rej(new Error('lector'));
+    s.onerror = () => { BD_XLSX_LIB = null; rej(new Error('lector')); };
+    document.head.appendChild(s);
+  });
+  return BD_XLSX_LIB;
+}
+
+/* 01/08 (2ª) · El botón "Subir" ya no abre la carga de una: primero ofrece
+   bajar la plantilla vacía. Quien nunca ha hecho la carga suele necesitar
+   antes el archivo con los títulos en el orden correcto. */
+function bdSubir() {
+  openSheet(`<div class="grip"></div><h2 class="h2" style="margin-bottom:4px;">Puesto de votación</h2>
+    <p class="muted small">Descarga la plantilla para llenarla, o sube el archivo ya diligenciado.</p>
+    <div class="stack" style="margin-top:16px;">
+      <button class="btn btn-ghost btn-block" id="lote-tpl">${I.download} Descargar plantilla</button>
+      <button class="btn btn-primary btn-block" id="lote-open">${I.upload} Actualización masiva</button>
+    </div>`, 'sheet-lote');
+  $('#lote-tpl').onclick = () => bdLotePlantilla($('#lote-tpl'));
+  $('#lote-open').onclick = () => bdLoteMasiva();
+}
+
+/* Excel vacío: SOLO la fila de títulos, en el orden que espera la carga. */
+async function bdLotePlantilla(btn) {
+  saving(btn, true);
+  try {
+    const X = await cargarXlsx();
+    const bin = new Uint8Array(bdLotePlantillaBin(X));
+    let b64 = '';
+    for (let i = 0; i < bin.length; i += 0x8000) b64 += String.fromCharCode.apply(null, bin.subarray(i, i + 0x8000));
+    downloadB64(btoa(b64), 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'PLANTILLA_CARGA_PUESTOS.xlsx');
+    saving(btn, false);
+    toast('Plantilla descargada', 'ok');
+  } catch (e) {
+    saving(btn, false);
+    toast(e && e.message === 'lector' ? 'No se pudo cargar el lector de Excel' : 'No se pudo generar la plantilla', 'err');
+  }
+}
+
+function bdLoteMasiva() {
+  openSheet(`<div class="grip"></div><h2 class="h2" style="margin-bottom:4px;">Actualización masiva de puesto de votación</h2>
+    <p class="muted small">Sube el Excel con los datos consultados y se actualizan las columnas de votación de cada documento.</p>
+    <div class="lote-guia">
+      <div class="lote-guia-t">Así debe venir el archivo</div>
+      <div class="lote-cols">
+        <span><b>A</b> Documento</span><span><b>B</b> Departamento</span><span><b>C</b> Municipio</span>
+        <span><b>D</b> Puesto</span><span><b>E</b> Dirección</span><span><b>F</b> Mesa</span>
+        <span><b>G</b> Motivo</span>
+      </div>
+      <ul class="lote-notas">
+        <li>Con o sin fila de títulos, da igual.</li>
+        <li>En la plantilla, al pegar un documento en A, <b>C queda POR CONFIRMAR</b> sola. Si pegas encima lo consultado, se reemplaza.</li>
+        <li><b>G Motivo</b> (lista): ${bdLoteMotivos().join(', ')}, solo para POR CONFIRMAR. Es lo que verá el líder en Validación de registros.</li>
+        <li>La columna A manda: se actualiza la fila de ese documento.</li>
+        <li><b>Celda vacía borra el dato.</b> Una fila con solo “POR CONFIRMAR” en C deja el resto en blanco.</li>
+        <li>Formatos: .xlsx o .csv</li>
+      </ul>
+    </div>
+    <input type="file" id="lote-file" accept=".xlsx,.csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,text/csv" style="display:none;" />
+    <button class="btn btn-primary btn-block" id="lote-pick" style="margin-top:14px;">Elegir archivo</button>
+    <div id="lote-res"></div>`, 'sheet-lote');
+
+  $('#lote-pick').onclick = () => $('#lote-file').click();
+  $('#lote-file').onchange = async (e) => {
+    const f = e.target.files[0]; if (!f) return;
+    const btn = $('#lote-pick'); saving(btn, true);
+    try {
+      const filas = await bdLoteLeer(f);
+      saving(btn, false);
+      if (!filas.length) return toast('El archivo no trae ningún documento', 'err');
+      bdLotePrevia(filas, f.name);
+    } catch (err) {
+      saving(btn, false);
+      toast(err && err.message === 'lector' ? 'No se pudo cargar el lector de Excel' : 'No pude leer ese archivo', 'err');
+    }
+  };
+}
+
+/* Archivo → filas limpias [{d,g,h,i,j,k}] (la última repetición gana) */
+async function bdLoteLeer(file) {
+  const X = await cargarXlsx();
+  const buf = await file.arrayBuffer();
+  const wb = X.read(new Uint8Array(buf), { type: 'array', sheetStubs: true });   /* stubs: ver la fórmula de C aunque no esté calculada */
+  const ws = wb.Sheets[wb.SheetNames[0]];
+  const aoa = X.utils.sheet_to_json(ws, { header: 1, defval: '', raw: false, blankrows: true });
+  /* 09/11/2026 · C con la fórmula de la plantilla pero sin valor calculado
+     (algún programa no la recalculó): con documento en A vale POR CONFIRMAR. */
+  const r0 = X.utils.decode_range(ws['!ref'] || 'A1').s.r;
+  aoa.forEach((fila, i) => {
+    const cel = ws['C' + (r0 + i + 1)];
+    if (fila && cel && cel.f && /POR CONFIRMAR/i.test(cel.f) && !String(fila[2] || '').trim() && String(fila[0] || '').trim()) fila[2] = 'POR CONFIRMAR';
+  });
+  return bdLoteFilas(aoa);
+}
+
+function bdLoteFilas(aoa) {
+  const orden = [], mapa = new Map();
+  (aoa || []).forEach(r => {
+    const c = (i) => String(r && r[i] != null ? r[i] : '').trim();
+    const d = normDocJs(c(0));
+    if (!d) return;                       // encabezado, fila vacía o basura
+    if (!mapa.has(d)) orden.push(d);
+    mapa.set(d, {
+      d, g: c(1).toUpperCase(), h: c(2).toUpperCase(),
+      i: c(3).toUpperCase(), j: c(4).toUpperCase(), k: c(5),
+      m: bdLoteMotivoNorm(c(6))   /* 09/11/2026 · '' | motivo | '?' (no válido) */
+    });
+  });
+  return orden.map(d => mapa.get(d));
+}
+
+/* Vista previa contra lo que ya está cargado en pantalla (BD_ALL): no hace
+   falta preguntarle nada al servidor para saber quién existe y quién no. */
+function bdLotePrevia(filas, nombreArchivo) {
+  const enBase = new Set(BD_ALL.map(c => normDocJs(c.documento)));
+  const hay = filas.filter(f => enBase.has(f.d));
+  const faltan = filas.filter(f => !enBase.has(f.d));
+  const enBlanco = hay.filter(f => !f.g && !f.i && !f.j && !f.k);
+  const fuera = hay.filter(f => !MV.esMunicipio(f.h));
+
+  const avisos = [];
+  if (enBlanco.length) avisos.push(`<li><b>${enBlanco.length.toLocaleString('es-CO')}</b> quedan sin departamento, puesto, dirección ni mesa (lo que tuvieran se borra).</li>`);
+  if (fuera.length) avisos.push(`<li><b>${fuera.length.toLocaleString('es-CO')}</b> quedan con municipio distinto de ${esc(MV.municipio)}: esos documentos <b>no podrán registrar voto</b> en la app de Votación.</li>`);
+  /* 09/11/2026 · motivo de POR CONFIRMAR (columna G) */
+  const porConf = hay.filter(f => f.h === 'POR CONFIRMAR');
+  const sinMot = porConf.filter(f => !f.m || f.m === '?');
+  const malMot = hay.filter(f => f.m === '?');
+  const motSobra = hay.filter(f => f.h !== 'POR CONFIRMAR' && f.m && f.m !== '?');
+  if (porConf.length) avisos.push(`<li><b>${porConf.length.toLocaleString('es-CO')}</b> quedan POR CONFIRMAR y aparecerán a su líder en Validación de registros.</li>`);
+  if (sinMot.length) avisos.push(`<li><b>${sinMot.length.toLocaleString('es-CO')}</b> POR CONFIRMAR van <b>sin motivo</b> (columna G vacía${malMot.length ? ' o no válida' : ''}): el líder los verá como “Por confirmar”.</li>`);
+  if (motSobra.length) avisos.push(`<li><b>${motSobra.length.toLocaleString('es-CO')}</b> traen motivo pero no están POR CONFIRMAR: el motivo no se guarda.</li>`);
+
+  $('#lote-res').innerHTML = `
+    <div class="lote-resumen">
+      <div class="lote-file">${esc(nombreArchivo || 'Archivo')}</div>
+      <div class="lote-kpis">
+        <div class="lote-kpi ok"><b>${hay.length.toLocaleString('es-CO')}</b><span>se actualizan</span></div>
+        <div class="lote-kpi ${faltan.length ? 'warn' : ''}"><b>${faltan.length.toLocaleString('es-CO')}</b><span>no están en la base</span></div>
+        <div class="lote-kpi"><b>${filas.length.toLocaleString('es-CO')}</b><span>filas leídas</span></div>
+      </div>
+      ${avisos.length ? `<ul class="lote-avisos">${avisos.join('')}</ul>` : ''}
+      ${hay.length ? `<div class="lote-tabla-wrap"><table class="lote-tabla">
+        <thead><tr>${BD_LOTE_COLS.map(c => `<th>${esc(c)}</th>`).join('')}</tr></thead>
+        <tbody>${hay.slice(0, 5).map(f => `<tr><td>${esc(f.d)}</td><td>${esc(f.g)}</td><td>${esc(f.h)}</td><td>${esc(f.i)}</td><td>${esc(f.j)}</td><td>${esc(f.k)}</td><td>${esc(f.h === 'POR CONFIRMAR' && f.m !== '?' ? f.m : '')}</td></tr>`).join('')}</tbody>
+      </table>${hay.length > 5 ? `<p class="muted small" style="margin-top:6px;">Se muestran las 5 primeras.</p>` : ''}</div>` : ''}
+      ${faltan.length ? `<button class="btn btn-quiet btn-block" id="lote-faltan">Ver los ${faltan.length.toLocaleString('es-CO')} que no están</button>` : ''}
+      <div class="stack" style="margin-top:14px;">
+        <button class="btn btn-primary btn-block" id="lote-go" ${hay.length ? '' : 'disabled'}>Actualizar ${hay.length.toLocaleString('es-CO')} registro(s)</button>
+        <button class="btn btn-quiet btn-block" data-close>Cancelar</button>
+      </div>
+    </div>`;
+
+  layer.querySelectorAll('[data-close]').forEach(b => b.onclick = closeLayer);
+  const vf = $('#lote-faltan');
+  if (vf) vf.onclick = () => copiarTexto(faltan.map(f => f.d).join('\n'), `${faltan.length} documento(s) copiados`);
+  if (hay.length) $('#lote-go').onclick = () => bdLoteAplicar(hay);
+}
+
+async function bdLoteAplicar(filas) {
+  const tandas = [];
+  for (let i = 0; i < filas.length; i += BD_LOTE_TANDA) tandas.push(filas.slice(i, i + BD_LOTE_TANDA));
+
+  $('#lote-res').innerHTML = `<div class="lote-prog">
+      <p class="muted small" id="lote-prog-t">Actualizando… no cierres la app.</p>
+      <div class="lote-bar"><i id="lote-bar-i" style="width:0%"></i></div>
+    </div>`;
+  const pick = $('#lote-pick'); if (pick) pick.disabled = true;
+
+  let n = 0, antes = [], faltan = [], nuevos = [];
+  try {
+    for (let t = 0; t < tandas.length; t++) {
+      const r = await api('priv.puestoLote', {}, 'POST', { ...auth(), filas: tandas[t], conMotivo: true }, { silent: true });
+      if (!r.ok) throw new Error(r.msg || 'No se pudo actualizar');
+      n += Number(r.n || 0);
+      antes = antes.concat(r.antes || []);
+      faltan = faltan.concat(r.noEncontrados || []);
+      (r.puestosNuevos || []).forEach(p => { if (nuevos.indexOf(p) < 0) nuevos.push(p); });
+      const pct = Math.round(((t + 1) / tandas.length) * 100);
+      const bar = $('#lote-bar-i'); if (bar) bar.style.width = pct + '%';
+      const txt = $('#lote-prog-t'); if (txt) txt.textContent = `Actualizando… ${n.toLocaleString('es-CO')} de ${filas.length.toLocaleString('es-CO')}`;
+    }
+  } catch (e) {
+    const res = $('#lote-res');
+    if (res) res.innerHTML = `<p class="lote-err">Se interrumpió: ${esc(e.message || 'error de conexión')}.<br>Se alcanzaron a actualizar ${n.toLocaleString('es-CO')} registro(s).</p>
+      <button class="btn btn-quiet btn-block" data-close style="margin-top:10px;">Cerrar</button>`;
+    if (antes.length) bdLoteFinal(n, antes, faltan, nuevos, true);
+    else layer.querySelectorAll('[data-close]').forEach(b => b.onclick = closeLayer);
+    toast('La carga no terminó', 'err');
+    await bdLoteRecargar();
+    return;
+  }
+
+  toast(`${n.toLocaleString('es-CO')} registro(s) actualizados`, 'ok');
+  bdLoteFinal(n, antes, faltan, nuevos, false);
+  await bdLoteRecargar();
+}
+
+function bdLoteFinal(n, antes, faltan, nuevos, parcial) {
+  const res = $('#lote-res'); if (!res) return;
+  res.innerHTML = `<div class="lote-resumen">
+      <div class="lote-kpis">
+        <div class="lote-kpi ok"><b>${n.toLocaleString('es-CO')}</b><span>actualizados</span></div>
+        ${faltan.length ? `<div class="lote-kpi warn"><b>${faltan.length.toLocaleString('es-CO')}</b><span>no están en la base</span></div>` : ''}
+      </div>
+      ${parcial ? `<p class="lote-err">La carga quedó a medias: el respaldo cubre solo lo que alcanzó a cambiar.</p>` : ''}
+      ${nuevos.length ? `<ul class="lote-avisos"><li>Puestos que no están en el catálogo de Configuración → Elecciones: <b>${nuevos.slice(0, 6).map(esc).join(' · ')}</b>${nuevos.length > 6 ? ` y ${nuevos.length - 6} más` : ''}. El Dashboard los agrupa como “Otro municipio” hasta que los agregues.</li></ul>` : ''}
+      <div class="stack" style="margin-top:14px;">
+        <button class="btn btn-ghost btn-block" id="lote-bk">${I.download} Descargar respaldo (cómo estaban antes)</button>
+        ${faltan.length ? `<button class="btn btn-quiet btn-block" id="lote-nf">Copiar los ${faltan.length.toLocaleString('es-CO')} no encontrados</button>` : ''}
+        <button class="btn btn-primary btn-block" data-close>Listo</button>
+      </div>
+      <p class="muted small" style="margin-top:10px;">El respaldo tiene el mismo formato: si algo salió mal, vuelve a subirlo y todo queda como estaba.</p>
+    </div>`;
+  layer.querySelectorAll('[data-close]').forEach(b => b.onclick = closeLayer);
+  $('#lote-bk').onclick = () => bdLoteRespaldo(antes);
+  const nf = $('#lote-nf');
+  if (nf) nf.onclick = () => copiarTexto(faltan.join('\n'), `${faltan.length} documento(s) copiados`);
+}
+
+/* Excel de respaldo, con el MISMO orden de columnas que se sube */
+async function bdLoteRespaldo(antes) {
+  try {
+    const X = await cargarXlsx();
+    const aoa = [BD_LOTE_COLS.slice()].concat(antes.map(f => f.slice(0, 7)));
+    const wb = X.utils.book_new();
+    X.utils.book_append_sheet(wb, X.utils.aoa_to_sheet(aoa), 'ANTES');
+    const b64 = X.write(wb, { bookType: 'xlsx', type: 'base64' });
+    const d = new Date(), p2 = (x) => String(x).padStart(2, '0');
+    const nom = `RESPALDO_PUESTOS_${d.getFullYear()}${p2(d.getMonth() + 1)}${p2(d.getDate())}_${p2(d.getHours())}${p2(d.getMinutes())}.xlsx`;
+    downloadB64(b64, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', nom);
+  } catch (e) { toast('No se pudo generar el respaldo', 'err'); }
+}
+
+/* Tras el lote la lista de tarjetas queda vieja: se vuelve a pedir entera
+   (son cientos de filas cambiadas; traer tarjeta por tarjeta sería peor). */
+async function bdLoteRecargar() {
+  try {
+    const r = await api('priv.baseDatos', Object.assign({ caller: BD_ME, act: '1' }, RAP.params()), 'GET', null, { silent: true });
+    if (!r || r.ok === false) return;
+    RAP.guardar('priv.baseDatos', r, r.__rapCrudo);
+    if (r.pc) window.BD_PC = r.pc;
+    BD_ALL = r.items || []; BD_COLS = r.columnas || []; BD_DASH = r.dash || BD_DASH;
+    if (window.bdActDato) bdActDato(r.act);
+    bdBuildIntChips(); bdApplyFilter();
+  } catch (e) { /* la vista sigue usable; el refresco en vivo la pondrá al día */ }
+}
+
+/* ---- AGREGAR nuevo contacto (documento primero, luego se desbloquea) ---- */
+function bdAgregar() {
+  /* 08/11/2026 · sin señal no se puede buscar el documento: se anota en Pendientes */
+  if (window.SINRED && !SINRED.enLinea() && window.PEND) return PEND.anotar({ dueno: BD_ME || (getActive() || {}).documento, titulo: 'Anotar sin señal' });
+  openSheet(`<div class="grip"></div><h2 class="h2" style="margin-bottom:6px;">Agregar contacto</h2>
+    <p class="muted small">Primero el documento: lo buscamos para no duplicar. Si está libre, se habilita el resto.</p>
+    <div class="stack">
+      <div class="ag-doc">
+        ${field('Documento', inputEl('a-doc', 'inputmode="numeric"'))}
+        <button class="btn btn-ghost" id="a-buscar">Buscar</button>
+      </div>
+      <div id="a-msg"></div>
+      <fieldset id="a-rest" disabled class="ag-rest">
+        ${field('Nombre completo', inputEl('a-nombre', 'placeholder="Nombres y apellidos"'))}
+        ${field('Contacto (WhatsApp)', inputEl('a-contacto', 'inputmode="numeric" maxlength="10"'))}
+        ${field('Residencia', comboboxHtml('a-resi', 'Escribe para buscar…'))}
+        ${field('Referencia (N° de líder, opcional)', inputEl('a-ref', 'inputmode="numeric"'))}
+        <button class="btn btn-primary btn-block" id="a-save">Guardar y crear tarjeta</button>
+      </fieldset>
+    </div>`);
+  onlyDigits($('#a-doc')); onlyDigits($('#a-contacto')); onlyDigits($('#a-ref'));
+  getResidencias().then(l => bindCombobox('a-resi', l));
+  const unlock = (on) => { $('#a-rest').disabled = !on; };
+  $('#a-buscar').onclick = async () => {
+    const d = onlyDig(val('a-doc'));
+    if (!/^\d{5,10}$/.test(d)) return toast('Documento inválido (5 a 10 dígitos)', 'err');
+    const btn = $('#a-buscar'); saving(btn, true);
+    try {
+      const r = await api('priv.validarDoc', { documento: d, ...auth() }); saving(btn, false);
+      if (r.existe) { $('#a-msg').innerHTML = `<div class="ag-warn">Ya existe: <b>${esc(r.nombre || d)}</b>. No se puede duplicar.</div>`; unlock(false); }
+      else { $('#a-msg').innerHTML = `<div class="ag-ok">Documento disponible. Completa los datos.</div>`; unlock(true); $('#a-nombre').focus(); }
+    } catch (e) { fallaRed(e); saving(btn, false); }
+  };
+  $('#a-save').onclick = async () => {
+    const body = { ...auth(), documento: onlyDig(val('a-doc')), nombre: val('a-nombre'), contacto: onlyDig(val('a-contacto')), residencia: val('a-resi'), referencia: onlyDig(val('a-ref')) };
+    if (body.nombre.split(/\s+/).filter(Boolean).length < 2) return toast('Escribe el nombre completo', 'err');
+    const btn = $('#a-save'); saving(btn, true);
+    try {
+      const r = await api('priv.personaAgregar', {}, 'POST', body); saving(btn, false);
+      if (!r.ok) return toast(r.msg || 'No se pudo crear', 'err');
+      closeLayer(); toast('Contacto creado', 'ok');
+      // asegurar que se vea (pestaña Todos) y anteponer
+      $$('#bd-chips .bd-chip').forEach(x => x.classList.toggle('active', x.dataset.f === 'Todos'));
+      if (($('#bd-q')||{}).value) $('#bd-q').value = '';
+      bdUpsertCard(r.card, true);
+    } catch (e) { fallaRed(e); saving(btn, false); }
+  };
+}
+
+/* Identidad del usuario logueado para los endpoints priv.* (va como `caller`
+   para no colisionar con el `documento` de la persona objetivo) */
+function auth() { return { caller: BD_ME }; }
+
+/* ---------- Combobox con búsqueda (residencia) ---------- */
+function comboboxHtml(id, ph) { return `<div class="combo" id="${id}-combo"><input class="input" id="${id}" placeholder="${esc(ph || 'Escribe para buscar…')}" autocomplete="off" /><div class="combo-list" id="${id}-list" hidden></div></div>`; }
+function bindCombobox(id, options) {
+  const input = $('#' + id), list = $('#' + id + '-list'); if (!input) return;
+  const paint = (q) => {
+    const f = (options || []).filter(o => String(o).toLowerCase().includes(String(q || '').toLowerCase())).slice(0, 60);
+    list.innerHTML = f.length ? f.map(o => `<button type="button" class="combo-opt" data-v="${esc(o)}">${esc(o)}</button>`).join('') : `<div class="combo-empty">Sin resultados</div>`;
+    list.querySelectorAll('.combo-opt').forEach(b => b.onclick = () => { input.value = b.dataset.v; list.hidden = true; });
+  };
+  input.onfocus = () => { paint(input.value); list.hidden = false; };
+  input.oninput = () => { paint(input.value); list.hidden = false; };
+}
+document.addEventListener('click', (e) => { $$('.combo-list').forEach(l => { const c = l.closest('.combo'); if (c && !c.contains(e.target)) l.hidden = true; }); });
+
+
+/* ============================================================
+   DESCARGA de archivos base64 (Excel/PDF generados en el CORE)
+   ============================================================ */
+function downloadB64(base64, mime, filename) {
+  try {
+    const bin = atob(base64); const len = bin.length; const bytes = new Uint8Array(len);
+    for (let i = 0; i < len; i++) bytes[i] = bin.charCodeAt(i);
+    const blob = new Blob([bytes], { type: mime || 'application/octet-stream' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a'); a.href = url; a.download = filename || 'archivo';
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+    return true;
+  } catch (e) { toast('No se pudo descargar el archivo', 'err'); return false; }
+}
+
+/* ============================================================
+   LÍDERES  (app privada · Módulo 4 · hoja LIDERES)
+   Tarjetas con Ver / WhatsApp / Teléfono / Editar / Acciones + Agregar.
+   Color por total de referidos (calculado en vivo en el CORE):
+   >=50 verde · >=10 azul · <10 rojo.
+   ============================================================ */
+let LD_ALL = [], LD_ME = '', LD_FILT = [], LD_SHOWN = 0, LD_PLANT = null;
+/* 25/07: columnas de la hoja LIDERES para el Exportar (llegan de priv.lideres;
+   el respaldo es el esquema real por si una versión vieja del CORE no las manda). */
+let LD_COLS = [];
+const LD_COLS_FALLBACK = ['CODIGO', 'NOMBRE', 'DOCUMENTO', 'CONTACTO', 'RESIDENCIA', 'PADRINO', 'REFERIDOS', 'CORREO', 'CONTRASEÑA', 'CLASIFICACION'];
+const LD_COLS_DEFECTO = ['CODIGO', 'NOMBRE', 'DOCUMENTO', 'CONTACTO', 'RESIDENCIA', 'PADRINO', 'REFERIDOS', 'CLASIFICACION'];
+const LD_BATCH = 60;
+function ldAuth() { return { caller: LD_ME }; }
+
+/* ============================================================
+   31/07 · CLASIFICACIÓN DEL LÍDER (columna CLASIFICACION de LIDERES)
+   ------------------------------------------------------------
+   El catálogo REAL llega del CORE en priv.lideres → r.clases; lo de
+   abajo es solo el respaldo por si el CORE aún no está publicado.
+   Lo que viaja y lo que se guarda es el VALOR (mayúscula, sin tildes);
+   la etiqueta y el emoji son de pantalla. LD_CLASE_FILT vacío = todas.
+   ============================================================ */
+const LD_CLASES_FALLBACK = [
+  { valor: 'PRINCIPAL',          etiqueta: 'Principal',          emoji: '⭐' },
+  { valor: 'SUGERIDO POR LIDER', etiqueta: 'Sugerido por l\u00EDder', emoji: '🔍' },
+  { valor: 'FAMILIAR',           etiqueta: 'Familiar',           emoji: '👩‍👩‍👧‍👧' },
+  { valor: 'PROCESOS INTERNOS',  etiqueta: 'Procesos Internos',  emoji: '👩🏻‍💻' }
+];
+let LD_CLASES = LD_CLASES_FALLBACK.slice();
+let LD_CLASE_FILT = new Set();
+function ldClases() { return (LD_CLASES && LD_CLASES.length) ? LD_CLASES : LD_CLASES_FALLBACK; }
+function ldClaseInfo(v) {
+  const s = String(v == null ? '' : v).toUpperCase().trim();
+  return ldClases().find(k => k.valor === s) || ldClases()[0];
+}
+/* 01/09/2026 · el botón Activado va en ESTA misma fila, a la derecha del
+   chip de clasificación: mismo alto, misma píldora y sin salto de línea,
+   para no ensanchar la tarjeta. El chip es el que cede espacio (se recorta
+   con puntos suspensivos) porque el botón siempre tiene que poder tocarse. */
+function ldClaseChip(c) {
+  const k = ldClaseInfo(c.clasificacion);
+  return `<div class="ld-clase-row"><span class="ld-clase" title="Clasificaci\u00F3n del l\u00EDder"><i>${k.emoji}</i>${esc(k.etiqueta)}</span>${ldActivadoHtml(c)}</div>`;
+}
+function ldClaseSelect(id, valor) {
+  const v = ldClaseInfo(valor).valor;
+  return `<select class="input" id="${id}">${ldClases().map(k =>
+    `<option value="${esc(k.valor)}"${k.valor === v ? ' selected' : ''}>${k.emoji} ${esc(k.etiqueta)}</option>`).join('')}</select>`;
+}
+
+/* ============================================================
+   AJUSTES 16/07 · MEMORIA MENSUAL DE LÍDERES
+   ------------------------------------------------------------
+   El 1 de cada mes el CORE cierra el mes anterior: guarda el balance de
+   todos los líderes, archiva las filas y deja ASISTENCIA e INTENCION en
+   blanco para que los líderes las vuelvan a llenar desde la app pública.
+   Aquí se consulta ese histórico y se descarga el PDF cuando se quiera.
+   ============================================================ */
+async function ldMemoria() {
+  openSheet(`<div class="grip"></div><h2 class="h2">Memoria mensual</h2>${loadingBox('Cargando meses…')}`);
+  try {
+    const r = await api('priv.balances', ldAuth());
+    if (!r.ok) { closeLayer(); return toast(r.msg || 'No se pudo cargar', 'err'); }
+    const meses = r.meses || [];
+    const lista = meses.length ? meses.map(m => `<article class="ld-mes">
+        <div class="ld-mes-h">
+          <b>${esc(m.mesTxt)}</b>
+          <span class="ld-trab ${ldTrabColor(m.pct)}"><b>${m.pct}%</b> trab.</span>
+        </div>
+        <div class="ld-mes-m small muted">${m.lideres} líder(es) · ${Number(m.ref).toLocaleString('es-CO')} referidos · cerrado ${esc(m.fechaCierre || '—')}</div>
+        <div class="ld-mes-acts">
+          <button class="bd-btn" data-ver="${esc(m.mes)}">Ver</button>
+          <button class="bd-btn" data-exp="${esc(m.mes)}">${I.download} Exportar</button>
+        </div>
+        <div class="ld-mes-acts" data-menu="${esc(m.mes)}" style="display:none;">
+          <button class="bd-btn" data-pdf="${esc(m.mes)}">PDF</button>
+          <button class="bd-btn" data-xlsx="${esc(m.mes)}">Excel</button>
+        </div>
+      </article>`).join('')
+      : `<p class="muted center" style="padding:22px 0;">Todavía no hay ningún mes guardado.<br><span class="small">El primer cierre se hace solo el 1 de agosto: guarda julio, lo archiva y deja las columnas listas para el mes nuevo.</span></p>`;
+    openSheet(`<div class="grip"></div>
+      <h2 class="h2" style="margin-bottom:4px;">Memoria mensual</h2>
+      <p class="muted small">Balance del trabajo de cada líder, guardado el primer día de cada mes.</p>
+      <div class="ld-meses">${lista}</div>`);
+    $$('#layer [data-ver]').forEach(b => b.onclick = () => ldMemoriaVer(b.dataset.ver));
+    /* 01/08: "Exportar" abre el menú del propio mes (PDF o Excel) y cierra
+       el que estuviera abierto en otra tarjeta. */
+    $$('#layer [data-exp]').forEach(b => b.onclick = () => {
+      const caja = $(`#layer [data-menu="${b.dataset.exp}"]`);
+      const abierto = caja && caja.style.display === 'flex';
+      $$('#layer [data-menu]').forEach(m => m.style.display = 'none');
+      if (caja && !abierto) caja.style.display = 'flex';
+    });
+    $$('#layer [data-pdf]').forEach(b => b.onclick = () => ldMemoriaPdf(b.dataset.pdf, b));
+    $$('#layer [data-xlsx]').forEach(b => b.onclick = () => ldMemoriaXlsx(b.dataset.xlsx, b));
+  } catch (e) { closeLayer(); fallaRed(e); }
+}
+
+async function ldMemoriaVer(mes) {
+  openSheet(`<div class="grip"></div><h2 class="h2">Balance</h2>${loadingBox('Cargando balance…')}`, 'sheet-xl');
+  try {
+    const r = await api('priv.balanceVer', { mes, ...ldAuth() });
+    if (!r.ok) { closeLayer(); return toast(r.msg || 'No se pudo cargar', 'err'); }
+    const filas = r.items.map(x => `<tr>
+        <td>#${esc(x.codigo)}</td><td class="ld-mes-td">${esc(x.lider)}</td><td>${x.ref}</td>
+        <td>${x.firme}</td><td>${x.noVota}</td><td>${x.noSeguro}</td><td>${x.noSabe}</td>
+        <td>${x.noContactado}</td><td>${x.noFid}</td><td><b class="${ldTrabColor(x.pct)}">${x.pct}%</b></td>
+      </tr>`).join('');
+    openSheet(`<div class="grip"></div>
+      <div class="det-head"><h2 class="h2">${esc(r.mesTxt)}</h2><span class="small muted">${r.total} líder(es)</span></div>
+      <div class="ld-mes-tabla">
+        <table class="sim-table">
+          <thead><tr><th>#</th><th>Líder</th><th>Ref</th><th>Firme</th><th>No vota</th><th>No seguro(a)</th><th>No sabe</th><th>No contactado</th><th>No fidelizados</th><th>% trab.</th></tr></thead>
+          <tbody>${filas}</tbody>
+        </table>
+      </div>
+      <div style="display:flex;gap:8px;margin-top:12px;">
+        <button class="btn btn-primary" id="ld-mes-pdf" style="flex:1 1 0;min-width:0;">${I.download} Descargar PDF</button>
+        <button class="btn btn-ghost" id="ld-mes-xlsx" style="flex:1 1 0;min-width:0;">${I.download} Descargar Excel</button>
+      </div>`, 'sheet-xl');
+    $('#ld-mes-pdf').onclick = () => ldMemoriaPdf(mes, $('#ld-mes-pdf'));
+    $('#ld-mes-xlsx').onclick = () => ldMemoriaXlsx(mes, $('#ld-mes-xlsx'));
+  } catch (e) { closeLayer(); fallaRed(e); }
+}
+
+async function ldMemoriaPdf(mes, btn) {
+  if (btn) saving(btn, true);
+  try {
+    const r = await api('priv.balancePdf', {}, 'POST', { mes, ...ldAuth() });
+    if (btn) saving(btn, false);
+    if (!r.ok) return toast(r.msg || 'No se pudo generar', 'err');
+    downloadB64(r.base64, r.mime, r.filename);
+    toast('PDF generado', 'ok');
+  } catch (e) { if (btn) saving(btn, false); toast('Error al generar el PDF', 'err'); }
+}
+
+/* 01/08 · Excel del mes (todos los líderes, una fila cada uno). Es la misma
+   tabla del informe, sin fila de totales, para poder filtrar y hacer tablas
+   dinámicas. El CORE lo arma con priv.balanceXlsx (Balance_Export.gs). */
+async function ldMemoriaXlsx(mes, btn) {
+  if (btn) saving(btn, true);
+  try {
+    const r = await api('priv.balanceXlsx', {}, 'POST', { mes, ...ldAuth() });
+    if (btn) saving(btn, false);
+    if (!r.ok) return toast(r.msg || 'No se pudo generar', 'err');
+    downloadB64(r.base64, r.mime, r.filename);
+    toast('Excel generado', 'ok');
+  } catch (e) { if (btn) saving(btn, false); toast('Error al generar el Excel', 'err'); }
+}
+
+function ldColor(ref) {
+  const n = Number(ref) || 0;
+  if (n >= 50) return 'ld-verde';
+  if (n >= 10) return 'ld-azul';
+  return 'ld-rojo';
+}
+const esMovilPriv = () => /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+
+/* Texto de una ACCIÓN listo para WhatsApp.
+   El .replace de %0A es RED DE SEGURIDAD: desde el Módulo 9.1 las plantillas
+   se guardan con saltos de línea de verdad, así que no encuentra nada. Se
+   deja por si alguien pega un texto viejo que todavía los traiga. Al enlace
+   de WhatsApp el %0A se lo pone encodeURIComponent solito, en ldWaOpen. */
+function ldWaText(tipo, c) {
+  const t = (LD_PLANT && LD_PLANT[tipo]) || '';
+  return t.replace(/\[NOMBRE\]/g, c.nombre || '')
+          .replace(/\[CODIGO\]/g, c.codigo || '')
+          .replace(/\[REFERIDOS\]/g, String(c.referidos || 0))
+          .replace(/%0A/g, '\n');
+}
+/* Abre WhatsApp del líder con el texto prellenado (móvil vs PC, como el repo real) */
+function ldWaOpen(numero, texto) {
+  const num = String(numero || '').replace(/\D/g, '');
+  if (!num) { toast('El líder no tiene número de WhatsApp', 'err'); return; }
+  const url = esMovilPriv()
+    ? ('whatsapp://send?phone=' + encodeURIComponent(num) + '&text=' + encodeURIComponent(texto || ''))
+    : ('https://api.whatsapp.com/send?phone=' + encodeURIComponent(num) + '&text=' + encodeURIComponent(texto || ''));
+  window.open(url, '_blank');
+}
+
+/* ---- AJUSTES 16/07 · barra de trabajo del líder ----
+   % DE TRABAJO = intenciones registradas ÷ referidos (regla del usuario).
+   Cuenta CUALQUIER valor en INTENCION: "No vota con nosotros" y "No
+   contactado" (= no responde) también son trabajo. Lo que queda VACÍO es
+   "No fidelizado": nadie lo llamó. */
+function ldTrabColor(p) { return p >= 80 ? 'ld-verde' : p >= 40 ? 'ld-azul' : 'ld-rojo'; }
+function ldBarraHtml(c) {
+  const ref = Number(c.referidos || 0);
+  const pct = Number(c.pctTrabajo || 0);
+  if (!ref) return `<div class="ld-bar-wrap"><div class="ld-bar-lbl"><span class="muted small">Sin referidos todavía</span></div></div>`;
+  return `<div class="ld-bar-wrap">
+      <div class="ld-bar-lbl">
+        <span><b>${ref.toLocaleString('es-CO')}</b> ref.</span>
+        <span class="ld-trab ${ldTrabColor(pct)}"><b>${pct}%</b> trab.</span>
+      </div>
+      <div class="ld-bar" title="${Number(c.trabajadas || 0).toLocaleString('es-CO')} de ${ref.toLocaleString('es-CO')} referidos con intención registrada">
+        <div class="ld-bar-in ${ldTrabColor(pct)}" style="width:${Math.max(pct ? 2 : 0, pct)}%"></div>
+      </div>
+    </div>`;
+}
+
+function ldCardHtml(c) {
+  const tel = c.contacto ? String(c.contacto).replace(/^57/, '') : '';
+  return `<article class="bd-card ld-card ${ldColor(c.referidos)}" data-cod="${esc(c.codigo)}">
+    <div class="bd-top">
+      ${avatarHtml(c.nombre, c.foto)}
+      <div class="bd-id">
+        <b class="bd-nombre"><span class="ld-cod">#${esc(c.codigo)}</span> ${esc(c.nombre || 'Sin nombre')}</b>
+        <span class="bd-doc">CC ${esc(c.documento || '—')}</span>
+      </div>
+      <span class="ld-refs ${ldColor(c.referidos)}">${Number(c.referidos || 0).toLocaleString('es-CO')} ref.</span>
+    </div>
+    ${ldBarraHtml(c)}
+    <div class="bd-meta">
+      <span><span class="bd-k">Residencia</span> ${esc(c.residencia || '—')}</span>
+      <span><span class="bd-k">Padrino</span> ${esc(c.padrino || '—')}</span>
+    </div>
+    <div class="bd-acts ld-acts">
+      <button class="bd-btn" data-a="ver">Ver</button>
+      <button class="bd-btn ld-ic ld-btn-wa" data-a="wa" ${c.contacto ? '' : 'disabled'} title="WhatsApp">${I.wa}</button>
+      ${esMovilPriv() ? `<button class="bd-btn ld-ic ld-btn-tel" data-a="tel" ${tel ? '' : 'disabled'} title="Llamar">${I.phone}</button>` : ''}
+      <button class="bd-btn ld-ic" data-a="editar" title="Editar">${I.pencil}</button>
+      <button class="bd-btn ld-ic ld-btn-acc" data-a="acciones" title="Acciones">${I.dots}</button>
+      ${String(c.codigo) !== '1' ? `<button class="bd-btn ld-ic bd-btn-danger" data-a="eliminar" data-perm="bd.eliminar" title="Eliminar líder (traspasa sus referidos)">${I.trash}</button>` : ''}
+    </div>
+    ${ldClaseChip(c)}
+  </article>`;
+}
+
+/* ============================================================
+   ACTIVADO / NO ACTIVADO  (01/09/2026)
+   ------------------------------------------------------------
+   Un interruptor por tarjeta que SOLO vive en esta vista: gris "No
+   activado" → verde "Activado". Guarda al instante (priv.liderActivar) y
+   queda guardado en la columna ACTIVADO de LIDERES.
+
+   ARRASTRE (pliego del usuario)
+     · Activar a un padrino activa a sus AHIJADOS (los directos: los que
+       llevan su nombre en la columna Padrino).
+     · Volver a tocarlo pide confirmación y los desactiva a todos.
+     · Si a un líder ACTIVADO le cambian el padrino por uno que NO está
+       activado, ese líder pasa a No activado (se avisa antes, en Editar).
+
+   La app PÚBLICA no se entera de nada: este campo no viaja a ningún
+   endpoint público.
+   ============================================================ */
+const ldNorm = s => String(s == null ? '' : s).normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim().toUpperCase();
+
+function ldActivadoHtml(c) {
+  const on = !!c.activado;
+  return `<button type="button" class="bd-btn ld-act ${on ? 'ld-act-on' : 'ld-act-off'}" data-a="activar"
+    aria-pressed="${on ? 'true' : 'false'}" title="${on ? 'Tócalo para desactivar' : 'Tócalo para activar'}">
+    <i class="ld-act-dot"></i>${on ? 'Activado' : 'No activado'}</button>`;
+}
+
+/* Ahijados DIRECTOS según lo que ya está en pantalla (para el aviso). El
+   número que manda es el del CORE; esto solo sirve para redactar el texto. */
+function ldAhijadosDe(c) {
+  const nom = ldNorm(c && c.nombre);
+  if (!nom) return [];
+  return LD_ALL.filter(x => ldNorm(x.padrino) === nom && String(x.codigo) !== String(c.codigo));
+}
+function ldPorNombre(nombre) {
+  const n = ldNorm(nombre);
+  return n ? LD_ALL.find(x => ldNorm(x.nombre) === n) : null;
+}
+
+/* Repinta SOLO el botón de una tarjeta (no la tarjeta entera: se perdería
+   el scroll y el enganche de los demás botones). */
+function ldPintarActivado(cod) {
+  const c = ldFind(cod); if (!c) return;
+  const btn = $(`#ld-grid .ld-card[data-cod="${cssq(cod)}"] [data-a="activar"]`);
+  if (!btn) return;
+  const on = !!c.activado;
+  btn.className = `bd-btn ld-act ${on ? 'ld-act-on' : 'ld-act-off'}`;
+  btn.innerHTML = `<i class="ld-act-dot"></i>${on ? 'Activado' : 'No activado'}`;
+  btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+  btn.title = on ? 'Tócalo para desactivar' : 'Tócalo para activar';
+  btn.disabled = false;
+}
+
+/* Aplica en pantalla lo que respondió el CORE (él manda: puede haber tocado
+   ahijados que este dispositivo todavía no tenía al día). */
+function ldAplicarAfectados(lista) {
+  (lista || []).forEach(a => {
+    const x = ldFind(a.codigo);
+    if (!x) return;
+    x.activado = !!a.activado;
+    ldPintarActivado(a.codigo);
+  });
+}
+
+async function ldActivar(cod) {
+  const c = ldFind(cod);
+  if (!c) return toast('Líder no encontrado', 'err');
+  const btn = $(`#ld-grid .ld-card[data-cod="${cssq(cod)}"] [data-a="activar"]`);
+  const nuevo = !c.activado;
+  const hijos = ldAhijadosDe(c);
+
+  /* Solo al DESACTIVAR se pregunta, y solo si arrastra a alguien. */
+  if (!nuevo && hijos.length) {
+    const ok = await confirmar('Desactivar líder', 
+      crow('Líder', '#' + c.codigo + ' · ' + (c.nombre || '')) +
+      crow('Ahijados que se desactivan', hijos.length.toLocaleString('es-CO')) +
+      `<p class="muted small" style="margin:10px 2px 0;">Sus ahijados (${hijos.map(x => esc(x.nombre)).slice(0, 6).join(', ')}${hijos.length > 6 ? '…' : ''}) también quedarán en <b>No activado</b>.</p>`);
+    if (!ok) return;
+  }
+
+  if (btn) btn.disabled = true;
+  try {
+    const r = await api('priv.liderActivar', {}, 'POST', { ...ldAuth(), codigo: cod, on: nuevo });
+    if (!r.ok) { if (btn) btn.disabled = false; return toast(r.msg || 'No se pudo guardar', 'err'); }
+    ldAplicarAfectados(r.afectados);
+    const n = Number(r.ahijados || 0);
+    toast(nuevo
+      ? ('Activado' + (n ? ` · ${n.toLocaleString('es-CO')} ahijado(s) también` : ''))
+      : ('No activado' + (n ? ` · ${n.toLocaleString('es-CO')} ahijado(s) también` : '')), 'ok');
+  } catch (e) {
+    if (btn) btn.disabled = false;
+    fallaRed(e);
+  }
+}
+
+async function viewLideres(user) {
+  LD_ME = user.documento; LD_USER = user; appWide(true, true);
+  app.innerHTML = `${backbar('Líderes')}
+    <div class="pad">
+      <div class="bd-toolbar">
+        <div class="bd-search"><input class="input" id="ld-q" placeholder="Buscar por código, nombre, documento, residencia o padrino…" autocomplete="off" /></div>
+        <button class="btn btn-ghost" id="ld-tablero" title="Crecimiento y tipificación de cada líder, mes a mes">${I.trend} Tablero</button>
+        <button class="btn btn-ghost" id="ld-memoria">${I.chart} Memoria mensual</button>
+        <button class="btn btn-ghost" id="ld-exp">${I.download} Exportar</button>
+        <button class="btn btn-ghost" id="ld-bitinf" title="Informe de bitácoras por meses (PDF o Excel)">${I.book} Bitácoras</button>
+        <button class="btn btn-primary bd-add" id="ld-add">+ Agregar</button>
+      </div>
+      <div class="ld-legend">
+        <span class="ld-leg ld-rojo">&lt; 10</span>
+        <span class="ld-leg ld-azul">10 – 49</span>
+        <span class="ld-leg ld-verde">50 o más</span>
+        <span class="small muted">referidos por líder</span>
+      </div>
+      <div class="ld-clfil" id="ld-clfil"></div>
+      <div class="bd-count" id="ld-count"></div>
+      <div id="ld-body">${loadingBox('Cargando líderes…')}</div>
+      <div class="center" id="ld-more" style="margin-top:12px;"></div>
+    </div>`;
+  app.hidden = false; hideSplash();
+  $('#backbtn').onclick = () => go('home');
+  $('#ld-add').onclick = () => ldAgregar();
+  $('#ld-tablero').onclick = () => go('lidtablero');   /* 13/11/2026 · js/lid-tablero.js */
+  $('#ld-memoria').onclick = () => ldMemoria();
+  $('#ld-exp').onclick = () => ldExportar();
+  $('#ld-bitinf').onclick = () => ldBitInforme();
+  let primera = true;
+  try {
+    await rapCargar('priv.lideres', ldAuth(), (r) => {
+      if (!$('#ld-body')) return;
+      if (!r || r.ok === false) { if (primera) $('#ld-body').innerHTML = `<p class="muted center">No se pudo cargar.</p>`; return; }
+      LD_ALL = r.items || []; LD_PLANT = r.plantillas || null; LD_COLS = r.columnas || [];
+      if (r.clases && r.clases.length) LD_CLASES = r.clases;
+      if (r.hayClase === false && primera) toast('Falta la columna CLASIFICACION en la hoja LIDERES', 'err');
+      primera = false;
+      ldClfilRender(); ldApplyFilter();
+    });
+  } catch (e) { if ($('#ld-body') && primera) $('#ld-body').innerHTML = `${fallaHtml(e)}`; }
+  const q = $('#ld-q'); let t;
+  q.oninput = () => { clearTimeout(t); t = setTimeout(ldApplyFilter, 160); };
+
+  vivoBind('lideres', LD_ME, vivoLideres);   // EN VIVO
+}
+
+/* ---- EN VIVO · Líderes ---- (la lista es chica: se recarga entera) */
+async function vivoLideres(rev) {
+  const r = await api('priv.lideres', Object.assign(ldAuth(), RAP.params()), 'GET', null, SILENCIO);
+  if (!r || r.ok === false) return;
+  RAP.guardar('priv.lideres', r, r.__rapCrudo);
+  if (!vivoCambio(JSON.stringify(r.items))) return;
+  LD_ALL = r.items || []; LD_PLANT = r.plantillas || LD_PLANT; LD_COLS = r.columnas || LD_COLS;
+  if (r.clases && r.clases.length) LD_CLASES = r.clases;
+  ldClfilRender(); ldApplyFilter(); vivoCerrarHoja(rev);
+}
+
+/* Pastillas de clasificación (junto a la leyenda de colores). El conteo sale
+   de LD_ALL, no de lo filtrado: así siempre se ve cuántos hay de cada tipo. */
+function ldClfilRender() {
+  const box = $('#ld-clfil'); if (!box) return;
+  const cuenta = {};
+  LD_ALL.forEach(c => { const v = ldClaseInfo(c.clasificacion).valor; cuenta[v] = (cuenta[v] || 0) + 1; });
+  box.innerHTML = `<button class="ld-clchip${LD_CLASE_FILT.size ? '' : ' on'}" data-cl="">Todas</button>` +
+    ldClases().map(k => `<button class="ld-clchip${LD_CLASE_FILT.has(k.valor) ? ' on' : ''}" data-cl="${esc(k.valor)}"><i>${k.emoji}</i>${esc(k.etiqueta)} <b>${(cuenta[k.valor] || 0).toLocaleString('es-CO')}</b></button>`).join('');
+  box.querySelectorAll('[data-cl]').forEach(b => b.onclick = () => {
+    const v = b.dataset.cl;
+    if (!v) LD_CLASE_FILT.clear();
+    else if (LD_CLASE_FILT.has(v)) LD_CLASE_FILT.delete(v);
+    else LD_CLASE_FILT.add(v);
+    ldClfilRender(); ldApplyFilter();
+  });
+}
+
+function ldApplyFilter() {
+  const q = ((($('#ld-q') || {}).value) || '').trim().toLowerCase();
+  LD_FILT = LD_ALL.filter(c => {
+    if (LD_CLASE_FILT.size && !LD_CLASE_FILT.has(ldClaseInfo(c.clasificacion).valor)) return false;
+    if (!q) return true;
+    const hay = ('#' + c.codigo + ' ' + (c.nombre || '') + ' ' + (c.documento || '') + ' ' + (c.residencia || '') + ' ' + (c.padrino || '')).toLowerCase();
+    return hay.includes(q);
+  });
+  LD_SHOWN = 0;
+  const cEl = $('#ld-count'); if (cEl) cEl.textContent = `${LD_FILT.length.toLocaleString('es-CO')} líder(es)`;
+  const body = $('#ld-body'); if (body) body.innerHTML = `<div class="bd-grid" id="ld-grid"></div>`;
+  ldRenderMore();
+}
+function ldRenderMore() {
+  const grid = $('#ld-grid'); if (!grid) return;
+  const next = LD_FILT.slice(LD_SHOWN, LD_SHOWN + LD_BATCH);
+  grid.insertAdjacentHTML('beforeend', next.map(ldCardHtml).join(''));
+  LD_SHOWN += next.length;
+  $$('#ld-grid .ld-card').forEach(card => {
+    if (card._wired) return; card._wired = true;
+    card.querySelectorAll('.bd-btn').forEach(b => b.onclick = () => ldAccion(b.dataset.a, card.dataset.cod));
+  });
+  const more = $('#ld-more');
+  if (LD_SHOWN < LD_FILT.length) {
+    more.innerHTML = `<button class="btn btn-ghost" id="ld-more-btn">Ver más (${(LD_FILT.length - LD_SHOWN).toLocaleString('es-CO')} restantes)</button>`;
+    $('#ld-more-btn').onclick = ldRenderMore;
+  } else more.innerHTML = '';
+}
+/* ---- 25/07 · EXPORTAR LÍDERES (Excel / PDF con selección de columnas) ----
+   Exporta lo que está FILTRADO en pantalla, en el mismo orden en que se ve.
+   "REFERIDOS" es una columna CALCULADA en el CORE (conteo en vivo desde
+   PRINCIPAL); no existe en la hoja LIDERES. CORREO y CONTRASEÑA se ofrecen
+   pero salen DESMARCADAS a propósito. */
+function ldExpFiltroTxt() {
+  const q = ((($('#ld-q') || {}).value) || '').trim();
+  return q ? `Búsqueda: “${q}”` : 'Todos los líderes';
+}
+/* 31/07 · tipos marcados en la hoja de Exportar, cruzados con las pastillas
+   de la vista (si ya filtraste a “Familiar”, el Excel no puede traer más). */
+function ldExpTipos() {
+  const marcados = $$('#ld-tipick input:checked').map(i => i.dataset.t);
+  return LD_CLASE_FILT.size ? marcados.filter(v => LD_CLASE_FILT.has(v)) : marcados;
+}
+function ldExpCods() {
+  const t = new Set(ldExpTipos());
+  return LD_FILT.filter(c => t.has(ldClaseInfo(c.clasificacion).valor))
+                .map(c => String(c.codigo == null ? '' : c.codigo).trim())
+                .filter(Boolean);
+}
+function ldExpCodsCount() {
+  const el = $('#ldx-cods'); if (!el) return;
+  const n = ldExpCods().length;
+  el.textContent = n === 1 ? 'Se exporta 1 líder' : `Se exportan ${n.toLocaleString('es-CO')} líderes`;
+  el.classList.toggle('ldx-cods-cero', n === 0);
+}
+function ldExpSel() { return $$('#ld-colpick input:checked').map(i => i.dataset.c); }
+function ldExpCount() {
+  const el = $('#ldx-n'); if (!el) return;
+  const n = ldExpSel().length;
+  el.textContent = n === 1 ? '1 columna seleccionada' : `${n} columnas seleccionadas`;
+}
+function ldExportar() {
+  if (!LD_FILT.length) return toast('No hay líderes en el filtro actual', 'err');
+  const cols = (LD_COLS && LD_COLS.length) ? LD_COLS : LD_COLS_FALLBACK;
+  const marcadas = new Set(LD_COLS_DEFECTO);
+  const filtroTxt = ldExpFiltroTxt();
+  const cuenta = {};
+  LD_FILT.forEach(c => { const v = ldClaseInfo(c.clasificacion).valor; cuenta[v] = (cuenta[v] || 0) + 1; });
+  const tipos = ldClases().filter(k => !LD_CLASE_FILT.size || LD_CLASE_FILT.has(k.valor));
+  openSheet(`<div class="grip"></div>
+    <h2 class="h2" style="margin-bottom:4px;">Exportar líderes</h2>
+    <p class="muted small">${esc(filtroTxt)}. Elige el tipo de líder y después las columnas.</p>
+    <h3 class="ldx-h3">Tipo de líder</h3>
+    <div class="col-pick ldx-tipos" id="ld-tipick">
+      ${tipos.map(k => `<label class="col-opt"><input type="checkbox" data-t="${esc(k.valor)}" checked/> <span><i class="ldx-emo">${k.emoji}</i> ${esc(k.etiqueta)} <em class="ldx-tag">${(cuenta[k.valor] || 0).toLocaleString('es-CO')}</em></span></label>`).join('')}
+    </div>
+    <p class="small muted ldx-cods" id="ldx-cods"></p>
+    <h3 class="ldx-h3">Columnas</h3>
+    <div class="ldx-tools">
+      <span class="small muted" id="ldx-n"></span>
+      <div class="ldx-tbtns">
+        <button class="bd-btn" id="ldx-all">Marcar todo</button>
+        <button class="bd-btn" id="ldx-none">Ninguna</button>
+      </div>
+    </div>
+    <div class="col-pick" id="ld-colpick">
+      ${cols.map(c => `<label class="col-opt"><input type="checkbox" data-c="${esc(c)}" ${marcadas.has(String(c).toUpperCase()) ? 'checked' : ''}/> <span>${esc(String(c).replace(/_/g, ' '))}${String(c).toUpperCase() === 'REFERIDOS' ? ' <em class="ldx-tag">calculada</em>' : ''}</span></label>`).join('')}
+    </div>
+    <p class="small muted ldx-nota">“Referidos” se calcula al momento: registros activos de la base de datos con ese líder. Correo y contraseña quedan desmarcados por seguridad.</p>
+    <div class="ldx-acts">
+      <button class="btn btn-primary" id="ldx-excel">${I.download} Excel</button>
+      <button class="btn btn-ghost" id="ldx-pdf">${I.pdf} PDF</button>
+    </div>`);
+  $$('#ld-tipick input').forEach(i => i.onchange = ldExpCodsCount);
+  ldExpCodsCount();
+  $$('#ld-colpick input').forEach(i => i.onchange = ldExpCount);
+  $('#ldx-all').onclick = () => { $$('#ld-colpick input').forEach(i => i.checked = true); ldExpCount(); };
+  $('#ldx-none').onclick = () => { $$('#ld-colpick input').forEach(i => i.checked = false); ldExpCount(); };
+  ldExpCount();
+  const bajar = async (tipo, btn) => {
+    const columnas = ldExpSel();
+    if (!columnas.length) return toast('Elige al menos una columna', 'err');
+    const tipos = ldExpTipos();
+    if (!tipos.length) return toast('Elige al menos un tipo de líder', 'err');
+    const cods = ldExpCods();
+    if (!cods.length) return toast('Ningún líder coincide con el tipo elegido', 'err');
+    saving(btn, true);
+    try {
+      const r = await api(tipo === 'excel' ? 'priv.lideresExcel' : 'priv.lideresPdf', {}, 'POST',
+        { caller: LD_ME, codigos: cods, columnas, tipos, filtroTxt });
+      saving(btn, false);
+      if (!r.ok) return toast(r.msg || 'No se pudo generar', 'err');
+      downloadB64(r.base64, r.mime, r.filename);
+      closeLayer(); toast('Archivo generado', 'ok');
+    } catch (e) { saving(btn, false); toast('Error al generar el archivo', 'err'); }
+  };
+  $('#ldx-excel').onclick = () => bajar('excel', $('#ldx-excel'));
+  $('#ldx-pdf').onclick = () => bajar('pdf', $('#ldx-pdf'));
+}
+
+function ldFind(cod) { return LD_ALL.find(x => String(x.codigo) === String(cod)); }
+function ldUpsertCard(card, prepend) {
+  RAP.tocar('priv.lideres');   // la memoria queda parchada; la copia local se rehace en la próxima visita
+  const old = LD_ALL.find(x => String(x.codigo) === String(card.codigo));
+  if (old && card.foto === undefined) card.foto = old.foto;   // la tarjeta suelta no trae la foto
+  const i = LD_ALL.findIndex(x => String(x.codigo) === String(card.codigo));
+  if (i >= 0) LD_ALL[i] = card; else if (prepend) LD_ALL.unshift(card); else LD_ALL.push(card);
+  const node = $(`#ld-grid .ld-card[data-cod="${cssq(card.codigo)}"]`);
+  if (node) {
+    const nn = h(ldCardHtml(card)); nn._wired = true;
+    nn.querySelectorAll('.bd-btn').forEach(b => b.onclick = () => ldAccion(b.dataset.a, card.codigo));
+    node.replaceWith(nn);
+  } else ldApplyFilter();
+}
+function ldAccion(a, cod) {
+  const c = ldFind(cod);
+  if (a === 'ver') return ldVer(cod);
+  if (a === 'wa') return (c && c.contacto) ? ldWaOpen(c.contacto, '') : toast('Sin número de WhatsApp', 'err');
+  if (a === 'tel') { if (c && c.contacto) location.href = 'tel:+' + String(c.contacto).replace(/\D/g, ''); else toast('Sin número', 'err'); return; }
+  if (a === 'editar') return ldEditar(cod);
+  if (a === 'acciones') return ldAcciones(cod);
+  if (a === 'activar') return ldActivar(cod);   /* 01/09 */
+  if (a === 'eliminar') return window.ldEliminar ? ldEliminar(cod) : toast('Recarga la app para eliminar líderes', 'err');   /* 17/11/2026 · js/lid-eliminar.js */
+}
+
+/* ---- VER · FICHA DEL LÍDER (13/10/2026 · Fase 2) ----
+   Cabecera antes que datos: la ficha se pinta AL INSTANTE con lo que ya trae
+   la tarjeta (nombre, referidos, desglose, foto). Municipio, puesto y mesa
+   salen de la Base de Datos de la sesión si ya está cargada (cero viajes) y
+   si no, de priv.liderVer en segundo plano.
+   Las cifras son navegables: tocar un KPI o una intención abre los
+   referidos YA filtrados por eso. */
+const LD_INT_COLOR = {
+  'Firme con el voto': 'li-firme', 'No vota con nosotros': 'li-novota', 'No está seguro(a)': 'li-duda',
+  'No sabe votar': 'li-nosabe', 'No contactado': 'li-nocont'
+};
+function ldIntCls(label) { return LD_INT_COLOR[label] || 'li-otra'; }
+
+function ldVerAbierta(cod) { const r = $('#lf-root'); return !!(r && r.dataset.cod === String(cod)); }
+
+function ldDatosHtml(c, completo) {
+  const tel = c.telLocal || (c.contacto ? String(c.contacto).replace(/^57/, '') : '');
+  const falta = completo ? '—' : '…';
+  return [
+    ['Documento', c.documento || '—'],
+    ['WhatsApp', tel || '—'],
+    ['Residencia', c.residencia || '—'],
+    ['Padrino', c.padrino || '—'],
+    ['Correo', c.correo || '—'],
+    ['En base de datos', completo ? (c.enPrincipal ? 'Sí' : 'No') : falta],
+    ['Municipio', c.municipio || falta],
+    ['Puesto', c.puesto || falta],
+    ['Mesa', c.mesa || falta]
+  ].map(([k, v]) => `<div class="det-row"><span>${esc(k)}</span><b>${esc(v)}</b></div>`).join('');
+}
+
+function ldIntencionHtml(c) {
+  const ref = Number(c.referidos || 0);
+  if (!ref) return `<p class="small muted" style="margin:4px 0;">Este líder todavía no tiene referidos.</p>`;
+  const partes = (c.desglose || []).map(d => ({ label: d.label, n: Number(d.n || 0), pct: Number(d.pct || 0), cls: ldIntCls(d.label), k: d.label }));
+  const noFid = Number(c.noFidelizados || 0);
+  if (noFid) partes.push({ label: 'No fidelizados', n: noFid, pct: Number(c.pctNoFidelizados || 0), cls: 'li-nofid', k: '__sin' });
+  const barra = partes.filter(x => x.n > 0).map(x => `<i class="lf-seg ${x.cls}" style="flex:${x.n}" title="${esc(x.label)}: ${x.n.toLocaleString('es-CO')}"></i>`).join('');
+  const filas = partes.map(x => `<button type="button" class="lf-int" data-int="${esc(x.k)}">
+      <i class="lf-dot ${x.cls}"></i><span class="lf-int-l">${esc(x.label)}</span>
+      <span class="lf-int-n">${x.n.toLocaleString('es-CO')}</span><span class="lf-int-p">${x.pct}%</span>${I.chevR || ''}
+    </button>`).join('');
+  return `<div class="lf-bar">${barra}</div><div class="lf-ints">${filas}</div>
+    <p class="small muted ld-dg-nota">Sin intención registrada = no fidelizado (nadie lo ha contactado). “No contactado” sí es trabajo: lo llamaron y no responde.</p>`;
+}
+
+function ldVerHtml(c, completo) {
+  const ref = Number(c.referidos || 0), trab = Number(c.trabajadas || 0), nof = Number(c.noFidelizados || 0);
+  const firme = (c.desglose || []).find(d => d.label === 'Firme con el voto') || { n: 0, pct: 0 };
+  const kpi = (k, n, l, sub, cls) => `<button type="button" class="lf-kpi ${cls || ''}" data-int="${esc(k)}" ${ref ? '' : 'disabled'}>
+      <b>${Number(n || 0).toLocaleString('es-CO')}</b><span>${esc(l)}</span>${sub !== '' ? `<em>${esc(String(sub))}</em>` : ''}</button>`;
+  const tel = c.telLocal || (c.contacto ? String(c.contacto).replace(/^57/, '') : '');
+  return `<div class="grip"></div>
+    <div class="lf" id="lf-root" data-cod="${esc(c.codigo)}">
+      <header class="lf-head">
+        ${avatarHtml(c.nombre, c.foto, 'av-lg')}
+        <div class="lf-id">
+          <h2 class="h2">${esc(c.nombre || 'Sin nombre')}</h2>
+          <div class="lf-sub"><span class="ld-cod">#${esc(c.codigo)}</span> · CC ${esc(c.documento || '—')}${c.residencia ? ' · ' + esc(c.residencia) : ''}</div>
+          <div class="lf-chips">${(k => `<span class="lf-chip"><i>${k.emoji}</i> ${esc(k.etiqueta)}</span>`)(ldClaseInfo(c.clasificacion))}<span class="lf-chip ${c.activado ? 'lf-on' : ''}">${c.activado ? 'Activado' : 'No activado'}</span>${c.padrino ? `<span class="lf-chip">Padrino: ${esc(c.padrino)}</span>` : ''}</div>
+        </div>
+      </header>
+      <div class="lf-kpis">
+        ${kpi('', ref, 'Referidos', '', 'lf-k-ref')}
+        ${kpi('__trab', trab, 'Trabajados', (c.pctTrabajo || 0) + '%', 'lf-k-trab ' + ldTrabColor(Number(c.pctTrabajo || 0)))}
+        ${kpi('__sin', nof, 'No fidelizados', (c.pctNoFidelizados || 0) + '%', 'lf-k-nof')}
+        ${kpi('Firme con el voto', firme.n, 'Firmes con el voto', (firme.pct || 0) + '%', 'lf-k-firme')}
+      </div>
+      <div class="ld-ver-cols">
+        <div class="ld-ver-c1">
+          <section class="lf-card"><div class="lf-card-h"><b>Intención de voto</b><span class="small muted">Toca para ver a quiénes</span></div>${ldIntencionHtml(c)}</section>
+          <div id="ld-graf-box">${loadingBox('Cargando el año…')}</div>
+        </div>
+        <div class="ld-ver-c2">
+          <div class="det-list" id="lf-datos">${ldDatosHtml(c, completo)}</div>
+          <div class="ld-ver-acts">
+            <button class="btn btn-ghost" id="v-wa" ${c.contacto ? '' : 'disabled'}>${I.wa} WhatsApp</button>
+            ${esMovilPriv() ? `<button class="btn btn-ghost" id="v-tel" ${tel ? '' : 'disabled'}>${I.phone} Llamar</button>` : ''}
+          </div>
+          <div class="stack" style="margin-top:12px;">
+            <button class="btn btn-quiet btn-block" id="v-refs">${I.users} Referidos (${ref.toLocaleString('es-CO')})</button>
+            <button class="btn btn-quiet btn-block" id="ld-ahijados">Ahijados y delegación</button>
+            <button class="btn btn-primary btn-block" id="v-edit">Editar</button>
+            <button class="btn btn-quiet btn-block" id="v-acc">Acciones (mensajes)</button>
+            ${String(c.codigo) !== '1' ? `<button class="btn btn-quiet btn-block bd-btn-danger" id="v-elim" data-perm="bd.eliminar">${I.trash} Eliminar líder</button>` : ''}
+          </div>
+        </div>
+      </div>
+    </div>`;
+}
+
+function ldVerPintar(c, completo) {
+  const cod = c.codigo;
+  if (ldVerAbierta(cod)) {                                   // ya está abierta: solo se completan los datos
+    const d = $('#lf-datos'); if (d) d.innerHTML = ldDatosHtml(c, completo);
+    return;
+  }
+  openSheet(ldVerHtml(c, completo), 'sheet-xl');
+  ldGrafCargar(cod, c);
+  $('#ld-ahijados').onclick = () => ldAhijados(cod);
+  $('#v-refs').onclick = () => ldReferidos(cod, c.nombre, c.referidos);
+  $$('#lf-root [data-int]').forEach(b => b.onclick = () => ldReferidos(cod, c.nombre, c.referidos, { int: b.dataset.int }));
+  $('#v-wa').onclick = () => ldWaOpen(c.contacto, '');
+  if ($('#v-tel')) $('#v-tel').onclick = () => { location.href = 'tel:+' + String(c.contacto || '').replace(/\D/g, ''); };
+  $('#v-edit').onclick = () => { closeLayer(); ldEditar(cod); };
+  $('#v-acc').onclick = () => { closeLayer(); ldAcciones(cod); };
+  if ($('#v-elim')) $('#v-elim').onclick = () => { closeLayer(); ldAccion('eliminar', cod); };   /* 17/11/2026 */
+}
+
+async function ldVer(cod) {
+  const base = ldFind(cod);
+  if (base) ldVerPintar(Object.assign({}, base), false);
+  else openSheet(`<div class="grip"></div><h2 class="h2">Líder</h2>${loadingBox('Cargando…')}`);
+  /* Complemento sin viaje: la Base de Datos de la sesión ya sabe dónde vota */
+  const bd = RAP.tomar('priv.baseDatos');
+  if (base && bd && base.documento) {
+    const d = normDocJs(base.documento);
+    const pr = (bd.data.items || []).find(x => normDocJs(x.documento) === d);
+    return ldVerPintar(Object.assign({}, base, {
+      enPrincipal: !!pr, municipio: pr ? String(pr.municipio || '') : '', puesto: pr ? String(pr.puestoCrudo || '') : '',
+      mesa: pr ? String(pr.mesa || '') : '', telLocal: base.contacto ? String(base.contacto).replace(/^57/, '') : ''
+    }), true);
+  }
+  try {
+    const r = await api('priv.liderVer', { codigo: cod, ...ldAuth() }, 'GET', null, base ? SILENCIO : {});
+    if (!r.ok) { if (!base) { closeLayer(); toast(r.msg || 'No se pudo cargar', 'err'); } return; }
+    if (base && !ldVerAbierta(cod)) return;                   // la cerraron mientras tanto
+    const c = Object.assign({}, base || {}, r.lider);
+    if (base && base.foto && !c.foto) c.foto = base.foto;
+    ldVerPintar(c, true);
+  } catch (e) { if (!base) { closeLayer(); fallaRed(e); } }
+}
+
+/* ---- REFERIDOS del líder (13/10/2026 · tarjetas) ----
+   Antes era una tabla; ahora son tarjetas con avatar, municipio, puesto/mesa
+   e intención, en columnas que aprovechan el ancho en PC. Se pide UNA vez por
+   sesión (priv.liderReferidos, con su sello rv) y todo lo demás —buscar,
+   municipio, intención, seleccionar y reasignar, Excel— es local. */
+let RF_ALL = [], RF_FILT = [], RF_SHOWN = 0, RF_COLS = [], RF_COD = '', RF_NOMBRE = '';
+let RF_SEL = null;   // 22/07: null = modo normal · Set(documentos) = modo selección
+let RF_MUN = '';     // 31/08: pastilla de municipio activa ('' = todos)
+let RF_INT = '';     // 13/10: intención activa ('' todas · '__trab' con intención · '__sin' sin intención · etiqueta)
+const RF_BATCH = 60;
+const rfNorm = s => String(s == null ? '' : s).normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
+
+async function ldReferidos(cod, nombre, refCount, op) {
+  RF_COD = cod; RF_NOMBRE = nombre || ''; RF_SEL = null; RF_MUN = ''; RF_MUNS_TODOS = false;
+  RF_INT = (op && op.int) || '';
+  const cache = RAP.tomar('priv.liderReferidos:' + cod);
+  if (!cache) openSheet(`<div class="grip"></div>
+    <div class="det-head"><h2 class="h2">Referidos · ${esc(nombre || ('#' + cod))}</h2>
+      <span class="ld-refs">${Number(refCount || 0).toLocaleString('es-CO')} ref.</span></div>
+    ${loadingBox('Cargando referidos…')}`, 'sheet-xl');
+  let pintado = false;
+  try {
+    await rapCargar('priv.liderReferidos', { codigo: cod, ...ldAuth() }, (r) => {
+      if (String(RF_COD) !== String(cod)) return;              // ya abrió otro líder
+      if (!r || r.ok === false) { if (!pintado) { closeLayer(); toast((r && r.msg) || 'No se pudo cargar', 'err'); } return; }
+      RF_ALL = r.items || []; RF_COLS = r.columnas || [];
+      if (!pintado) rfRender(); else if ($('#rf-body')) rfApply();
+      pintado = true;
+    }, 'priv.liderReferidos:' + cod);
+  } catch (e) { if (!pintado) { closeLayer(); fallaRed(e); } }
+}
+
+/* Pinta la hoja de referidos desde memoria (sin volver a pedir datos) */
+function rfRender() {
+  openSheet(`<div class="grip"></div>
+    <div class="det-head"><h2 class="h2">Referidos · ${esc(RF_NOMBRE || ('#' + RF_COD))}</h2>
+      <span class="ld-refs">${RF_ALL.length.toLocaleString('es-CO')} ref.</span></div>
+    <section class="asis-sec">
+      <div class="asis-head">
+        <div class="bd-search"><input class="input" id="rf-q" placeholder="Buscar por documento, nombre, contacto, residencia, municipio, puesto o mesa…" autocomplete="off" /></div>
+        <button class="btn btn-ghost asis-xls" id="rf-xls" ${RF_ALL.length ? '' : 'hidden'}>${I.download} Excel</button>
+      </div>
+      <div class="rf-muns rf-ints" id="rf-ints"></div>
+      <div class="rf-muns" id="rf-muns"></div>
+      <div class="rf-acts" id="rf-acts" ${RF_ALL.length ? '' : 'hidden'}>${rfActsHtml()}</div>
+      <div id="rf-body"></div>
+    </section>
+    <div class="stack" style="margin-top:12px;">
+      <button class="btn btn-quiet btn-block" id="rf-back">Volver al líder</button>
+    </div>`, 'sheet-xl');
+  const q = $('#rf-q'); let t;
+  if (q) q.oninput = () => { clearTimeout(t); t = setTimeout(rfApply, 160); };
+  const xls = $('#rf-xls'); if (xls) xls.onclick = rfExcel;
+  const back = $('#rf-back'); if (back) back.onclick = () => ldVer(RF_COD);
+  rfBindActs();
+  rfApply();
+}
+
+/* ---- SELECCIÓN MÚLTIPLE + REASIGNAR (22/07) ----
+   Los botones viven en el encabezado de la hoja, no en cada fila. En
+   reposo solo se ve "Seleccionar"; al tocarlo el mismo botón pasa a ser
+   "Asignar Seleccionado(s) (N)" y aparecen "Todos" y "Cancelar". La
+   selección se guarda por DOCUMENTO, así que sobrevive al buscador y al
+   paginado ("Ver más"). */
+function rfActsHtml() {
+  if (!RF_SEL) return `<button class="btn btn-ghost" id="rf-sel">Seleccionar</button>`;
+  const n = RF_SEL.size;
+  const todos = RF_FILT.length && RF_FILT.every(x => RF_SEL.has(String(x.documento)));
+  return `<button class="btn btn-primary" id="rf-asig">Asignar Seleccionado(s)${n ? ` (${n.toLocaleString('es-CO')})` : ''}</button>
+    <button class="btn btn-ghost" id="rf-todos">${todos ? 'Ninguno' : 'Todos'}</button>
+    <button class="btn btn-quiet" id="rf-cancel">Cancelar</button>`;
+}
+
+function rfBindActs() {
+  const box = $('#rf-acts'); if (!box) return;
+  const sel = $('#rf-sel'); if (sel) sel.onclick = () => { RF_SEL = new Set(); rfPaintActs(); rfApply(); };
+  const can = $('#rf-cancel'); if (can) can.onclick = () => { RF_SEL = null; rfPaintActs(); rfApply(); };
+  const asg = $('#rf-asig'); if (asg) asg.onclick = rfReasignar;
+  const tod = $('#rf-todos'); if (tod) tod.onclick = () => {
+    const todos = RF_FILT.length && RF_FILT.every(x => RF_SEL.has(String(x.documento)));
+    RF_FILT.forEach(x => { const d = String(x.documento); if (todos) RF_SEL.delete(d); else RF_SEL.add(d); });
+    rfPaintActs(); rfPaintChecks();
+  };
+}
+
+/* Repinta solo la barra de botones (para no perder el scroll de la tabla) */
+function rfPaintActs() {
+  const box = $('#rf-acts'); if (!box) return;
+  box.innerHTML = rfActsHtml();
+  rfBindActs();
+}
+
+/* Sincroniza las casillas ya pintadas con el Set (tras "Todos"/"Ninguno") */
+function rfPaintChecks() {
+  const g = $('#rf-grid'); if (!g || !RF_SEL) return;
+  g.querySelectorAll('.rf-card[data-doc]').forEach(el => {
+    const on = RF_SEL.has(String(el.dataset.doc));
+    el.classList.toggle('rf-on', on);
+    const ck = el.querySelector('.rf-ck'); if (ck) ck.checked = on;
+  });
+}
+
+/* Toque en una tarjeta (delegado en la grilla): en modo selección la alterna;
+   el botón de WhatsApp abre el chat sin seleccionar. */
+function rfRowClick(ev) {
+  const wa = ev.target && ev.target.closest ? ev.target.closest('[data-wa]') : null;
+  if (wa) { ev.stopPropagation(); return ldWaOpen(wa.dataset.wa, ''); }
+  if (!RF_SEL) return;
+  const el = ev.target && ev.target.closest ? ev.target.closest('.rf-card[data-doc]') : null;
+  if (!el) return;
+  const d = String(el.dataset.doc || ''); if (!d) return;
+  if (RF_SEL.has(d)) RF_SEL.delete(d); else RF_SEL.add(d);
+  const on = RF_SEL.has(d);
+  el.classList.toggle('rf-on', on);
+  const ck = el.querySelector('.rf-ck'); if (ck) ck.checked = on;
+  rfPaintActs();
+}
+
+/* Reasigna TODOS los seleccionados al mismo líder, en una sola llamada */
+function rfReasignar() {
+  if (!RF_SEL || !RF_SEL.size) return toast('Toca las filas que quieres mover (o usa "Todos")');
+  const docs = Array.from(RF_SEL);
+  const fuera = docs.filter(d => !RF_FILT.some(x => String(x.documento) === d)).length;
+  const lideres = (typeof LD_ALL !== 'undefined' && LD_ALL.length ? LD_ALL : []).filter(l => String(l.codigo) !== String(RF_COD));
+  const label = l => `#${l.codigo} · ${l.nombre}`;
+  openSheet(`<div class="grip"></div>
+    <h2 class="h2">Reasignar líder</h2>
+    <p class="muted small" style="margin:-4px 0 10px;">${docs.length.toLocaleString('es-CO')} referido(s) seleccionado(s)${fuera ? ` · ${fuera.toLocaleString('es-CO')} fuera del filtro actual` : ''}</p>
+    <div class="reasg-cur"><span>Líder actual</span><b>${esc('#' + RF_COD + (RF_NOMBRE ? ' · ' + RF_NOMBRE : ''))}</b></div>
+    <label class="field" style="margin-top:12px;"><span>Nuevo líder</span>${comboboxHtml('reasg-lid', 'Escribe para buscar líder…')}</label>
+    <button class="btn btn-primary btn-block" id="reasg-save" style="margin-top:14px;">Reasignar</button>
+    <button class="btn btn-quiet btn-block" id="reasg-back" style="margin-top:8px;">Volver a referidos</button>`, 'reasg-sheet');
+  bindCombobox('reasg-lid', lideres.map(label));
+  const inp = $('#reasg-lid'); if (inp) inp.focus();
+  const back = $('#reasg-back'); if (back) back.onclick = rfRender;
+  $('#reasg-save').onclick = async () => {
+    const v = String((inp && inp.value) || '').trim();
+    const m = /^#(\d+)/.exec(v);
+    if (!m) return toast('Elige un líder de la lista', 'err');
+    const code = m[1];
+    if (String(code) === String(RF_COD)) return toast('Ese ya es su líder', 'err');
+    const btn = $('#reasg-save'); saving(btn, true);
+    try {
+      const r = await api('priv.personaReasignarLote', {}, 'POST', { caller: LD_ME, documentos: docs, referencia: code });
+      saving(btn, false);
+      if (!r.ok) return toast(r.msg || 'No se pudo reasignar', 'err');
+      const movidos = new Set(docs);
+      RF_ALL = RF_ALL.filter(x => !movidos.has(String(x.documento)));
+      RAP.olvidar('priv.liderReferidos:' + RF_COD); RAP.olvidar('priv.liderReferidos:' + code);
+      const n = Number(r.n || docs.length);
+      const src = ldFind(RF_COD); if (src) src.referidos = Math.max(0, Number(src.referidos || 0) - n);
+      const dst = ldFind(code);   if (dst) dst.referidos = Number(dst.referidos || 0) + n;
+      ldApplyFilter();
+      RF_SEL = null;
+      toast(`${n.toLocaleString('es-CO')} referido(s) reasignado(s)`, 'ok');
+      rfRender();
+    } catch (e) { fallaRed(e); saving(btn, false); }
+  };
+}
+
+/* ---- PASTILLAS DE MUNICIPIO (31/08/2026) ----
+   Debajo del buscador, el reparto por MUNICIPIO con los MISMOS colores de
+   la Base de Datos (bdColor). Tocar una pastilla filtra la tabla; volver a
+   tocarla la quita. El Excel exporta lo filtrado, así que "solo los de
+   Girardot" sale gratis. Se cuenta sobre el total del líder, no sobre lo
+   que quede tras buscar. */
+function rfMunClave(v) { return String(v == null ? '' : v).trim().toUpperCase() || 'SIN DATO'; }
+
+function rfMuns() {
+  const map = {};
+  RF_ALL.forEach(x => { const k = rfMunClave(x.municipio); map[k] = (map[k] || 0) + 1; });
+  return Object.keys(map).map(k => ({ k: k, n: map[k] }))
+    .sort((a, b) => (b.n - a.n) || a.k.localeCompare(b.k, 'es'));
+}
+
+/* Con líderes grandes la cola es larga (el líder N° 1 tiene 25 municipios
+   distintos, la mayoría con una sola persona): se muestran los 8 primeros y
+   el resto detrás de "+ N más". La pastilla activa siempre se ve. */
+const RF_MUNS_TOPE = 8;
+let RF_MUNS_TODOS = false;
+
+function rfPaintMuns() {
+  const caja = $('#rf-muns'); if (!caja) return;
+  const lista = rfMuns();
+  if (!RF_ALL.length || lista.length < 2) { caja.innerHTML = ''; return; }
+  let visibles = lista, resto = 0;
+  if (!RF_MUNS_TODOS && lista.length > RF_MUNS_TOPE + 1) {
+    visibles = lista.slice(0, RF_MUNS_TOPE);
+    resto = lista.length - visibles.length;
+    if (RF_MUN && !visibles.some(x => x.k === RF_MUN)) {
+      const sel = lista.find(x => x.k === RF_MUN);
+      if (sel) { visibles = visibles.slice(0, RF_MUNS_TOPE - 1).concat([sel]); resto = lista.length - visibles.length; }
+    }
+  }
+  caja.innerHTML = `<button type="button" class="rf-mun rf-mun-all ${RF_MUN ? '' : 'on'}" data-mun="">Todos <b>${RF_ALL.length.toLocaleString('es-CO')}</b></button>` +
+    visibles.map(x => `<button type="button" class="rf-mun ${bdColor(x.k)} ${RF_MUN === x.k ? 'on' : ''}" data-mun="${esc(x.k)}">${esc(x.k)} <b>${x.n.toLocaleString('es-CO')}</b></button>`).join('') +
+    (resto ? `<button type="button" class="rf-mun rf-mun-mas" id="rf-mun-mas">+ ${resto} más</button>` : '');
+  $$('#rf-muns .rf-mun').forEach(b => b.onclick = () => {
+    if (b.id === 'rf-mun-mas') { RF_MUNS_TODOS = true; return rfPaintMuns(); }
+    const v = b.dataset.mun;
+    RF_MUN = (RF_MUN === v) ? '' : v;
+    rfApply();
+  });
+}
+
+/* ---- PASTILLAS DE INTENCIÓN (13/10/2026) ----
+   Mismas etiquetas y colores de la ficha. Se llega aquí ya filtrado cuando
+   se toca un KPI o una intención en la ficha del líder. */
+function rfIntClave(v) { return rfNorm(String(v == null ? '' : v).trim()); }
+function rfInts() {
+  const map = new Map(); let sin = 0;
+  RF_ALL.forEach(x => {
+    const v = String(x.intencion || '').trim();
+    if (!v) { sin++; return; }
+    const k = rfIntClave(v);
+    if (!map.has(k)) map.set(k, { k: v, n: 0 });
+    map.get(k).n++;
+  });
+  const orden = LD_INT_ORDEN.map(rfIntClave);
+  const lista = Array.from(map.values()).sort((a, b) => {
+    const ia = orden.indexOf(rfIntClave(a.k)), ib = orden.indexOf(rfIntClave(b.k));
+    return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib) || b.n - a.n;
+  });
+  return { lista, sin };
+}
+function rfIntPasa(x) {
+  if (!RF_INT) return true;
+  const v = String(x.intencion || '').trim();
+  if (RF_INT === '__sin') return !v;
+  if (RF_INT === '__trab') return !!v;
+  return rfIntClave(v) === rfIntClave(RF_INT);
+}
+function rfPaintInts() {
+  const caja = $('#rf-ints'); if (!caja) return;
+  if (!RF_ALL.length) { caja.innerHTML = ''; return; }
+  const { lista, sin } = rfInts();
+  const trab = RF_ALL.length - sin;
+  const b = (k, txt, n, cls) => `<button type="button" class="rf-mun rf-int-p ${cls || ''} ${RF_INT === k ? 'on' : ''}" data-int="${esc(k)}">${esc(txt)} <b>${n.toLocaleString('es-CO')}</b></button>`;
+  caja.innerHTML = b('', 'Todas', RF_ALL.length, 'rf-mun-all') + b('__trab', 'Trabajados', trab, 'li-trab') +
+    lista.map(x => b(x.k, x.k, x.n, ldIntCls(x.k))).join('') + (sin ? b('__sin', 'No fidelizados', sin, 'li-nofid') : '');
+  caja.querySelectorAll('[data-int]').forEach(el => el.onclick = () => { const v = el.dataset.int; RF_INT = (RF_INT === v ? '' : v); rfApply(); });
+}
+
+function rfApply() {
+  const qEl = $('#rf-q'); const q = qEl ? rfNorm(qEl.value).trim() : '';
+  const base = RF_ALL.filter(x => (!RF_MUN || rfMunClave(x.municipio) === RF_MUN) && rfIntPasa(x));
+  RF_FILT = !q ? base.slice() : base.filter(x =>
+    rfNorm([x.documento, x.nombre, x.contacto, x.residencia, x.municipio, x.puesto, x.mesa, x.intencion].join(' ')).includes(q));
+  RF_SHOWN = 0;
+  rfPaintInts();
+  rfPaintMuns();
+  rfPaintActs();
+  const body = $('#rf-body'); if (!body) return;
+  if (!RF_FILT.length) {
+    body.innerHTML = `<p class="muted center small" style="padding:14px 0;">${RF_ALL.length ? 'Ningún referido coincide con el filtro.' : 'Este líder no tiene referidos todavía.'}</p>`;
+    return;
+  }
+  body.innerHTML = `<p class="small muted rf-cuenta">${RF_FILT.length.toLocaleString('es-CO')} de ${RF_ALL.length.toLocaleString('es-CO')} referido(s)</p>
+    <div class="rf-grid ${RF_SEL ? 'rf-picking' : ''}" id="rf-grid"></div>
+    <div class="center" id="rf-more" style="margin-top:10px;"></div>`;
+  const g = $('#rf-grid'); if (g) g.onclick = rfRowClick;
+  rfMore();
+}
+
+function rfCardHtml(x) {
+  const on = RF_SEL && RF_SEL.has(String(x.documento));
+  const tel = x.contacto ? String(x.contacto).replace(/^57/, '') : '';
+  const int = String(x.intencion || '').trim();
+  const mun = x.municipio || '';
+  const lugar = [x.puesto, x.mesa ? 'Mesa ' + x.mesa : ''].filter(Boolean).join(' · ');
+  return `<article class="rf-card ${on ? 'rf-on' : ''}" data-doc="${esc(x.documento || '')}">
+      ${RF_SEL ? `<input type="checkbox" class="rf-ck" ${on ? 'checked' : ''} aria-label="Seleccionar" />` : ''}
+      ${avatarHtml(x.nombre, x.foto)}
+      <div class="rf-c-main">
+        <b class="rf-c-nom">${esc(x.nombre || '—')}</b>
+        <span class="rf-c-sub">CC ${esc(x.documento || '—')}${tel ? ' · ' + esc(tel) : ''}</span>
+        <span class="rf-c-meta">${mun ? `<span class="bd-mun ${bdColor(mun)}">${esc(mun)}</span>` : ''}${lugar ? `<span class="rf-c-lugar">${esc(lugar)}</span>` : ''}</span>
+        ${x.residencia ? `<span class="rf-c-res">${esc(x.residencia)}</span>` : ''}
+      </div>
+      <div class="rf-c-side">
+        <span class="rf-int ${int ? ldIntCls(int) : 'li-nofid'}">${esc(int || 'Sin intención')}</span>
+        ${tel && !RF_SEL ? `<button type="button" class="rf-wa" data-wa="${esc(x.contacto)}" title="WhatsApp">${I.wa}</button>` : ''}
+      </div>
+    </article>`;
+}
+
+function rfMore() {
+  const g = $('#rf-grid'); if (!g) return;
+  const next = RF_FILT.slice(RF_SHOWN, RF_SHOWN + RF_BATCH);
+  g.insertAdjacentHTML('beforeend', next.map(rfCardHtml).join(''));
+  RF_SHOWN += next.length;
+  const more = $('#rf-more'); if (!more) return;
+  if (RF_SHOWN < RF_FILT.length) {
+    more.innerHTML = `<button class="btn btn-ghost" id="rf-more-btn">Ver más (${(RF_FILT.length - RF_SHOWN).toLocaleString('es-CO')} restantes)</button>`;
+    $('#rf-more-btn').onclick = rfMore;
+  } else more.innerHTML = '';
+}
+
+/* Excel con selección de columnas (igual que la Base de Datos): exporta lo FILTRADO */
+function rfExcel() {
+  const docs = RF_FILT.map(x => x.documento).filter(Boolean);
+  if (!docs.length) return toast('No hay referidos en el filtro actual', 'err');
+  const cols = RF_COLS.length ? RF_COLS : ['DOCUMENTO', 'NOMBRE', 'CONTACTO', 'RESIDENCIA', 'MUNICIPIO', 'PUESTO', 'MESA'];
+  const pref = new Set(['DOCUMENTO', 'NOMBRE', 'CONTACTO', 'RESIDENCIA', 'MUNICIPIO', 'PUESTO', 'MESA']);
+  const marcadas = new Set(cols.filter(c => pref.has(String(c).toUpperCase())));
+  openSheet(`<div class="grip"></div>
+    <h2 class="h2" style="margin-bottom:4px;">Exportar a Excel</h2>
+    <p class="muted small">${docs.length.toLocaleString('es-CO')} referido(s) · ${esc(RF_NOMBRE || ('#' + RF_COD))}. Elige las columnas:</p>
+    <div class="col-pick" id="rf-colpick">
+      ${cols.map(c => `<label class="col-opt"><input type="checkbox" data-c="${esc(c)}" ${marcadas.has(c) ? 'checked' : ''}/> <span>${esc(String(c).replace(/_/g, ' '))}</span></label>`).join('')}
+    </div>
+    <div class="stack" style="margin-top:12px;">
+      <button class="btn btn-primary btn-block" id="rf-colgo">${I.download} Descargar Excel</button>
+      <button class="btn btn-quiet btn-block" id="rf-colback">Volver a referidos</button>
+    </div>`, 'sheet-xl');
+  $('#rf-colback').onclick = rfRender;
+  $('#rf-colgo').onclick = async () => {
+    const columnas = $$('#rf-colpick input:checked').map(i => i.dataset.c);
+    if (!columnas.length) return toast('Elige al menos una columna', 'err');
+    const btn = $('#rf-colgo'); saving(btn, true);
+    try {
+      const r = await api('priv.liderReferidosExcel', {}, 'POST', { caller: LD_ME, codigo: RF_COD, documentos: docs, columnas });
+      saving(btn, false);
+      if (!r.ok) return toast(r.msg || 'No se pudo generar', 'err');
+      downloadB64(r.base64, r.mime, r.filename);
+      toast('Archivo generado', 'ok');
+    } catch (e) { saving(btn, false); toast('Error al generar el archivo', 'err'); }
+  };
+}
+
+/* ---- AJUSTES 16/07 · desglose de intenciones del líder ----
+   Solo se pintan las intenciones REGISTRADAS (las que están en cero no se
+   pintan) + "No fidelizados", que son las filas sin intención. */
+function ldDesgloseHtml(c) {
+  const ref = Number(c.referidos || 0);
+  if (!ref) return '';
+  const filas = (c.desglose || []).map(d =>
+    `<div class="ld-dg-row">
+       <span class="ld-dg-k">${esc(d.label)} <b>${d.pct}%</b></span>
+       <span class="ld-dg-n">${Number(d.n).toLocaleString('es-CO')}</span>
+     </div>`).join('');
+  const noFid = Number(c.noFidelizados || 0);
+  const noFidHtml = noFid
+    ? `<div class="ld-dg-row ld-dg-nofid">
+         <span class="ld-dg-k">No fidelizados <b>${Number(c.pctNoFidelizados || 0)}%</b></span>
+         <span class="ld-dg-n">${noFid.toLocaleString('es-CO')}</span>
+       </div>` : '';
+  return `<div class="ld-dg">
+      ${ldBarraHtml(c)}
+      ${filas || `<p class="small muted" style="margin:2px 0 0;">Todavía no hay intenciones registradas este mes.</p>`}
+      ${noFidHtml}
+      <p class="small muted ld-dg-nota">Sin intención registrada = no fidelizado (nadie lo ha contactado). “No contactado” sí es trabajo: lo llamaron y no responde.</p>
+    </div>`;
+}
+
+
+/* ============================================================
+   GRÁFICA ANUAL DE TRABAJO DEL LÍDER  (31/08/2026)
+   ------------------------------------------------------------
+   Una barra por mes del AÑO EN CURSO con el % de trabajo (intenciones
+   registradas ÷ referidos). Al tocar una barra se abre el desglose de
+   ese mes debajo.
+
+   DE DÓNDE SALEN LOS MESES
+     · Los cerrados, de la hoja BALANCES (priv.liderMeses).
+     · El mes EN CURSO no está en BALANCES —se cierra el día 1 del mes
+       siguiente— así que se arma aquí con el dato en vivo que ya trae
+       priv.liderVer. Sin esto, cada 1 de enero la gráfica saldría vacía
+       el mes entero.
+
+   Se pintan desde el primer mes con datos hasta el mes de hoy: en 2026
+   el sistema arrancó en julio y seis columnas vacías no dicen nada.
+   ============================================================ */
+const LD_INT_ORDEN = ['Firme con el voto', 'No vota con nosotros', 'No está seguro(a)', 'No sabe votar', 'No contactado'];
+const LD_MESES_TXT = ['Enero', 'Febrero', 'Marzo', 'Abril', 'Mayo', 'Junio', 'Julio', 'Agosto', 'Septiembre', 'Octubre', 'Noviembre', 'Diciembre'];
+let LD_GRAF = { meses: [], cod: '' };
+
+function ldMesHoy() { const d = new Date(); return d.getFullYear() + '-' + pad2(d.getMonth() + 1); }
+function ldMesCorto(mes) { const n = parseInt(String(mes).slice(5, 7), 10); return (LD_MESES_TXT[n - 1] || '').slice(0, 3); }
+function ldMesLargo(mes) { const n = parseInt(String(mes).slice(5, 7), 10); return (LD_MESES_TXT[n - 1] || '') + ' ' + String(mes).slice(0, 4); }
+
+/* Fila de BALANCES → desglose con las mismas etiquetas de la ficha */
+function ldMesDesglose(m) {
+  const pares = [
+    ['Firme con el voto', m.firme], ['No vota con nosotros', m.noVota],
+    ['No está seguro(a)', m.noSeguro], ['No sabe votar', m.noSabe],
+    ['No contactado', m.noContactado]
+  ];
+  const ref = Number(m.ref || 0);
+  return pares.filter(x => Number(x[1] || 0) > 0)
+    .map(x => ({ label: x[0], n: Number(x[1]), pct: ref ? Math.round(Number(x[1]) * 100 / ref) : 0 }));
+}
+
+/* El mes en curso, en vivo, con la forma de una fila de BALANCES */
+function ldMesEnVivo(c) {
+  const ref = Number(c.referidos || 0), trab = Number(c.trabajadas || 0);
+  const por = {};
+  (c.desglose || []).forEach(d => { por[d.label] = Number(d.n || 0); });
+  return {
+    mes: ldMesHoy(), ref: ref, trab: trab,
+    pct: Number(c.pctTrabajo || 0), noFid: Number(c.noFidelizados || 0),
+    firme: por['Firme con el voto'] || 0, noVota: por['No vota con nosotros'] || 0,
+    noSeguro: por['No está seguro(a)'] || 0, noSabe: por['No sabe votar'] || 0,
+    noContactado: por['No contactado'] || 0,
+    envivo: true
+  };
+}
+
+/* Arma la serie del año actual: cerrados + el de hoy en vivo */
+function ldSerieAnual(mesesCerrados, enVivo) {
+  /* El mes de referencia sale del propio dato en vivo (y no de new Date()
+     por segunda vez): así el año que se filtra y el mes en el que termina
+     la serie son SIEMPRE el mismo, y las pruebas pueden fijar la fecha. */
+  const hoy = (enVivo && enVivo.mes) ? String(enVivo.mes) : ldMesHoy();
+  const anio = hoy.slice(0, 4);
+  const map = {};
+  (mesesCerrados || []).forEach(m => { if (String(m.mes).slice(0, 4) === anio && m.mes !== hoy) map[m.mes] = m; });
+  if (enVivo) map[hoy] = enVivo;
+  const claves = Object.keys(map).sort();
+  if (!claves.length) return [];
+  const desde = parseInt(claves[0].slice(5, 7), 10);
+  const hasta = parseInt(hoy.slice(5, 7), 10);
+  const out = [];
+  for (let m = desde; m <= hasta; m++) {
+    const k = anio + '-' + pad2(m);
+    out.push(map[k] || { mes: k, ref: 0, trab: 0, pct: 0, noFid: 0, vacio: true });
+  }
+  return out;
+}
+
+function ldGrafHtml(serie) {
+  if (!serie.length) {
+    return `<div class="ld-graf"><p class="small muted center" style="margin:6px 0;">Todavía no hay meses cerrados de este año. El primer informe se guarda el 1º del mes que viene.</p></div>`;
+  }
+  const barras = serie.map(m => {
+    const pct = Number(m.pct || 0);
+    const alto = m.vacio ? 0 : Math.max(pct ? 3 : 1.5, pct);
+    return `<button type="button" class="ld-gb ${m.vacio ? 'ld-gb-vacio' : ''} ${m.envivo ? 'ld-gb-vivo' : ''}" data-mes="${esc(m.mes)}"
+        title="${esc(ldMesLargo(m.mes))}: ${m.vacio ? 'sin informe' : pct + '% de trabajo'}">
+      <span class="ld-gb-v">${m.vacio ? '' : pct + '%'}</span>
+      <span class="ld-gb-col"><span class="ld-gb-in ${ldTrabColor(pct)}" style="height:${alto}%"></span></span>
+      <span class="ld-gb-m">${esc(ldMesCorto(m.mes))}${ldBitDe(m.mes).length ? '<i class="ld-gb-bit" aria-label="con bitácora"></i>' : ''}</span>
+    </button>`;
+  }).join('');
+  const vivo = serie.some(m => m.envivo);
+  return `<div class="ld-graf">
+      <div class="ld-graf-h"><b>Trabajo mes a mes · ${esc(String(serie[0].mes).slice(0, 4))}</b><span class="small muted">Toca un mes${LD_BIT.ok ? ' para ver su detalle y su bitácora' : ''}</span></div>
+      <div class="ld-graf-b">${barras}</div>
+      ${vivo ? `<p class="small muted ld-graf-p">El último mes va en vivo: se cierra el 1º del mes siguiente.</p>` : ''}
+      <div id="ld-graf-det"></div>
+    </div>`;
+}
+
+/* Engancha los toques de la gráfica (se llama tras pintarla) */
+function ldGrafBind(serie) {
+  const det = $('#ld-graf-det'); if (!det) return;
+  $$('.ld-gb').forEach(b => b.onclick = () => {
+    const m = serie.find(x => x.mes === b.dataset.mes);
+    const abierto = b.classList.contains('on');
+    $$('.ld-gb').forEach(x => x.classList.remove('on'));
+    if (abierto || !m) { det.innerHTML = ''; return; }
+    b.classList.add('on');
+    det.innerHTML = ldMesDetHtml(m);
+    ldBitBind(det, m);
+  });
+}
+
+function ldMesDetHtml(m) {
+  if (m.vacio) return `<div class="ld-graf-det"><b>${esc(ldMesLargo(m.mes))}</b><p class="small muted" style="margin:4px 0 0;">Ese mes no quedó informe guardado.</p>${ldBitHtml(m.mes)}</div>`;
+  const filas = ldMesDesglose(m).map(d =>
+    `<div class="ld-dg-row"><span class="ld-dg-k">${esc(d.label)} <b>${d.pct}%</b></span><span class="ld-dg-n">${d.n.toLocaleString('es-CO')}</span></div>`).join('');
+  const noFid = Number(m.noFid || 0);
+  return `<div class="ld-graf-det">
+      <b>${esc(ldMesLargo(m.mes))}${m.envivo ? ' · en vivo' : ''}</b>
+      <div class="small muted" style="margin:2px 0 6px;">${Number(m.ref || 0).toLocaleString('es-CO')} ref. · ${Number(m.trab || 0).toLocaleString('es-CO')} trabajados · <b class="${ldTrabColor(Number(m.pct || 0))}">${Number(m.pct || 0)}%</b></div>
+      ${filas || `<p class="small muted" style="margin:0;">Ese mes no se registró ninguna intención.</p>`}
+      ${noFid ? `<div class="ld-dg-row ld-dg-nofid"><span class="ld-dg-k">No fidelizados</span><span class="ld-dg-n">${noFid.toLocaleString('es-CO')}</span></div>` : ''}
+      ${ldBitHtml(m.mes)}
+    </div>`;
+}
+
+/* ============================================================
+   BITÁCORA DEL LÍDER POR MES  (03/11/2026)
+   ------------------------------------------------------------
+   Llega en el MISMO viaje que la gráfica (priv.liderMeses con bit=1).
+   Agregar: cualquier usuario con la pastilla lid.bitacora (DEV y ADMIN
+   siempre). Editar: solo quien la escribió (propia=true, lo decide el
+   CORE). No se borra. Al guardar se parcha la lista en memoria: no se
+   vuelve a pedir nada.
+   03/11/2026 (2) · DOS CAMPOS: Refiere y Compromiso. Los dos opcionales,
+   pero no se guarda con los dos vacíos (lo revisan el formulario y el CORE).
+   Las de antes (un solo texto) se ven como "Nota"; si su autor la edita, el
+   texto entra en Refiere y queda en el formato nuevo. Se manda también
+   `texto` armado para que un CORE anterior la guarde igual.
+   ============================================================ */
+let LD_BIT = { cod: '', ok: false, items: [] };
+function ldBitDe(mes) { return LD_BIT.ok ? LD_BIT.items.filter(b => b.mes === mes) : []; }
+function ldBitFecha(f) {
+  const m = String(f || '').match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})/);
+  if (!m) return esc(f || '');
+  const hh = parseInt(m[4], 10), ap = hh < 12 ? 'a. m.' : 'p. m.', h12 = ((hh + 11) % 12) + 1;
+  return `${parseInt(m[3], 10)} ${(LD_MESES_TXT[parseInt(m[2], 10) - 1] || '').slice(0, 3).toLowerCase()} ${m[1]} · ${h12}:${m[5]} ${ap}`;
+}
+function ldBitCampos(b) {
+  const p = [];
+  if (b.refiere) p.push(`<div class="ld-bit-c"><span class="ld-bit-k ld-bit-k--ref">Refiere</span><div class="ld-bit-tx">${esc(b.refiere)}</div></div>`);
+  if (b.compromiso) p.push(`<div class="ld-bit-c"><span class="ld-bit-k ld-bit-k--comp">Compromiso</span><div class="ld-bit-tx">${esc(b.compromiso)}</div></div>`);
+  if (!b.refiere && !b.compromiso && b.texto) p.push(`<div class="ld-bit-c"><span class="ld-bit-k">Nota</span><div class="ld-bit-tx">${esc(b.texto)}</div></div>`);
+  return `<div class="ld-bit-cs">${p.join('')}</div>`;
+}
+function ldBitItemHtml(b) {
+  return `<div class="ld-bit-it" data-id="${esc(b.id)}">
+      <div class="ld-bit-meta"><b>${esc(b.autor || 'Panel')}</b><span>${ldBitFecha(b.fecha)}${b.editado ? ' · editada' : ''}</span>
+        ${b.propia ? `<button type="button" class="ld-bit-edit" data-id="${esc(b.id)}">Editar</button>` : ''}</div>
+      ${ldBitCampos(b)}
+    </div>`;
+}
+/* Los dos campos del formulario (agregar y editar usan el mismo) */
+function ldBitFormCampos(mes) {
+  return `<label class="ld-bit-l"><span class="ld-bit-k ld-bit-k--ref">Refiere</span>
+        <textarea class="input ta ld-bit-ta ld-bit-ref" rows="2" maxlength="2000" placeholder="¿A quién o qué refirió en ${esc(ldMesLargo(mes))}?"></textarea></label>
+      <label class="ld-bit-l"><span class="ld-bit-k ld-bit-k--comp">Compromiso</span>
+        <textarea class="input ta ld-bit-ta ld-bit-comp" rows="2" maxlength="2000" placeholder="¿Qué se comprometió a hacer?"></textarea></label>
+      <p class="small muted ld-bit-ayuda">Los dos son opcionales, pero escribe al menos uno.</p>`;
+}
+function ldBitLeer(caja) {
+  const ref = (caja.querySelector('.ld-bit-ref') || {}).value || '', comp = (caja.querySelector('.ld-bit-comp') || {}).value || '';
+  const refiere = ref.trim(), compromiso = comp.trim();
+  const texto = [refiere ? 'Refiere: ' + refiere : '', compromiso ? 'Compromiso: ' + compromiso : ''].filter(Boolean).join('\n');
+  return { refiere, compromiso, texto };
+}
+function ldBitHtml(mes) {
+  if (!LD_BIT.ok) return '';
+  const lista = ldBitDe(mes);
+  return `<div class="ld-bit" data-mes="${esc(mes)}">
+      <div class="ld-bit-h"><b>Bitácora de ${esc(ldMesLargo(mes))}</b>
+        <button type="button" class="btn btn-quiet ld-bit-add">+ Agregar bitácora</button></div>
+      <div class="ld-bit-form" hidden>
+        ${ldBitFormCampos(mes)}
+        <div class="ld-bit-acts"><button type="button" class="btn btn-ghost ld-bit-cancel">Cancelar</button><button type="button" class="btn btn-primary ld-bit-save">Guardar</button></div>
+      </div>
+      <div class="ld-bit-list">${lista.length ? lista.map(ldBitItemHtml).join('') : `<p class="small muted ld-bit-vacia">Todavía no hay bitácoras de este mes.</p>`}</div>
+    </div>`;
+}
+function ldBitRepintar(det, m) {
+  const caja = det.querySelector('.ld-bit'); if (!caja) return;
+  const nuevo = h(ldBitHtml(m.mes)); caja.replaceWith(nuevo);
+  ldBitBind(det, m);
+  const b = $(`.ld-gb[data-mes="${cssq(m.mes)}"] .ld-gb-m`);   // el punto de la barra
+  if (b && ldBitDe(m.mes).length && !b.querySelector('.ld-gb-bit')) b.insertAdjacentHTML('beforeend', '<i class="ld-gb-bit" aria-label="con bitácora"></i>');
+}
+function ldBitBind(det, m) {
+  const caja = det.querySelector('.ld-bit'); if (!caja) return;
+  const form = caja.querySelector('.ld-bit-form'), add = caja.querySelector('.ld-bit-add');
+  if (add) add.onclick = () => { form.hidden = false; add.hidden = true; form.querySelector('.ld-bit-ref').focus(); };
+  caja.querySelector('.ld-bit-cancel').onclick = () => { form.hidden = true; if (add) add.hidden = false; form.querySelectorAll('textarea').forEach(t => t.value = ''); };
+  const save = caja.querySelector('.ld-bit-save');
+  save.onclick = async () => {
+    if (save.disabled) return;
+    const v = ldBitLeer(form);
+    if (!v.refiere && !v.compromiso) { toast('Escribe Refiere o Compromiso', 'err'); return form.querySelector('.ld-bit-ref').focus(); }
+    saving(save, true);
+    try {
+      const r = await api('priv.liderBitacoraGuardar', {}, 'POST', { ...ldAuth(), codigo: LD_BIT.cod, mes: m.mes, ...v });
+      if (!r || !r.ok) { saving(save, false); return toast((r && r.msg) || 'No se pudo guardar', 'err'); }
+      if (r.item && r.item.refiere === undefined) Object.assign(r.item, { refiere: '', compromiso: '' });   // CORE anterior: queda como Nota
+      LD_BIT.items.unshift(r.item);
+      LD_BITINF = null;                            // el informe se vuelve a pedir
+      toast('Bitácora guardada', 'ok');
+      ldBitRepintar(det, m);
+    } catch (e) { saving(save, false); if (e && e.pendiente) { form.hidden = true; form.querySelectorAll('textarea').forEach(t => t.value = ''); return fallaRed(e); } toast(String(e && e.message || '').indexOf('Permiso') >= 0 ? 'No tienes permiso para escribir bitácoras' : FALLA.txt(e), 'err'); }
+  };
+  caja.querySelectorAll('.ld-bit-edit').forEach(bt => bt.onclick = () => ldBitEditar(det, m, bt.dataset.id));
+}
+function ldBitEditar(det, m, id) {
+  const b = LD_BIT.items.find(x => x.id === id); if (!b) return;
+  const it = det.querySelector(`.ld-bit-it[data-id="${cssq(id)}"]`); if (!it) return;
+  const cs = it.querySelector('.ld-bit-cs');
+  cs.outerHTML = `<div class="ld-bit-ed">${ldBitFormCampos(m.mes)}
+      <div class="ld-bit-acts"><button type="button" class="btn btn-ghost ld-bit-cancel">Cancelar</button><button type="button" class="btn btn-primary ld-bit-save">Guardar cambios</button></div></div>`;
+  const ed = it.querySelector('.ld-bit-ed'), save = ed.querySelector('.ld-bit-save');
+  const tRef = ed.querySelector('.ld-bit-ref'), tComp = ed.querySelector('.ld-bit-comp');
+  const legado = !b.refiere && !b.compromiso && b.texto;      // la de antes: su texto entra en Refiere
+  tRef.value = legado ? b.texto : (b.refiere || ''); tComp.value = b.compromiso || ''; tRef.focus();
+  const eb = it.querySelector('.ld-bit-edit'); if (eb) eb.hidden = true;
+  ed.querySelector('.ld-bit-cancel').onclick = () => ldBitRepintar(det, m);
+  save.onclick = async () => {
+    if (save.disabled) return;
+    const v = ldBitLeer(ed);
+    if (!v.refiere && !v.compromiso) { toast('Escribe Refiere o Compromiso', 'err'); return tRef.focus(); }
+    if (!legado && v.refiere === (b.refiere || '') && v.compromiso === (b.compromiso || '')) return ldBitRepintar(det, m);
+    saving(save, true);
+    try {
+      const r = await api('priv.liderBitacoraEditar', {}, 'POST', { ...ldAuth(), id, ...v });
+      if (!r || !r.ok) { saving(save, false); return toast((r && r.msg) || 'No se pudo guardar', 'err'); }
+      const i = LD_BIT.items.findIndex(x => x.id === id);
+      if (i >= 0) LD_BIT.items[i] = Object.assign({ refiere: '', compromiso: '' }, r.item);
+      LD_BITINF = null;
+      toast('Bitácora actualizada', 'ok');
+      ldBitRepintar(det, m);
+    } catch (e) { saving(save, false); fallaRed(e); }
+  };
+}
+
+
+/* ============================================================
+   INFORME DE BITÁCORAS POR MESES  (03/11/2026)
+   ------------------------------------------------------------
+   Líderes → botón "Bitácoras". Se eligen uno o varios meses (los que
+   tienen bitácoras) y, si se quiere, uno o varios líderes; sale en PDF o
+   en Excel con Refiere y Compromiso, fecha y autor, por mes y por líder.
+   · UN viaje: priv.liderBitacoraInforme trae el resumen por mes y, si todo
+     cabe (< 90 KB), todas las filas → el archivo se arma sin volver al
+     servidor. Si el CORE dice que no cabe (grande), se piden solo los meses
+     elegidos (un viaje).
+   · Nunca viaja un archivo: el PDF (jsPDF local, js/vendor) y el Excel
+     (xlsx local) los arma el navegador. Las librerías se cargan solo al
+     descargar, una vez por sesión.
+   · La hoja se pinta al instante; los meses llegan de fondo. Lo traído se
+     guarda en memoria (LD_BITINF) hasta que se guarde o edite una bitácora.
+   · Permiso de invitado: lid.bitInforme (candado "Sin exportar" lo apaga).
+   ============================================================ */
+let LD_BITINF = null;            // { data, t } en memoria de la sesión
+let LD_USER = null;              // quien abrió Líderes (para el pie del PDF)
+const LDI_LIB = {};              // promesas de las librerías
+
+function ldiCargarScript(clave, src, listo) {
+  if (listo()) return Promise.resolve();
+  if (LDI_LIB[clave]) return LDI_LIB[clave];
+  LDI_LIB[clave] = new Promise((res, rej) => {
+    const s = document.createElement('script'); s.src = src;
+    s.onload = () => listo() ? res() : rej(new Error('lib'));
+    s.onerror = () => { delete LDI_LIB[clave]; rej(new Error('lib')); };
+    document.head.appendChild(s);
+  });
+  return LDI_LIB[clave];
+}
+function ldiCargarPdf() {
+  return ldiCargarScript('jspdf', 'js/vendor/jspdf.umd.min.js', () => !!(window.jspdf && window.jspdf.jsPDF))
+    .then(() => ldiCargarScript('autotable', 'js/vendor/jspdf.plugin.autotable.min.js', () => !!(window.jspdf.jsPDF.API && window.jspdf.jsPDF.API.autoTable)))
+    .then(() => window.jspdf.jsPDF);
+}
+
+/* Filas compactas del CORE → objetos */
+function ldiFilas(d) {
+  const ix = {}; (d.cols || []).forEach((c, i) => ix[c] = i);
+  return (d.filas || []).map(f => ({
+    cod: String(f[ix.codigo]), mes: f[ix.mes], fecha: f[ix.fecha] || '', autor: f[ix.autor] || '',
+    refiere: f[ix.refiere] || '', compromiso: f[ix.compromiso] || '', nota: f[ix.nota] || '', editado: f[ix.editado] || ''
+  }));
+}
+function ldiMesesTxt(meses) {
+  const ms = meses.slice().sort();
+  if (!ms.length) return '';
+  if (ms.length === 1) return ldMesLargo(ms[0]);
+  return ms.map(m => ldMesLargo(m)).join(', ');
+}
+function ldiArchivo(meses, ext) {
+  const ms = meses.slice().sort();
+  const rango = ms.length === 1 ? ms[0] : ms[0] + '_a_' + ms[ms.length - 1];
+  return `Informe_bitacoras_lideres_${rango}.${ext}`;
+}
+function ldiHora(f) { const m = String(f || '').match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})/); return m ? `${m[3]}/${m[2]}/${m[1]} ${m[4]}:${m[5]}` : String(f || ''); }
+
+/* ---------- Hoja de opciones ---------- */
+async function ldBitInforme() {
+  const t0 = performance.now();
+  const st = { meses: new Set(), cods: new Set(), q: '' };   // cods vacío = todos
+  openSheet(`<div class="grip"></div>
+    <h2 class="h2" style="margin-bottom:4px;">Informe de bitácoras</h2>
+    <p class="muted small">Elige los meses y, si quieres, los líderes. El informe trae Refiere y Compromiso con su fecha y autor, por mes y por líder.</p>
+    <h3 class="ldx-h3">Meses</h3>
+    <div class="ldi-tools"><span class="small muted" id="ldi-mn"></span>
+      <div class="ldx-tbtns"><button class="bd-btn" id="ldi-mall" disabled>Todos</button><button class="bd-btn" id="ldi-mnone" disabled>Ninguno</button></div></div>
+    <div class="ldi-meses" id="ldi-meses">${loadingBox('Buscando meses con bitácoras…')}</div>
+    <h3 class="ldx-h3">Líderes</h3>
+    <div class="ldi-tools"><span class="small muted" id="ldi-ln">Todos los líderes de los meses elegidos</span>
+      <div class="ldx-tbtns"><button class="bd-btn" id="ldi-lall">Todos</button></div></div>
+    <input class="input ldi-q" id="ldi-q" placeholder="Buscar líder por nombre o código…" autocomplete="off" />
+    <div class="col-pick ldi-lids" id="ldi-lids"></div>
+    <p class="small muted ldi-res" id="ldi-res"></p>
+    <div class="ldx-acts">
+      <button class="btn btn-primary" id="ldi-pdf" disabled>${I.pdf} PDF</button>
+      <button class="btn btn-ghost" id="ldi-xls" disabled>${I.download} Excel</button>
+    </div>`);
+  const fuera = () => !$('#ldi-meses');
+  let d = LD_BITINF && LD_BITINF.data;
+  if (!d) {
+    try {
+      d = await api('priv.liderBitacoraInforme', ldAuth(), 'GET', null, { silent: true });
+    } catch (e) {
+      if (fuera()) return;
+      const caja = $('#ldi-meses'); if (caja) caja.innerHTML = `<p class="small muted">${String(e && e.message || '').indexOf('Permiso') >= 0 ? 'No tienes permiso para el informe de bitácoras.' : 'No se pudo traer la lista de meses. Revisa la conexión e intenta de nuevo.'}</p>`;
+      return;
+    }
+    if (!d || !d.ok) { if (!fuera()) $('#ldi-meses').innerHTML = `<p class="small muted">${esc((d && d.msg) || 'No se pudo traer la lista de meses.')}</p>`; return; }
+    LD_BITINF = { data: d, t: Date.now() };
+  }
+  if (fuera()) return;
+  const meses = d.meses || [];
+  if (!meses.length) { $('#ldi-meses').innerHTML = `<p class="small muted">Todavía no hay bitácoras en ningún mes.</p>`; return; }
+  st.meses.add(meses[0].mes);                            // por defecto, el mes más reciente
+  /* Los nombres salen de la lista de Líderes que ya está en memoria (el CORE
+     no lee LIDERES para esto); si no está, el que mande el CORE o el código. */
+  const nombre = c => { const l = ldFind(c); return (l && l.nombre) || (d.lideres && d.lideres[c]) || ('Líder #' + c); };
+  $('#ldi-meses').innerHTML = meses.map(m => `<button type="button" class="ldi-mes" data-m="${esc(m.mes)}" aria-pressed="false">
+      <b>${esc(ldMesLargo(m.mes))}</b><span>${m.n.toLocaleString('es-CO')} bitácora${m.n === 1 ? '' : 's'} · ${m.lideres.toLocaleString('es-CO')} líder${m.lideres === 1 ? '' : 'es'}</span></button>`).join('');
+  $('#ldi-mall').disabled = false; $('#ldi-mnone').disabled = false;
+
+  /* Líderes que tienen bitácora en los meses elegidos */
+  const lidsDe = () => {
+    const s = new Set();
+    meses.forEach(m => { if (st.meses.has(m.mes)) (m.cods || []).forEach(c => s.add(String(c))); });
+    return [...s].sort((a, b) => Number(a) - Number(b));
+  };
+  const resumen = () => {
+    const lids = lidsDe();
+    [...st.cods].forEach(c => { if (lids.indexOf(c) < 0) st.cods.delete(c); });
+    let n = 0;
+    if (d.completo) {
+      n = ldiFilas(d).filter(f => st.meses.has(f.mes) && (!st.cods.size || st.cods.has(f.cod))).length;
+    } else meses.forEach(m => { if (st.meses.has(m.mes)) n += m.n; });
+    const nl = st.cods.size || lids.length;
+    $('#ldi-mn').textContent = st.meses.size ? `${st.meses.size} mes${st.meses.size === 1 ? '' : 'es'} elegido${st.meses.size === 1 ? '' : 's'}` : 'Elige al menos un mes';
+    $('#ldi-ln').textContent = st.cods.size ? `${st.cods.size} líder${st.cods.size === 1 ? '' : 'es'} elegido${st.cods.size === 1 ? '' : 's'}` : 'Todos los líderes de los meses elegidos';
+    $('#ldi-res').textContent = st.meses.size ? `${(d.completo || !st.cods.size) ? n.toLocaleString('es-CO') : 'Las'} bitácora${n === 1 ? '' : 's'} de ${nl.toLocaleString('es-CO')} líder${nl === 1 ? '' : 'es'}.` : '';
+    $('#ldi-pdf').disabled = $('#ldi-xls').disabled = !st.meses.size;
+    $$('#ldi-meses .ldi-mes').forEach(b => { const on = st.meses.has(b.dataset.m); b.classList.toggle('on', on); b.setAttribute('aria-pressed', on ? 'true' : 'false'); });
+  };
+  const pintarLids = () => {
+    const q = ldNorm(st.q), lids = lidsDe().filter(c => !q || ldNorm(nombre(c) + ' ' + c).indexOf(q) >= 0);
+    $('#ldi-lids').innerHTML = lids.length
+      ? lids.map(c => `<label class="col-opt"><input type="checkbox" data-c="${esc(c)}" ${st.cods.has(c) ? 'checked' : ''}/> <span><em class="ldx-tag">#${esc(c)}</em> ${esc(nombre(c))}</span></label>`).join('')
+      : `<p class="small muted" style="margin:0;">${st.meses.size ? 'Ningún líder coincide con la búsqueda.' : 'Elige un mes para ver sus líderes.'}</p>`;
+    $$('#ldi-lids input').forEach(i => i.onchange = () => { i.checked ? st.cods.add(i.dataset.c) : st.cods.delete(i.dataset.c); resumen(); });
+  };
+  $$('#ldi-meses .ldi-mes').forEach(b => b.onclick = () => { const m = b.dataset.m; st.meses.has(m) ? st.meses.delete(m) : st.meses.add(m); pintarLids(); resumen(); });
+  $('#ldi-mall').onclick = () => { meses.forEach(m => st.meses.add(m.mes)); pintarLids(); resumen(); };
+  $('#ldi-mnone').onclick = () => { st.meses.clear(); pintarLids(); resumen(); };
+  $('#ldi-lall').onclick = () => { st.cods.clear(); pintarLids(); resumen(); };
+  $('#ldi-q').oninput = e => { st.q = e.target.value; pintarLids(); };
+  pintarLids(); resumen();
+  try { RED.pantalla && RED.pantalla('lid.bitInforme', performance.now() - t0); } catch (e) {}
+
+  const bajar = async (tipo, btn) => {
+    if (btn.disabled || !st.meses.size) return;
+    const t1 = performance.now();
+    saving(btn, true);
+    try {
+      let dd = d;
+      if (!d.completo) {
+        dd = await api('priv.liderBitacoraInforme', { ...ldAuth(), meses: [...st.meses].join(','), codigos: [...st.cods].join(',') }, 'GET', null, { silent: true });
+        if (!dd || !dd.ok) { saving(btn, false); return toast((dd && dd.msg) || 'No se pudo armar el informe', 'err'); }
+      }
+      const filas = ldiFilas(dd).filter(f => st.meses.has(f.mes) && (!st.cods.size || st.cods.has(f.cod)));
+      if (!filas.length) { saving(btn, false); return toast('No hay bitácoras con esa selección', 'err'); }
+      const sel = { meses: [...st.meses].sort(), filas, nombre, filtroLid: st.cods.size };
+      if (tipo === 'pdf') await ldiPdf(sel); else await ldiExcel(sel);
+      saving(btn, false);
+      try { RED.pantalla && RED.pantalla('lid.bitInforme.' + tipo, performance.now() - t1); } catch (e) {}
+      toast(tipo === 'pdf' ? 'PDF descargado' : 'Excel descargado', 'ok');
+    } catch (e) {
+      saving(btn, false);
+      toast(String(e && e.message) === 'lib' ? 'No se pudo cargar el generador del archivo. Revisa la conexión.' : 'No se pudo armar el informe', 'err');
+    }
+  };
+  $('#ldi-pdf').onclick = () => bajar('pdf', $('#ldi-pdf'));
+  $('#ldi-xls').onclick = () => bajar('excel', $('#ldi-xls'));
+}
+
+/* Orden del informe: mes ↑, líder (código ↑), fecha ↑ */
+function ldiOrden(filas) {
+  return filas.slice().sort((a, b) => a.mes < b.mes ? -1 : a.mes > b.mes ? 1 : (Number(a.cod) - Number(b.cod)) || (a.fecha < b.fecha ? -1 : a.fecha > b.fecha ? 1 : 0));
+}
+
+/* ---------- Excel ---------- */
+async function ldiExcel(sel) {
+  const X = await cargarXlsx();
+  const filas = ldiOrden(sel.filas);
+  const cab = ['Mes', 'Código', 'Líder', 'Fecha y hora', 'Autor', 'Refiere', 'Compromiso', 'Nota (formato anterior)', 'Editada'];
+  const aoa = [cab].concat(filas.map(f => [ldMesLargo(f.mes), Number(f.cod) || f.cod, sel.nombre(f.cod), ldiHora(f.fecha), f.autor, f.refiere, f.compromiso, f.nota, f.editado ? ldiHora(f.editado) : '']));
+  const ws = X.utils.aoa_to_sheet(aoa);
+  ws['!cols'] = [{ wch: 16 }, { wch: 8 }, { wch: 30 }, { wch: 17 }, { wch: 22 }, { wch: 60 }, { wch: 60 }, { wch: 40 }, { wch: 17 }];
+  ws['!autofilter'] = { ref: X.utils.encode_range({ s: { r: 0, c: 0 }, e: { r: aoa.length - 1, c: cab.length - 1 } }) };
+  /* Resumen: por mes y por líder */
+  const res = [['Mes', 'Código', 'Líder', 'Bitácoras', 'Con Refiere', 'Con Compromiso']], agg = {};
+  filas.forEach(f => { const k = f.mes + '|' + f.cod; const a = agg[k] || (agg[k] = { mes: f.mes, cod: f.cod, n: 0, r: 0, c: 0 }); a.n++; if (f.refiere) a.r++; if (f.compromiso) a.c++; });
+  Object.keys(agg).forEach(k => { const a = agg[k]; res.push([ldMesLargo(a.mes), Number(a.cod) || a.cod, sel.nombre(a.cod), a.n, a.r, a.c]); });
+  res.push(['Total', '', '', filas.length, filas.filter(f => f.refiere).length, filas.filter(f => f.compromiso).length]);
+  const wr = X.utils.aoa_to_sheet(res);
+  wr['!cols'] = [{ wch: 16 }, { wch: 8 }, { wch: 30 }, { wch: 11 }, { wch: 12 }, { wch: 15 }];
+  const wb = X.utils.book_new();
+  X.utils.book_append_sheet(wb, wr, 'Resumen');
+  X.utils.book_append_sheet(wb, ws, 'Bitácoras');
+  X.writeFile(wb, ldiArchivo(sel.meses, 'xlsx'));
+}
+
+/* ---------- PDF ---------- */
+/* Las fuentes estándar del PDF solo traen latín-1: se cambia lo demás */
+function ldiPdfTx(s) {
+  return String(s == null ? '' : s)
+    .replace(/[‘’‚′]/g, "'").replace(/[“”„″]/g, '"')
+    .replace(/[–—−]/g, '-').replace(/…/g, '...').replace(/[•●▪]/g, '-')
+    .replace(/ /g, ' ').replace(/[^\n\r\t\x20-\x7E¡-ÿ]/g, '');
+}
+function ldiHex(c) { const m = String(c || '').match(/^#?([0-9a-f]{6})$/i); const v = m ? m[1] : '007BFF'; return [0, 2, 4].map(i => parseInt(v.slice(i, i + 2), 16)); }
+async function ldiLogo() {
+  try {
+    const r = await fetch('img/logo.png'); if (!r.ok) return null;
+    const b = await r.blob();
+    return await new Promise(res => { const fr = new FileReader(); fr.onload = () => res(fr.result); fr.onerror = () => res(null); fr.readAsDataURL(b); });
+  } catch (e) { return null; }
+}
+async function ldiPdf(sel) {
+  const [jsPDF, logo] = await Promise.all([ldiCargarPdf(), ldiLogo()]);
+  const M = window.MARCA || {};
+  const azul = ldiHex(M.COLOR), azul7 = ldiHex(M.COLOR_700 || '#0056B3');
+  const tinta = [33, 37, 41], gris = [108, 117, 125], linea = [222, 226, 230], suave = [244, 247, 251];
+  const doc = new jsPDF({ unit: 'mm', format: 'a4' });
+  const W = doc.internal.pageSize.getWidth(), H = doc.internal.pageSize.getHeight(), mg = 14;
+  const filas = ldiOrden(sel.filas);
+  const lids = [...new Set(filas.map(f => f.cod))];
+  const autores = [...new Set(filas.map(f => f.autor).filter(Boolean))];
+  const conRef = filas.filter(f => f.refiere).length, conComp = filas.filter(f => f.compromiso).length;
+  const quien = (LD_USER && (LD_USER.nombre || LD_USER.name)) || '';
+  const ahora = new Date();
+  const hoyTx = `${ahora.getDate()} de ${LD_MESES_TXT[ahora.getMonth()].toLowerCase()} de ${ahora.getFullYear()}, ${String(ahora.getHours()).padStart(2, '0')}:${String(ahora.getMinutes()).padStart(2, '0')}`;
+
+  /* Encabezado de la primera página */
+  doc.setFillColor(...azul); doc.rect(0, 0, W, 34, 'F');
+  doc.setFillColor(...azul7); doc.rect(0, 34, W, 1.6, 'F');
+  let x0 = mg;
+  if (logo) { try { doc.setFillColor(255, 255, 255); doc.roundedRect(mg, 7, 20, 20, 3, 3, 'F'); doc.addImage(logo, 'PNG', mg + 1.5, 8.5, 17, 17); x0 = mg + 25; } catch (e) {} }
+  doc.setTextColor(255, 255, 255);
+  doc.setFont('helvetica', 'bold'); doc.setFontSize(17);
+  doc.text('Informe de bitácoras de líderes', x0, 16);
+  doc.setFont('helvetica', 'normal'); doc.setFontSize(10);
+  doc.text(ldiPdfTx(`${M.CANDIDATO || ''}${M.MUNICIPIO ? ' · ' + M.MUNICIPIO : ''}${M.EQUIPO ? ' · ' + M.EQUIPO : ''}`), x0, 22.5);
+  doc.text(ldiPdfTx(ldiMesesTxt(sel.meses)), x0, 28);
+
+  /* Indicadores */
+  let y = 44;
+  const kpis = [[filas.length, 'Bitácoras'], [lids.length, 'Líderes'], [sel.meses.length, sel.meses.length === 1 ? 'Mes' : 'Meses'], [conRef, 'Con Refiere'], [conComp, 'Con Compromiso']];
+  const kw = (W - mg * 2 - 4 * 4) / kpis.length;
+  kpis.forEach((k, i) => {
+    const kx = mg + i * (kw + 4);
+    doc.setFillColor(...suave); doc.setDrawColor(...linea); doc.roundedRect(kx, y, kw, 18, 2.5, 2.5, 'FD');
+    doc.setTextColor(...azul7); doc.setFont('helvetica', 'bold'); doc.setFontSize(15);
+    doc.text(Number(k[0]).toLocaleString('es-CO'), kx + kw / 2, y + 9, { align: 'center' });
+    doc.setTextColor(...gris); doc.setFont('helvetica', 'normal'); doc.setFontSize(8);
+    doc.text(k[1], kx + kw / 2, y + 14.5, { align: 'center' });
+  });
+  y += 24;
+  doc.setFontSize(8.5); doc.setTextColor(...gris);
+  const nota = `Generado el ${hoyTx}${quien ? ' por ' + quien : ''}. ${sel.filtroLid ? 'Líderes elegidos: ' + lids.length + '.' : 'Todos los líderes con bitácora en los meses elegidos.'}${autores.length ? ' Autores: ' + autores.join(', ') + '.' : ''}`;
+  const notaL = doc.splitTextToSize(ldiPdfTx(nota), W - mg * 2);
+  doc.text(notaL, mg, y); y += notaL.length * 3.8 + 3;
+
+  /* Por mes: banda del mes y una tabla con el líder como fila de grupo */
+  sel.meses.forEach(mes => {
+    const delMes = filas.filter(f => f.mes === mes);
+    if (!delMes.length) return;
+    const lm = [...new Set(delMes.map(f => f.cod))];
+    if (y > H - 50) { doc.addPage(); y = 18; }
+    doc.setFillColor(...azul); doc.roundedRect(mg, y, W - mg * 2, 10, 2, 2, 'F');
+    doc.setTextColor(255, 255, 255); doc.setFont('helvetica', 'bold'); doc.setFontSize(11.5);
+    doc.text(ldiPdfTx(ldMesLargo(mes)), mg + 4, y + 6.7);
+    doc.setFont('helvetica', 'normal'); doc.setFontSize(9);
+    doc.text(`${delMes.length} bitácora${delMes.length === 1 ? '' : 's'} · ${lm.length} líder${lm.length === 1 ? '' : 'es'}`, W - mg - 4, y + 6.7, { align: 'right' });
+    y += 12;
+    const body = [];
+    lm.forEach(c => {
+      const suyas = delMes.filter(f => f.cod === c);
+      body.push([{ content: ldiPdfTx(`#${c} · ${sel.nombre(c)}`) + `   (${suyas.length} bitácora${suyas.length === 1 ? '' : 's'})`, colSpan: 4, styles: { fillColor: [232, 241, 255], textColor: azul7, fontStyle: 'bold', fontSize: 9.5 } }]);
+      suyas.forEach(f => {
+        const fecha = ldiHora(f.fecha) + (f.editado ? '\n(editada)' : '');
+        if (!f.refiere && !f.compromiso && f.nota) body.push([fecha, ldiPdfTx(f.autor), { content: 'Nota: ' + ldiPdfTx(f.nota), colSpan: 2, styles: { fontStyle: 'italic' } }]);
+        else body.push([fecha, ldiPdfTx(f.autor), ldiPdfTx(f.refiere) || '-', ldiPdfTx(f.compromiso) || '-']);
+      });
+    });
+    doc.autoTable({
+      startY: y, margin: { left: mg, right: mg, top: 18, bottom: 16 },
+      head: [['Fecha', 'Autor', 'Refiere', 'Compromiso']], body,
+      theme: 'grid',
+      styles: { font: 'helvetica', fontSize: 8.6, cellPadding: 2.2, textColor: tinta, lineColor: linea, lineWidth: 0.2, valign: 'top', overflow: 'linebreak' },
+      headStyles: { fillColor: [52, 58, 64], textColor: 255, fontStyle: 'bold', fontSize: 8.6 },
+      columnStyles: { 0: { cellWidth: 24, textColor: gris, fontSize: 8 }, 1: { cellWidth: 28 }, 2: { cellWidth: 65 }, 3: { cellWidth: 'auto' } },
+      rowPageBreak: 'avoid'
+    });
+    y = doc.lastAutoTable.finalY + 8;
+  });
+
+  /* Pie de página en todas las páginas */
+  const n = doc.getNumberOfPages();
+  for (let i = 1; i <= n; i++) {
+    doc.setPage(i);
+    doc.setDrawColor(...linea); doc.line(mg, H - 11, W - mg, H - 11);
+    doc.setFontSize(7.5); doc.setTextColor(...gris); doc.setFont('helvetica', 'normal');
+    doc.text(ldiPdfTx(`Informe de bitácoras · ${M.CANDIDATO || ''} · Uso interno`), mg, H - 6.5);
+    doc.text(`Página ${i} de ${n}`, W - mg, H - 6.5, { align: 'right' });
+  }
+  doc.save(ldiArchivo(sel.meses, 'pdf'));
+}
+
+/* Pide el historial y pinta la gráfica dentro de la ficha ya abierta.
+   No bloquea: la ficha se ve completa y la gráfica entra cuando llega. */
+async function ldGrafCargar(cod, c) {
+  const caja = $('#ld-graf-box'); if (!caja) return;
+  let meses = [];
+  LD_BIT = { cod: String(cod), ok: false, items: [] };
+  try {
+    /* 03/11/2026 · bit=1: las bitácoras del líder llegan en el mismo viaje.
+       Con un CORE anterior no vienen y la bitácora simplemente no se muestra. */
+    const r = await api('priv.liderMeses', { codigo: cod, bit: '1', ...ldAuth() });
+    if (r && r.ok) {
+      meses = r.meses || [];
+      if (Array.isArray(r.bitacoras)) LD_BIT = { cod: String(r.codigo || cod), ok: true, items: r.bitacoras };
+    }
+  } catch (e) { /* sin historial se ve solo el mes en vivo */ }
+  if (!$('#ld-graf-box')) return;                  // cerraron la ficha mientras tanto
+  const serie = ldSerieAnual(meses, ldMesEnVivo(c));
+  LD_GRAF = { meses: serie, cod: cod };
+  caja.innerHTML = ldGrafHtml(serie);
+  ldGrafBind(serie);
+}
+
+/* ============================================================
+   AHIJADOS Y DELEGACIÓN DEL GRUPO  (31/08/2026)
+   ------------------------------------------------------------
+   Aquí se CONCEDE que un padrino entre a la Zona de líderes de su
+   ahijado en la app pública y trabaje ese grupo. No es automático: sin
+   este interruptor ningún padrino ve nada de nadie.
+   Lo que se delega: agregar, editar y marcar asistencia/intención.
+   Lo que NO: ceder referidos, ni la contraseña o el correo del ahijado.
+   ============================================================ */
+async function ldAhijados(cod) {
+  openSheet(`<div class="grip"></div><h2 class="h2">Ahijados</h2>${loadingBox('Cargando…')}`);
+  let r;
+  try { r = await api('priv.liderAhijados', { codigo: cod, ...ldAuth() }); }
+  catch (e) { closeLayer(); return fallaRed(e); }
+  if (!r || !r.ok) { closeLayer(); return toast((r && r.msg) || 'No se pudo cargar', 'err'); }
+  ldAhijadosPintar(r);
+}
+
+function ldAhijadosPintar(r) {
+  const lista = r.ahijados || [];
+  const filas = lista.map(a => `<article class="ld-aj" data-cod="${esc(a.codigo)}">
+      <div class="ld-aj-top">
+        <div class="ld-aj-id"><b>#${esc(a.codigo)} · ${esc(a.nombre)}</b>
+          <span class="small muted">${Number(a.referidos).toLocaleString('es-CO')} ref. · <b class="${ldTrabColor(Number(a.pct || 0))}">${Number(a.pct || 0)}%</b> trab.</span></div>
+        <span class="ld-refs ${ldColor(a.referidos)}">${Number(a.referidos).toLocaleString('es-CO')} ref.</span>
+      </div>
+      <label class="ld-aj-sw">
+        <input type="checkbox" class="ld-aj-ck" ${a.delegado ? 'checked' : ''} ${a.delegadoOtro ? 'disabled' : ''} />
+        <span>${a.delegadoOtro ? 'Su grupo ya está delegado al líder #' + esc(a.delegadoOtro) : 'Su padrino puede gestionar este grupo'}</span>
+      </label>
+    </article>`).join('');
+
+  openSheet(`<div class="grip"></div>
+    <div class="det-head"><h2 class="h2">Ahijados de ${esc(r.padrino.nombre)}</h2>
+      <span class="ld-refs">${lista.length.toLocaleString('es-CO')}</span></div>
+    ${lista.length ? `<p class="small muted" style="margin:-4px 0 10px;">Al encender el interruptor, <b>${esc(r.padrino.nombre)}</b> podrá entrar a la Zona de líderes de ese ahijado desde la app pública y trabajar su grupo: agregar, editar y marcar asistencia e intención. <b>No</b> podrá ceder referidos ni cambiarle la contraseña. Todo lo que haga queda marcado a su nombre.</p>
+       <div class="stack" id="ld-aj-list">${filas}</div>`
+      : `<p class="muted center" style="padding:22px 0;">Este líder no tiene ahijados.<br><span class="small">Son los líderes que lo tienen a él en la casilla <b>Padrino</b>.</span></p>`}
+    ${r.columna === false ? `<p class="small" style="color:#B03636;margin-top:10px;">Falta la columna DELEGADO_A en la hoja LIDERES: corre <b>migrarPadrino3108()</b> una vez en el editor de Apps Script.</p>` : ''}
+    <button class="btn btn-quiet btn-block" id="ld-aj-back" style="margin-top:12px;">Volver al líder</button>`, 'sheet-xl');
+
+  $('#ld-aj-back').onclick = () => ldVer(r.padrino.codigo);
+  $$('.ld-aj-ck').forEach(ck => ck.onchange = async () => {
+    const art = ck.closest('.ld-aj');
+    const on = ck.checked;
+    ck.disabled = true;
+    try {
+      const rr = await api('priv.liderDelegar', {}, 'POST', { ...ldAuth(), padrino: r.padrino.codigo, ahijado: art.dataset.cod, on: on });
+      if (!rr.ok) { ck.checked = !on; toast(rr.msg || 'No se pudo guardar', 'err'); }
+      else toast(on ? 'Grupo delegado a su padrino' : 'Delegación retirada', 'ok');
+    } catch (e) { ck.checked = !on; fallaRed(e); }
+    ck.disabled = false;
+  });
+}
+
+/* ---- ACCIONES (Código · Tarea · No tarea) — WhatsApp prellenado o BuilderBot ---- */
+function ldAcciones(cod) {
+  const c = ldFind(cod);
+  if (!c) return toast('Líder no encontrado', 'err');
+  const items = [
+    { tipo: 'codigo',  titulo: 'Código (bienvenida)', desc: 'Envía su N° de referido y cómo usar la app.' },
+    { tipo: 'tarea',   titulo: 'Tarea OK',            desc: 'Felicita por la tarea bien hecha.' },
+    { tipo: 'notarea', titulo: 'No tarea',            desc: 'Recuerda amablemente la meta de referidos.' }
+  ];
+  const bloques = items.map(it => {
+    const texto = ldWaText(it.tipo, c);
+    return `<div class="ld-acc-block" data-perm-wa>
+      <div class="ld-acc-head"><b>${esc(it.titulo)}</b><span class="small muted">${esc(it.desc)}</span></div>
+      <div class="ld-acc-prev">${esc(texto)}</div>
+      <div class="ld-acc-btns">
+        <button class="btn btn-primary" data-wa="${it.tipo}" ${c.contacto ? '' : 'disabled'}>${I.wa} Abrir WhatsApp</button>
+        <button class="btn btn-ghost" data-bot="${it.tipo}" ${c.contacto ? '' : 'disabled'}>Enviar por bot</button>
+      </div>
+    </div>`;
+  }).join('');
+  const clasBloque = `<div class="ld-acc-block" data-perm-clas>
+      <div class="ld-acc-head"><b>Clasificación</b><span class="small muted">Cambia el tipo de líder. Se guarda al instante.</span></div>
+      <div class="ld-cl-opts" id="ld-cl-opts">
+        ${ldClases().map(k => `<button class="ld-clchip${ldClaseInfo(c.clasificacion).valor === k.valor ? ' on' : ''}" data-set="${esc(k.valor)}"><i>${k.emoji}</i>${esc(k.etiqueta)}</button>`).join('')}
+      </div>
+    </div>`;
+  openSheet(`<div class="grip"></div>
+    <div class="det-head"><h2 class="h2">Acciones · ${esc(c.nombre)}</h2><span class="bd-doc">#${esc(c.codigo)} · ${Number(c.referidos || 0).toLocaleString('es-CO')} ref.</span></div>
+    ${c.contacto ? '' : '<div class="ag-warn">Este líder no tiene número de WhatsApp registrado.</div>'}
+    <div class="ld-acc-list">${clasBloque}${bloques}</div>`);
+  layer.querySelectorAll('[data-set]').forEach(b => b.onclick = async () => {
+    const v = b.dataset.set;
+    if (b.classList.contains('on')) return;
+    const caja = $('#ld-cl-opts'); if (caja) caja.classList.add('ld-cl-busy');
+    try {
+      const r = await api('priv.liderClasificacion', {}, 'POST', { ...ldAuth(), codigo: c.codigo, clasificacion: v });
+      if (!r.ok) toast(r.msg || 'No se pudo cambiar', 'err');
+      else {
+        c.clasificacion = v;
+        layer.querySelectorAll('[data-set]').forEach(x => x.classList.toggle('on', x.dataset.set === v));
+        ldUpsertCard(r.card); ldClfilRender();
+        toast('Clasificación actualizada', 'ok');
+      }
+    } catch (e) { fallaRed(e); }
+    if (caja) caja.classList.remove('ld-cl-busy');
+  });
+  layer.querySelectorAll('[data-wa]').forEach(b => b.onclick = () => ldWaOpen(c.contacto, ldWaText(b.dataset.wa, c)));
+  layer.querySelectorAll('[data-bot]').forEach(b => {
+    const orig = b.innerHTML; let armed = false, timer = null;
+    b.onclick = async () => {
+      if (b.disabled) return;
+      if (!armed) {
+        armed = true; b.classList.add('ld-armed'); b.textContent = '¿Confirmar envío?';
+        timer = setTimeout(() => { armed = false; b.classList.remove('ld-armed'); b.innerHTML = orig; }, 3500);
+        return;
+      }
+      clearTimeout(timer); armed = false; b.classList.remove('ld-armed');
+      b.disabled = true; b.innerHTML = '<span class="spinner spinner-brand"></span>';
+      try {
+        const r = await api('priv.liderAccion', {}, 'POST', { ...ldAuth(), codigo: c.codigo, tipo: b.dataset.bot });
+        toast(r.msg || (r.ok ? 'Mensaje enviado' : 'No se pudo enviar'), r.ok ? 'ok' : 'err');
+      } catch (e) { fallaRed(e); }
+      b.disabled = false; b.innerHTML = orig;
+    };
+  });
+}
+
+/* ---- EDITAR (no permite código existente; documento/contraseña fijos) ---- */
+/* `pre` (01/09): valores a restaurar tras cancelar el aviso de cambio de
+   padrino. Se vuelve a abrir el formulario con lo que el usuario había
+   escrito y con el padrino ORIGINAL — descartar significa descartar ESE
+   cambio, no todo lo demás. */
+async function ldEditar(cod, pre) {
+  openSheet(`<div class="grip"></div><h2 class="h2">Editar líder</h2>${loadingBox('Cargando…')}`);
+  let c, meta;
+  try {
+    const [rv, rm] = await Promise.all([api('priv.liderVer', { codigo: cod, ...ldAuth() }), api('priv.liderNuevoMeta', ldAuth())]);
+    if (!rv.ok) { closeLayer(); return toast(rv.msg, 'err'); }
+    c = rv.lider; meta = rm;
+  } catch (e) { closeLayer(); return fallaRed(e); }
+  const padrinos = (meta.lideres || []).map(l => l.nombre).filter(n => n && n !== c.nombre);
+  openSheet(`<div class="grip"></div><h2 class="h2" style="margin-bottom:10px;">Editar líder</h2>
+    <div class="stack">
+      ${field('Código', inputEl('le-cod', 'inputmode="numeric"'))}
+      ${field('Nombre completo', inputEl('le-nombre'))}
+      ${field('Documento (no editable)', inputEl('le-doc', 'disabled'))}
+      ${field('WhatsApp', inputEl('le-wa', 'inputmode="numeric" maxlength="10"'))}
+      ${field('Residencia', comboboxHtml('le-resi', 'Escribe para buscar…'))}
+      ${field('Padrino', comboboxHtml('le-padrino', 'Líder que lo refirió (opcional)'))}
+      ${field('Clasificación', ldClaseSelect('le-clase', c.clasificacion))}
+      ${field('Correo (opcional)', inputEl('le-correo', 'inputmode="email"'))}
+      <button class="btn btn-primary btn-block" id="le-save">Guardar cambios</button>
+    </div>`);
+  $('#le-cod').value = c.codigo || ''; $('#le-nombre').value = c.nombre || '';
+  $('#le-doc').value = c.documento || '';
+  $('#le-wa').value = c.telLocal || (c.contacto ? String(c.contacto).replace(/^57/, '') : '');
+  $('#le-correo').value = c.correo || '';
+  onlyDigits($('#le-cod')); onlyDigits($('#le-wa'));
+  getResidencias().then(l => { bindCombobox('le-resi', l); $('#le-resi').value = c.residencia || ''; });
+  bindCombobox('le-padrino', padrinos); $('#le-padrino').value = c.padrino || '';
+  if (pre) {
+    ['codigo:le-cod', 'nombre:le-nombre', 'contacto:le-wa', 'residencia:le-resi', 'padrino:le-padrino', 'correo:le-correo', 'clasificacion:le-clase']
+      .forEach(par => { const [k, id] = par.split(':'); const el = $('#' + id); if (el && pre[k] != null) el.value = pre[k]; });
+  }
+  $('#le-save').onclick = async () => {
+    const body = { ...ldAuth(), codigoOriginal: cod, codigo: onlyDig(val('le-cod')), nombre: val('le-nombre'), contacto: onlyDig(val('le-wa')), residencia: val('le-resi'), padrino: val('le-padrino'), correo: val('le-correo'), clasificacion: val('le-clase') };
+    if (!/^\d+$/.test(body.codigo) || Number(body.codigo) < 1) return toast('Código inválido', 'err');
+    if (body.nombre.split(/\s+/).filter(Boolean).length < 2) return toast('Nombre: al menos 2 palabras', 'err');
+    if (body.contacto && body.contacto.length !== 10) return toast('WhatsApp: 10 dígitos', 'err');
+
+    /* 01/09 · CAMBIO DE PADRINO: si este líder está ACTIVADO y el padrino
+       nuevo existe pero NO está activado, pasa a No activado (junto con sus
+       ahijados). Se avisa antes; cancelar descarta SOLO el cambio de padrino.
+       Si el padrino nuevo sí está activado, no se toca nada: activar es
+       siempre un acto explícito, nunca un efecto secundario de editar. */
+    if (ldNorm(body.padrino) !== ldNorm(c.padrino)) {
+      const yo = ldFind(cod) || c;
+      const pn = body.padrino ? ldPorNombre(body.padrino) : null;
+      if (yo && yo.activado && pn && !pn.activado) {
+        const hijos = ldAhijadosDe(yo);
+        const ok = await confirmar('Cambio de padrino',
+          crow('Líder', '#' + (yo.codigo || cod) + ' · ' + (yo.nombre || '')) +
+          crow('Nuevo padrino', '#' + pn.codigo + ' · ' + pn.nombre + ' (No activado)') +
+          crow('Queda', 'No activado') +
+          `<p class="muted small" style="margin:10px 2px 0;">Su nuevo padrino no está activado, así que este líder pasará a <b>No activado</b>${hijos.length ? ` junto con sus ${hijos.length.toLocaleString('es-CO')} ahijado(s)` : ''}.</p>`);
+        if (!ok) return ldEditar(cod, { ...body, padrino: c.padrino || '' });
+      }
+    }
+
+    const btn = $('#le-save'); saving(btn, true);
+    try {
+      const r = await api('priv.liderEditar', {}, 'POST', body); saving(btn, false);
+      if (!r.ok) return toast(r.msg || 'No se pudo guardar', 'err');
+      closeLayer(); toast('Líder actualizado', 'ok'); ldUpsertCard(r.card);
+      ldAplicarAfectados(r.desactivados);   /* 01/09: bajó él y su grupo */
+    } catch (e) { saving(btn, false); fallaRed(e); }
+  };
+}
+
+/* ---- AGREGAR líder (documento primero; crea en base si no existe) ---- */
+async function ldAgregar() {
+  openSheet(`<div class="grip"></div><h2 class="h2">Registro de líder</h2>${loadingBox('Preparando…')}`);
+  let meta;
+  try { meta = await api('priv.liderNuevoMeta', ldAuth()); }
+  catch (e) { closeLayer(); return fallaRed(e); }
+  const padrinos = (meta.lideres || []).map(l => l.nombre);
+  openSheet(`<div class="grip"></div><h2 class="h2" style="margin-bottom:6px;">Registro de líder</h2>
+    <p class="muted small">Primero el documento: si ya está en la base, se usa; si no, se crea también en la base. El líder no se duplica.</p>
+    <div class="stack">
+      ${field('Código', inputEl('la-cod', 'inputmode="numeric"'))}
+      <div class="ag-doc">
+        ${field('Documento del líder', inputEl('la-doc', 'inputmode="numeric"'))}
+        <button class="btn btn-ghost" id="la-buscar">Buscar</button>
+      </div>
+      <div id="la-msg"></div>
+      <fieldset id="la-rest" disabled class="ag-rest">
+        ${field('Nombre completo', inputEl('la-nombre', 'placeholder="Nombres y apellidos"'))}
+        ${field('WhatsApp', inputEl('la-wa', 'inputmode="numeric" maxlength="10"'))}
+        ${field('Residencia', comboboxHtml('la-resi', 'Escribe para buscar…'))}
+        ${field('Padrino (opcional)', comboboxHtml('la-padrino', 'Líder que lo refirió'))}
+        ${field('Clasificación', ldClaseSelect('la-clase'))}
+        ${field('Correo (opcional)', inputEl('la-correo', 'inputmode="email"'))}
+        <p class="muted small">La contraseña del líder será su documento.</p>
+        <button class="btn btn-primary btn-block" id="la-save">Guardar líder</button>
+      </fieldset>
+    </div>`);
+  $('#la-cod').value = meta.sugerido || '';
+  onlyDigits($('#la-cod')); onlyDigits($('#la-doc')); onlyDigits($('#la-wa'));
+  getResidencias().then(l => bindCombobox('la-resi', l));
+  bindCombobox('la-padrino', padrinos);
+  const unlock = (on) => { $('#la-rest').disabled = !on; };
+  let creaEnBase = false;
+  $('#la-buscar').onclick = async () => {
+    const d = onlyDig(val('la-doc'));
+    if (!/^\d{5,10}$/.test(d)) return toast('Documento inválido (5 a 10 dígitos)', 'err');
+    const btn = $('#la-buscar'); saving(btn, true);
+    try {
+      const r = await api('priv.liderBuscarDoc', { documento: d, ...ldAuth() }); saving(btn, false);
+      if (!r.ok) { $('#la-msg').innerHTML = `<div class="ag-warn">${esc(r.msg || 'Documento inválido')}</div>`; unlock(false); return; }
+      if (r.yaLider) { $('#la-msg').innerHTML = `<div class="ag-warn">Ya es líder (código <b>#${esc(r.codigo)}</b>): <b>${esc(r.nombre || '')}</b>. No se puede duplicar.</div>`; unlock(false); return; }
+      if (r.enPrincipal) {
+        creaEnBase = false;
+        $('#la-msg').innerHTML = `<div class="ag-ok">Está en la base: <b>${esc(r.nombre || '')}</b>. Confirma o ajusta y guarda.</div>`;
+        unlock(true);
+        $('#la-nombre').value = r.nombre || ''; $('#la-wa').value = (r.contacto || ''); $('#la-resi').value = r.residencia || '';
+      } else {
+        creaEnBase = true;
+        $('#la-msg').innerHTML = `<div class="ag-ok">No está en la base: se creará también con estos datos.</div>`;
+        unlock(true); $('#la-nombre').focus();
+      }
+    } catch (e) { saving(btn, false); fallaRed(e); }
+  };
+  $('#la-save').onclick = async () => {
+    const cod = onlyDig(val('la-cod'));
+    if (!/^\d+$/.test(cod) || Number(cod) < 1) return toast('Código inválido', 'err');
+    const body = { ...ldAuth(), codigo: cod, documento: onlyDig(val('la-doc')), nombre: val('la-nombre'), contacto: onlyDig(val('la-wa')), residencia: val('la-resi'), padrino: val('la-padrino'), correo: val('la-correo'), clasificacion: val('la-clase') };
+    if (!/^\d{5,10}$/.test(body.documento)) return toast('Documento inválido', 'err');
+    if (creaEnBase) {
+      if (body.nombre.split(/\s+/).filter(Boolean).length < 2) return toast('Escribe el nombre completo', 'err');
+      if (body.contacto.length !== 10) return toast('WhatsApp: 10 dígitos', 'err');
+      if (!body.residencia) return toast('Indica la residencia', 'err');
+    }
+    const btn = $('#la-save'); saving(btn, true);
+    try {
+      const r = await api('priv.liderAgregar', {}, 'POST', body); saving(btn, false);
+      if (!r.ok) return toast(r.msg || 'No se pudo crear', 'err');
+      closeLayer(); toast('Líder registrado', 'ok');
+      if (($('#ld-q') || {}).value) $('#ld-q').value = '';
+      ldUpsertCard(r.card, true);
+    } catch (e) { saving(btn, false); fallaRed(e); }
+  };
+}
+
+/* ============================================================
+   DASHBOARD  (análisis de registros · barras Honda vs otro)
+   ============================================================ */
+let DASH_ROWS = [], DASH_COLS = [], DASH_ME = '';
+let DASH_GROUP = 'residencia', DASH_TOPN = 15, DASH_Q = '';
+let DASH_SOLO_PUESTO = false, DASH_SIN_REG = false;
+const DASH_INT = new Set();
+let DASH_RESI_ALL = null;
+/* 26/07/2026 · catálogo de puestos de votación (Configuración → Avanzado →
+   Elecciones). El servidor ya manda cada fila con su puesto COLAPSADO; esta
+   lista solo sirve para pintar en CERO los puestos que no tienen registros. */
+let DASH_PUESTOS = [], DASH_P_OTRO = 'Otro municipio';
+const DASH_TOPN_OPTS = [10, 15, 25, 50, 0]; // 0 = Todas
+
+/* 13/10/2026 · Fase 2: el Dashboard sale de la MISMA lista de PRINCIPAL que
+   la Base de Datos (priv.baseDatos fmt=2 ya trae puesto, mesa y el catálogo).
+   Venir de Base de Datos = cero viajes; entrar directo = un viaje que de paso
+   deja lista la Base de Datos. Las filas se arman igual que
+   apiPrivDashboardArmar_ (Dashboard.gs): activos, residencia y municipio con
+   su "(Sin …)", y el municipio de la campaña comparado como en el CORE. */
+function dashDesdeBd(r) {
+  const d = r.dash || {};
+  BD_DASH = d;
+  const mio = String(MV.municipio || '').trim().toUpperCase();
+  DASH_ROWS = (r.items || []).filter(x => String(x.estado || 'ACTIVO').toUpperCase() !== 'INACTIVO').map(x => ({
+    documento: String(x.documento == null ? '' : x.documento).trim(),
+    nombre: x.nombre || '',
+    residencia: String(x.residencia || '').trim() || '(Sin residencia)',
+    municipio: String(x.municipio || '').trim() || '(Sin municipio)',
+    puesto: x.puesto !== undefined ? x.puesto : bdPuestoEtiqueta(x.puestoCrudo),
+    puestoCrudo: String(x.puestoCrudo || '').trim(),
+    mesa: String(x.mesa == null ? '' : x.mesa).trim(),
+    intencion: String(x.intencion || '').trim(),
+    esFlandes: !!mio && String(x.municipio == null ? '' : x.municipio).trim().toUpperCase() === mio,
+    esLider: !!x.esLider
+  }));
+  DASH_COLS = d.columnas || DASH_COLS;
+  DASH_PUESTOS = d.puestos || DASH_PUESTOS; DASH_P_OTRO = d.puestoOtro || DASH_P_OTRO;
+}
+
+async function viewDashboard(user) {
+  DASH_ME = user.documento; appWide(true, true);
+  app.innerHTML = `${backbar('Dashboard')}
+    <div class="pad">
+      <div id="dash-controls"></div>
+      <div id="dash-body">${loadingBox('Analizando registros…')}</div>
+    </div>`;
+  app.hidden = false; hideSplash();
+  $('#backbtn').onclick = () => go('bd');
+  DASH_GROUP = 'residencia'; DASH_TOPN = 15; DASH_Q = ''; DASH_SOLO_PUESTO = false; DASH_SIN_REG = false; DASH_INT.clear();
+  let primera = true;
+  try {
+    await rapCargar('priv.baseDatos', { caller: DASH_ME, act: '1' }, (r) => {   /* act=1: misma caché que Base de datos */
+      if (!$('#dash-body')) return;
+      if (!r || r.ok === false) { if (primera) $('#dash-body').innerHTML = `<p class="muted center">No se pudo cargar.</p>`; return; }
+      if (!r.dash) return dashViejo(primera);   // CORE todavía sin la Fase 2: se usa la ruta de antes
+      dashDesdeBd(r);
+      if (primera) dashRenderControls();
+      primera = false;
+      dashRender();
+    });
+  } catch (e) { if ($('#dash-body') && primera) $('#dash-body').innerHTML = `${fallaHtml(e)}`; }
+
+  vivoBind('bd', DASH_ME, vivoDashboard);   // EN VIVO: el Dashboard sale de PRINCIPAL → canal 'bd'
+}
+
+/* ---- EN VIVO · Dashboard ----
+   Cambia una persona en otro equipo y las gráficas se recalculan solas. Se
+   conservan los controles tal como los dejó el usuario (agrupación, Top N,
+   búsqueda, filtros): solo se cambian los datos por debajo. */
+/* Respaldo mientras el CORE desplegado no traiga la lista compacta */
+async function dashViejo(primera) {
+  try {
+    const r = await api('priv.dashboard', { caller: DASH_ME }, 'GET', null, primera ? {} : SILENCIO);
+    if (!r || !r.ok || !$('#dash-body')) return;
+    DASH_ROWS = r.rows || []; DASH_COLS = r.columnas || [];
+    DASH_PUESTOS = r.puestos || []; DASH_P_OTRO = r.puestoOtro || DASH_P_OTRO;
+    dashRenderControls(); dashRender();
+  } catch (e) { if ($('#dash-body')) $('#dash-body').innerHTML = `${fallaHtml(e)}`; }
+}
+
+async function vivoDashboard(rev) {
+  /* Si la señal trae la persona, basta su tarjeta (se parcha en la lista de
+     sesión y el tablero se recalcula desde ahí); si no, la lista entera. */
+  const c = RAP.tomar('priv.baseDatos');
+  const doc = rev && rev.doc ? normDocJs(rev.doc) : '';
+  if (c && doc) {
+    const r = await api('priv.bdCard', { caller: DASH_ME, documento: doc }, 'GET', null, SILENCIO);
+    const items = c.data.items || (c.data.items = []);
+    const prev = rev.prev ? normDocJs(rev.prev) : '';
+    for (let i = items.length - 1; i >= 0; i--) {
+      const d = normDocJs(items[i].documento);
+      if ((prev && d === prev) || d === doc) items.splice(i, 1);
+    }
+    if (r && r.card) items.push(bdCompletarCard(r.card));
+    RAP.tocar('priv.baseDatos', 'bd', rev.ts);
+    dashDesdeBd(c.data); dashRender(); vivoCerrarHoja(rev);
+    return;
+  }
+  const r = await api('priv.baseDatos', Object.assign({ caller: DASH_ME, act: '1' }, RAP.params()), 'GET', null, SILENCIO);
+  if (!r || r.ok === false) return;
+  RAP.guardar('priv.baseDatos', r, r.__rapCrudo);
+  if (!vivoCambio(JSON.stringify(r.items))) return;
+  dashDesdeBd(r); dashRender(); vivoCerrarHoja(rev);
+}
+
+function dashIntValues() {
+  const c = {};
+  DASH_ROWS.forEach(r => { if (r.intencion) c[r.intencion] = (c[r.intencion] || 0) + 1; });
+  return Object.keys(c).sort((a, b) => c[b] - c[a]);
+}
+
+function dashRenderControls() {
+  const ints = dashIntValues();
+  $('#dash-controls').innerHTML = `
+    <div class="dash-toolbar">
+      <div class="bd-search"><input class="input" id="dash-q" placeholder="Buscar zona o puesto…" autocomplete="off" value="${esc(DASH_Q)}" /></div>
+    </div>
+    <div class="dash-segs">
+      <div class="seg" id="dash-group">
+        <button class="seg-b ${DASH_GROUP === 'residencia' ? 'active' : ''}" data-g="residencia">Por residencia</button>
+        <button class="seg-b ${DASH_GROUP === 'puesto' ? 'active' : ''}" data-g="puesto">Por puesto</button>
+      </div>
+      <label class="dash-top"><span class="small muted">Top</span>
+        <select class="input dash-select" id="dash-topn">
+          ${DASH_TOPN_OPTS.map(n => `<option value="${n}" ${n === DASH_TOPN ? 'selected' : ''}>${n === 0 ? 'Todas' : n}</option>`).join('')}
+        </select></label>
+    </div>
+    <div class="dash-toggles">
+      <button class="bd-chip ${DASH_SOLO_PUESTO ? 'active' : ''}" id="dash-solopuesto">Solo con puesto asignado</button>
+      <button class="bd-chip ${DASH_SIN_REG ? 'active' : ''} ${DASH_GROUP === 'puesto' ? 'hidden' : ''}" id="dash-sinreg">Incluir zonas sin registros</button>
+    </div>
+    ${ints.length ? `<div class="bd-chips bd-chips-int" id="dash-int"><span class="bd-chips-lbl">Intención:</span>
+      ${ints.map(v => `<button class="bd-chip bd-chip-int ${DASH_INT.has(v) ? 'active' : ''}" data-int="${esc(v)}">${esc(v)}</button>`).join('')}</div>` : ''}
+    <div class="dash-exports">
+      <button class="btn btn-ghost" id="dash-xls">${I.download} Excel</button>
+      <button class="btn btn-ghost" id="dash-pdf">${I.pdf} PDF</button>
+    </div>`;
+  let t;
+  $('#dash-q').oninput = (e) => { DASH_Q = e.target.value; clearTimeout(t); t = setTimeout(dashRender, 160); };
+  $$('#dash-group .seg-b').forEach(b => b.onclick = () => { DASH_GROUP = b.dataset.g; dashRenderControls(); dashRender(); });
+  $('#dash-topn').onchange = (e) => { DASH_TOPN = parseInt(e.target.value, 10); dashRender(); };
+  $('#dash-solopuesto').onclick = () => { DASH_SOLO_PUESTO = !DASH_SOLO_PUESTO; dashRenderControls(); dashRender(); };
+  const sr = $('#dash-sinreg'); if (sr) sr.onclick = async () => { DASH_SIN_REG = !DASH_SIN_REG; if (DASH_SIN_REG && !DASH_RESI_ALL) DASH_RESI_ALL = await getResidencias(); dashRenderControls(); dashRender(); };
+  $$('#dash-int .bd-chip-int').forEach(ch => ch.onclick = () => { const v = ch.dataset.int; if (DASH_INT.has(v)) DASH_INT.delete(v); else DASH_INT.add(v); dashRenderControls(); dashRender(); });
+  $('#dash-xls').onclick = () => dashExport('excel');
+  $('#dash-pdf').onclick = () => dashExport('pdf');
+}
+
+/* Filas que pasan los filtros de datos (intención + solo con puesto) */
+function dashFilteredRows() {
+  return DASH_ROWS.filter(r => {
+    if (DASH_SOLO_PUESTO && (!r.puesto || r.puesto === '(Sin puesto)')) return false;
+    if (DASH_INT.size && !DASH_INT.has(r.intencion)) return false;
+    return true;
+  });
+}
+/* Agrupa por residencia|puesto → verde (Honda) / rojo (otro) */
+function dashAggregate(rows) {
+  const key = DASH_GROUP === 'puesto' ? 'puesto' : 'residencia';
+  const g = {};
+  rows.forEach(r => { const k = r[key] || '(Sin dato)'; if (!g[k]) g[k] = { z: k, g: 0, r: 0 }; if (r.esFlandes) g[k].g++; else g[k].r++; });
+  let arr = Object.keys(g).map(k => ({ z: g[k].z, g: g[k].g, r: g[k].r, t: g[k].g + g[k].r }));
+  if (DASH_SIN_REG && key === 'residencia' && DASH_RESI_ALL) {
+    const have = {}; arr.forEach(x => have[String(x.z).toUpperCase()] = true);
+    DASH_RESI_ALL.forEach(z => { if (!have[String(z).toUpperCase()]) arr.push({ z: z, g: 0, r: 0, t: 0 }); });
+  }
+  /* Un puesto del catálogo sin registros igual se lista, en cero: es la forma
+     de ver que ese puesto existe y todavía no tiene a nadie. */
+  if (key === 'puesto' && DASH_PUESTOS.length) {
+    const have = {}; arr.forEach(x => have[String(x.z).toUpperCase()] = true);
+    DASH_PUESTOS.forEach(pu => { if (!have[String(pu).toUpperCase()]) arr.push({ z: pu, g: 0, r: 0, t: 0 }); });
+  }
+  const q = DASH_Q.trim().toLowerCase();
+  if (q) arr = arr.filter(x => String(x.z).toLowerCase().includes(q));
+  arr.sort((a, b) => {
+    /* "Otro municipio" es el residuo de todo lo que no es del municipio:
+       va siempre de última, pese lo que pese. */
+    if (a.z === DASH_P_OTRO) return 1;
+    if (b.z === DASH_P_OTRO) return -1;
+    return b.t - a.t || String(a.z).localeCompare(b.z);
+  });
+  return arr;
+}
+function dashRender() {
+  const rows = dashFilteredRows();
+  const agg = dashAggregate(rows);
+  const total = rows.length, honda = rows.filter(r => r.esFlandes).length;
+  const pct = total ? Math.round(honda * 100 / total) : 0;
+  /* Con catálogo, el KPI cuenta los puestos del municipio (incluidos los que
+     están en cero) y NO cuenta ni "(Sin puesto)" ni "Otro municipio", que no
+     son puestos sino cajones. */
+  const zonasConReg = (DASH_GROUP === 'puesto' && DASH_PUESTOS.length)
+    ? DASH_PUESTOS.length
+    : agg.filter(x => x.t > 0).length;
+  const shown = DASH_TOPN === 0 ? agg : agg.slice(0, DASH_TOPN);
+  const maxT = agg.reduce((m, x) => Math.max(m, x.t), 1);
+
+  const bars = shown.map(x => {
+    const gw = Math.round(x.g / maxT * 100), rw = Math.round(x.r / maxT * 100);
+    return `<div class="dbar">
+      <div class="dbar-head"><span class="dbar-z" title="${esc(x.z)}">${esc(x.z)}</span><span class="dbar-t">${x.t.toLocaleString('es-CO')}</span></div>
+      <div class="dbar-track"><div class="dbar-g" style="width:${gw}%"></div><div class="dbar-r" style="width:${rw}%"></div></div>
+      <div class="dbar-legend"><span class="dot-g"></span>${x.g} en ${esc(MV.municipio)} <span class="dot-r"></span>${x.r} otro</div>
+    </div>`;
+  }).join('') || `<p class="muted center" style="padding:20px 0;">Sin datos para el filtro actual.</p>`;
+
+  // Mini-distribución por intención (de las filas filtradas)
+  const ic = {}; rows.forEach(r => { const k = r.intencion || '(Sin dato)'; ic[k] = (ic[k] || 0) + 1; });
+  const iArr = Object.keys(ic).map(k => ({ k, n: ic[k] })).sort((a, b) => b.n - a.n);
+  const iMax = iArr.reduce((m, x) => Math.max(m, x.n), 1);
+  const intBars = iArr.map(x => `<div class="ibar"><span class="ibar-l" title="${esc(x.k)}">${esc(x.k)}</span>
+      <div class="ibar-track"><div class="ibar-fill" style="width:${Math.round(x.n / iMax * 100)}%"></div></div>
+      <span class="ibar-n">${x.n.toLocaleString('es-CO')}</span></div>`).join('');
+
+  $('#dash-body').innerHTML = `
+    <div class="dash-kpis">
+      <div class="dk"><b>${total.toLocaleString('es-CO')}</b><span>Registros</span></div>
+      <div class="dk"><b>${honda.toLocaleString('es-CO')}</b><span>Vota en ${esc(MV.municipio)}</span></div>
+      <div class="dk"><b>${pct}%</b><span>% en ${esc(MV.municipio)}</span></div>
+      <div class="dk"><b>${zonasConReg.toLocaleString('es-CO')}</b><span>${DASH_GROUP === 'puesto' ? 'Puestos' : 'Zonas'}</span></div>
+    </div>
+    <div class="dash-card">
+      <div class="dash-card-h"><b>${DASH_GROUP === 'puesto' ? 'Registros por puesto' : 'Registros por zona de residencia'}</b>
+        <span class="dash-key"><span class="dot-g"></span> ${esc(MV.municipio)} <span class="dot-r"></span> Otro municipio</span></div>
+      ${bars}
+      ${DASH_TOPN !== 0 && agg.length > DASH_TOPN ? `<p class="small muted center" style="margin-top:8px;">Mostrando top ${DASH_TOPN} de ${agg.length.toLocaleString('es-CO')} · usa la búsqueda o cambia el Top.</p>` : ''}
+    </div>
+    ${iArr.length ? `<div class="dash-card"><div class="dash-card-h"><b>Distribución por intención de voto</b></div>${intBars}</div>` : ''}`;
+}
+
+function dashExport(tipo) {
+  const rows = dashFilteredRows();
+  const q = DASH_Q.trim().toLowerCase();
+  const key = DASH_GROUP === 'puesto' ? 'puesto' : 'residencia';
+  const finales = q ? rows.filter(r => String(r[key] || '').toLowerCase().includes(q)) : rows;
+  const docs = finales.map(r => r.documento).filter(Boolean);
+  if (!docs.length) return toast('No hay registros en el filtro actual', 'err');
+  const pref = ['NOMBRE', 'DOCUMENTO', 'CONTACTO', 'RESIDENCIA', 'MUNICIPIO', 'PUESTO', 'MESA', 'INTENCION'];
+  const checked = new Set(DASH_COLS.filter(c => pref.indexOf(String(c).toUpperCase()) !== -1));
+  openSheet(`<div class="grip"></div>
+    <h2 class="h2" style="margin-bottom:4px;">Exportar a ${tipo === 'excel' ? 'Excel' : 'PDF'}</h2>
+    <p class="muted small">${docs.length.toLocaleString('es-CO')} registro(s) del filtro actual. Elige las columnas:</p>
+    <div class="col-pick" id="col-pick">
+      ${DASH_COLS.map(c => `<label class="col-opt"><input type="checkbox" data-c="${esc(c)}" ${checked.has(c) ? 'checked' : ''}/> <span>${esc(String(c).replace(/_/g, ' '))}</span></label>`).join('')}
+    </div>
+    <button class="btn btn-primary btn-block" id="col-go" style="margin-top:12px;">${I.download} Descargar ${tipo === 'excel' ? 'Excel' : 'PDF'}</button>`);
+  $('#col-go').onclick = async () => {
+    const columnas = $$('#col-pick input:checked').map(i => i.dataset.c);
+    if (!columnas.length) return toast('Elige al menos una columna', 'err');
+    const btn = $('#col-go'); saving(btn, true);
+    try {
+      const action = tipo === 'excel' ? 'priv.dashExcel' : 'priv.dashPdf';
+      const r = await api(action, {}, 'POST', { caller: DASH_ME, documentos: docs, columnas, groupBy: DASH_GROUP, topN: DASH_TOPN || 15 });
+      saving(btn, false);
+      if (!r.ok) return toast(r.msg || 'No se pudo generar', 'err');
+      downloadB64(r.base64, r.mime, r.filename);
+      closeLayer(); toast('Archivo generado', 'ok');
+    } catch (e) { saving(btn, false); toast('Error al generar el archivo', 'err'); }
+  };
+}
+
+/* ============================================================
+   SIMULADOR  (potencial Honda vs votos reales)
+   ============================================================ */
+let SIM = null, SIM_ME = '', SIM_Q = '';
+async function viewSimulador(user) {
+  SIM_ME = user.documento; appWide(true); SIM_Q = '';
+  app.innerHTML = `${backbar('Simulador')}
+    <div class="pad">
+      <div id="sim-body">${loadingBox('Simulando votación…')}</div>
+    </div>`;
+  app.hidden = false; hideSplash();
+  $('#backbtn').onclick = () => go('bd');
+  try {
+    const r = await api('priv.simulador', { caller: SIM_ME });
+    if (!r.ok) { $('#sim-body').innerHTML = `<p class="muted center">No se pudo cargar.</p>`; return; }
+    SIM = r; elecSet(r.eleccion); simRender();
+  } catch (e) { $('#sim-body').innerHTML = `${fallaHtml(e)}`; }
+
+  vivoBind('bd', SIM_ME, vivoSimulador);   // EN VIVO: el Simulador también sale de PRINCIPAL
+}
+
+/* ---- EN VIVO · Simulador ---- */
+async function vivoSimulador(rev) {
+  const r = await api('priv.simulador', { caller: SIM_ME }, 'GET', null, SILENCIO);
+  /* El `now` del servidor se toma SIEMPRE (aunque los puestos no cambien):
+     es la resincronización del regresivo. Lo que se ahorra es el repintado. */
+  if (!r.ok) return;
+  elecSet(r.eleccion);
+  if (!vivoCambio(JSON.stringify(r.puestos) + JSON.stringify(r.eleccion.fecha) + r.eleccion.horaInicio + r.eleccion.horaFin)) return;
+  SIM = r; simRender(); vivoCerrarHoja(rev);
+}
+function simRender() {
+  const t = SIM.totales;
+  const q = SIM_Q.trim().toLowerCase();
+  const puestos = q ? SIM.puestos.filter(p => String(p.puesto).toLowerCase().includes(q)) : SIM.puestos;
+  const maxReg = SIM.puestos.reduce((m, x) => Math.max(m, x.registros), 1);
+  const bars = puestos.map((x, i) => {
+    const w = Math.round(x.registros / maxReg * 100);
+    const mesas = x.mesas.map(m => `<tr><td>Mesa ${esc(m.mesa)}</td><td>${m.registros.toLocaleString('es-CO')}</td><td>${pctES(m.pct)}</td></tr>`).join('');
+    return `<div class="sbar" data-i="${i}">
+      <div class="sbar-head"><span class="sbar-p" title="${esc(x.puesto)}">${esc(x.puesto)}</span><span class="sbar-n">${x.registros.toLocaleString('es-CO')} reg. · <b>${pctES(x.pct)}</b></span></div>
+      <div class="sbar-track"><div class="sbar-real" style="width:${w}%"></div></div>
+      <button class="sbar-toggle" data-t="${i}">Ver mesas (${x.mesas.length})</button>
+      <div class="sbar-mesas hidden" id="sm-${i}"><table class="sim-table"><tr><th>Mesa</th><th>Registros</th><th>Conversión</th></tr>${mesas}</table></div>
+    </div>`;
+  }).join('') || `<p class="muted center" style="padding:20px 0;">Sin puestos para mostrar.</p>`;
+
+  $('#sim-body').innerHTML = `
+    ${elecCronoHtml('sim-crono', 'dias')}
+    <div class="dash-kpis">
+      <div class="dk"><b>${t.registros.toLocaleString('es-CO')}</b><span>Registros en ${esc(MV.municipio)}</span></div>
+      <div class="dk"><b>${t.puestos.toLocaleString('es-CO')}</b><span>Puestos</span></div>
+      <div class="dk"><b>${t.mesas.toLocaleString('es-CO')}</b><span>Mesas</span></div>
+    </div>
+    <p class="small muted" style="margin:2px 0 8px;">Los votos que se obtendrían si votara todo el que está registrado con municipio de votación <b>${esc(MV.municipio)}</b>. La <b>conversión</b> de un puesto es su peso sobre el total de ${esc(MV.municipio)}; la de una mesa, su peso dentro de su propio puesto.</p>
+    <div class="bd-search" style="margin-bottom:10px;"><input class="input" id="sim-q" placeholder="Buscar puesto…" autocomplete="off" value="${esc(SIM_Q)}" /></div>
+    <div class="sim-list">${bars}</div>
+    <button class="btn btn-primary btn-block" id="sim-pdf" style="margin-top:14px;">${I.pdf} Generar informe PDF</button>`;
+  elecCronoBind('sim-crono', 'dias');
+  let tm; $('#sim-q').oninput = (e) => { SIM_Q = e.target.value; clearTimeout(tm); tm = setTimeout(simRender, 160); };
+  $$('.sbar-toggle').forEach(b => b.onclick = () => { const el = $('#sm-' + b.dataset.t); if (el) el.classList.toggle('hidden'); });
+  $('#sim-pdf').onclick = async () => {
+    const btn = $('#sim-pdf'); saving(btn, true);
+    try {
+      const r = await api('priv.simuladorPdf', {}, 'POST', { caller: SIM_ME });
+      saving(btn, false);
+      if (!r.ok) return toast(r.msg || 'No se pudo generar', 'err');
+      downloadB64(r.base64, r.mime, r.filename);
+      toast('Informe generado', 'ok');
+    } catch (e) { saving(btn, false); toast('Error al generar el PDF', 'err'); }
+  };
+}
+
+
+
+/* ============================================================
+   VOTACIÓN  (tablero EN VIVO de votos · Excel/PDF)
+   Los votos se registran desde la app de escaneo (aparte);
+   aquí llegan y se ven en vivo por PUESTO, MESA y LÍDER.
+   ============================================================ */
+const VOTO_FBCFG = (typeof MARCA !== 'undefined' && MARCA.FIREBASE) || {};
+let VOTO_ME = '', VOTO_TAB = 'porPuesto', VOTO_Q = '';
+let VOTO_TALLY = { total: 0, porPuesto: [], porMesa: [], porLider: [] };
+let VOTO_poll = null, VOTO_fb = null, VOTO_ref = null, VOTO_onVal = null, VOTO_reloadT = null, VOTO_last = 0;
+
+function loadScript(src) { return new Promise((res, rej) => { const s = document.createElement('script'); s.src = src; s.async = true; s.onload = res; s.onerror = () => rej(new Error(src)); document.head.appendChild(s); }); }
+async function loadFirebase() { if (window.firebase && window.firebase.database) return window.firebase; const b = 'https://www.gstatic.com/firebasejs/10.12.2/'; await loadScript(b + 'firebase-app-compat.js'); await loadScript(b + 'firebase-database-compat.js'); return window.firebase; }
+
+function votoTeardown() {
+  if (VOTO_poll) { clearInterval(VOTO_poll); VOTO_poll = null; }
+  if (ELEC.timer) { clearInterval(ELEC.timer); ELEC.timer = null; }
+  if (VOTO_ref && VOTO_onVal) { try { VOTO_ref.off('value', VOTO_onVal); } catch (e) {} }
+  VOTO_onVal = null;
+  if (VOTO_reloadT) { clearTimeout(VOTO_reloadT); VOTO_reloadT = null; }
+  if (VOTO_LID_T) { clearTimeout(VOTO_LID_T); VOTO_LID_T = null; }
+  if (VOTO_ref2 && VOTO_onVal2) { try { VOTO_ref2.off('value', VOTO_onVal2); } catch (e) {} }
+  VOTO_ref2 = null; VOTO_onVal2 = null;
+}
+
+async function viewVotacion(user) {
+  VOTO_ME = user.documento; appWide(true);
+  VOTO_TAB = 'porPuesto'; VOTO_Q = '';
+  votoTeardown(); window.__votoTeardown = votoTeardown;
+
+  app.innerHTML = `${backbar('Votación')}
+    <div class="pad">
+      <p class="voto-note">Los votos se registran desde la app de escaneo. Aquí llegan y se ven <b>en vivo</b> por puesto, mesa y líder.</p>
+      ${elecCronoHtml('voto-crono', 'horas')}
+      <div class="voto-total" id="voto-total"></div>
+      <div class="seg voto-tabs" id="voto-tabs">
+        <button class="seg-b active" data-t="porPuesto">Puesto</button>
+        <button class="seg-b" data-t="porMesa">Mesa</button>
+        <button class="seg-b" data-t="porLider">Líder</button>
+      </div>
+      <div class="bd-search" style="margin:8px 0;"><input class="input" id="voto-q" placeholder="Buscar…" autocomplete="off"></div>
+      <div id="voto-counters">${loadingBox('Cargando votos…')}</div>
+      <div class="dash-exports" style="margin-top:14px;">
+        <button class="btn btn-ghost" id="voto-xls">${I.download} Excel</button>
+        <button class="btn btn-ghost" id="voto-pdf">${I.pdf} PDF</button>
+      </div>
+      <button class="btn btn-ghost btn-block" id="voto-refresh" style="margin-top:2px;">Actualizar ahora</button>
+    </div>`;
+  app.hidden = false; hideSplash();
+
+  $('#backbtn').onclick = () => { votoTeardown(); window.__votoTeardown = null; go('bd'); };
+  $$('#voto-tabs .seg-b').forEach(b => b.onclick = () => { VOTO_TAB = b.dataset.t; $$('#voto-tabs .seg-b').forEach(x => x.classList.toggle('active', x === b)); votoRenderCounters(); if (VOTO_TAB === 'porLider' && VOTO_LID_VIEJO) votoLideresLuego(); });
+  let tq; $('#voto-q').oninput = (e) => { VOTO_Q = e.target.value; clearTimeout(tq); tq = setTimeout(votoRenderCounters, 140); };
+  $('#voto-xls').onclick = () => votoExport('excel');
+  $('#voto-pdf').onclick = () => votoExport('pdf');
+  $('#voto-refresh').onclick = () => votoLoad(true);
+
+  await votoLoad(false);
+  elecCronoBind('voto-crono', 'horas');
+  /* 13/10/2026 · Fase 2: sin reloj de 7 s; el sondeo queda solo de respaldo.
+     12/10 · Fase 3: los conteos llegan de /votacion (ver votoAplicarVivo). */
+  votoInitFirebase();
+}
+function votoRespaldo() {
+  if (VOTO_poll || !$('#voto-counters')) return;
+  VOTO_poll = setInterval(() => { if (!document.hidden) votoLoad(false); }, 7000);
+}
+
+async function votoLoad(manual) {
+  try {
+    /* 17/07: el refresco de fondo (sondeo de 7 s y señal) va EN SILENCIO —
+       sin loader. Solo el botón "Actualizar ahora" muestra carga. */
+    const r = await api('voto.contadores', { caller: VOTO_ME }, 'GET', null, manual ? {} : SILENCIO);
+    /* cada sondeo trae la hora del servidor → el regresivo se resincroniza */
+    if (r.ok) { VOTO_TALLY = r.tally; VOTO_LID_VIEJO = false; VOTO_LID_ULT = Date.now(); elecSet(r.eleccion); VOTO_last = Date.now(); votoRenderCounters(); if (manual) toast('Actualizado', 'ok'); }
+  } catch (e) { if (manual) toast('No se pudo actualizar', 'err'); }
+}
+
+/* 12/10/2026 · Fase 3 — los conteos llegan DIRECTO de Firebase.
+   El CORE escribe /votacion en cada voto (total, puestos y mesas; nunca
+   nombres de líderes: ese nodo es de lectura pública). Así el tablero ya no
+   pide voto.contadores por cada voto (antes: 2–3 s en el servidor por voto
+   y por dispositivo). Bases, catálogo y líderes salen de la carga inicial;
+   los líderes se refrescan solo con esa pestaña a la vista y como mucho una
+   vez cada 15 s. Si /votacion no se deja leer, se vuelve a la señal de
+   meta/votacion_rev (como antes) y, sin Firebase, al sondeo de respaldo. */
+let VOTO_LID_T = null, VOTO_LID_VIEJO = false, VOTO_LID_ULT = 0;
+function votoPct(n, base) { return base ? Math.round(n * 10000 / base) / 100 : 0; }
+function votoAplicarVivo(v) {
+  if (!v || typeof v.total !== 'number') return false;
+  const mapa = (o) => { const m = {}; Object.keys(o || {}).forEach(k => { const x = o[k]; if (x && x.l != null) m[String(x.l)] = Number(x.n) || 0; }); return m; };
+  const fusionar = (arr, m) => {
+    const vistos = {};
+    const out = (arr || []).map(x => { vistos[x.label] = 1; const n = (x.label in m) ? m[x.label] : x.n; return Object.assign({}, x, { n, pct: votoPct(n, x.base) }); });
+    Object.keys(m).forEach(l => { if (!vistos[l] && m[l]) out.push({ label: l, n: m[l], base: 0, pct: 0 }); });
+    return out.sort((a, b) => b.n - a.n || String(a.label).localeCompare(b.label));
+  };
+  VOTO_TALLY = Object.assign({}, VOTO_TALLY, {
+    total: v.total, pct: votoPct(v.total, VOTO_TALLY.base || 0),
+    porPuesto: fusionar(VOTO_TALLY.porPuesto, mapa(v.puesto)),
+    porMesa: fusionar(VOTO_TALLY.porMesa, mapa(v.mesa))
+  });
+  return true;
+}
+function votoLideresLuego() {
+  VOTO_LID_VIEJO = true;
+  if (VOTO_TAB !== 'porLider' || VOTO_LID_T) return;
+  const falta = Math.max(0, 15000 - (Date.now() - VOTO_LID_ULT));
+  VOTO_LID_T = setTimeout(() => { VOTO_LID_T = null; if ($('#voto-counters') && VOTO_TAB === 'porLider') votoLoad(false); }, falta);
+}
+
+function votoInitFirebase() {
+  let llego = false;
+  const t0 = setTimeout(() => { if (!llego) votoRespaldo(); }, 6000);
+  loadFirebase().then(fb => {
+    if (!$('#voto-counters')) return;                    // ya salió de la vista
+    VOTO_fb = fb;
+    (fb.apps && fb.apps.length) ? fb.app() : fb.initializeApp(VOTO_FBCFG);
+    VOTO_ref = fb.database().ref('votacion');
+    VOTO_onVal = VOTO_ref.on('value', (snap) => {
+      llego = true; clearTimeout(t0);
+      if (votoAplicarVivo(snap.val())) { VOTO_last = Date.now(); votoRenderCounters(); votoLideresLuego(); }
+      else if (!VOTO_ref2) votoSenalVieja(fb, t0, () => { llego = true; });   // CORE sin conteos en vivo todavía
+    }, () => { votoSenalVieja(fb, t0, () => { llego = true; }); });
+  }).catch(() => { clearTimeout(t0); votoRespaldo(); });
+}
+
+/* Respaldo: la señal de antes (meta/votacion_rev) + voto.contadores */
+let VOTO_ref2 = null, VOTO_onVal2 = null;
+function votoSenalVieja(fb, t0, marcar) {
+  if (!$('#voto-counters') || VOTO_ref2) return;
+  VOTO_ref2 = fb.database().ref('meta/votacion_rev');
+  let primero = true;
+  VOTO_onVal2 = VOTO_ref2.on('value', () => {
+    marcar(); clearTimeout(t0);
+    if (primero) { primero = false; return; }
+    if (VOTO_reloadT) return;
+    VOTO_reloadT = setTimeout(() => { VOTO_reloadT = null; votoLoad(false); }, 600);
+  }, () => { clearTimeout(t0); votoRespaldo(); });
+}
+
+function votoRenderCounters() {
+  const totEl = $('#voto-total'); if (!totEl) return;
+  const hora = VOTO_last ? new Date(VOTO_last).toLocaleTimeString('es-CO') : '';
+  const base = VOTO_TALLY.base || 0;
+  totEl.innerHTML = `<div class="voto-total-n">${(VOTO_TALLY.total || 0).toLocaleString('es-CO')}</div>
+    <div class="voto-total-l"><span class="voto-live">● EN VIVO</span> votos registrados${hora ? ' · ' + hora : ''}</div>
+    ${base ? `<div class="voto-total-c">${pctES(VOTO_TALLY.pct)} de conversión · ${base.toLocaleString('es-CO')} registros en ${esc(MV.municipio)}</div>` : ''}`;
+  let list = VOTO_TALLY[VOTO_TAB] || [];
+  const q = VOTO_Q.trim().toLowerCase();
+  if (q) list = list.filter(x => String(x.label).toLowerCase().includes(q));
+  const max = list.reduce((m, x) => Math.max(m, x.n), 1);
+  /* AJUSTE 17/07: junto al conteo va la CONVERSIÓN contra los registros de
+     esa etiqueta (puesto/mesa/líder). La barra sigue midiendo votos contra el
+     puesto más votado — si midiera el porcentaje, con 1 voto de 1031 no se
+     vería absolutamente nada. El número dice la verdad fina; la barra, quién
+     va adelante. */
+  $('#voto-counters').innerHTML = list.map(x => `<div class="vc-row">
+      <div class="vc-head"><span class="vc-lbl" title="${esc(x.label)}">${esc(x.label)}</span><span class="vc-n">${x.n.toLocaleString('es-CO')}<small class="vc-pct">${pctBase(x)}</small></span></div>
+      <div class="vc-track"><div class="vc-fill" style="width:${Math.round(x.n / max * 100)}%"></div></div>
+      <div class="vc-sub">${x.base ? `de ${x.base.toLocaleString('es-CO')} registros` : `sin registros en ${MV.municipio} con esta etiqueta`}</div>
+    </div>`).join('') || `<p class="muted center" style="padding:16px 0;">Sin votos${q ? ' para la búsqueda' : ' aún'}.</p>`;
+}
+
+async function votoExport(tipo) {
+  const btn = tipo === 'excel' ? $('#voto-xls') : $('#voto-pdf'); saving(btn, true);
+  try {
+    const r = await api(tipo === 'excel' ? 'voto.excel' : 'voto.informePdf', {}, 'POST', { caller: VOTO_ME });
+    saving(btn, false);
+    if (!r.ok) return toast(r.msg || 'No se pudo generar', 'err');
+    downloadB64(r.base64, r.mime, r.filename); toast('Archivo generado', 'ok');
+  } catch (e) { saving(btn, false); toast('Error al generar el archivo', 'err'); }
+}
+
+/* ---------- Barra superior con avatar/rol y salir ----------
+   Fase 9.2: el avatar del Inicio se comporta igual que el de la app pública
+   (avatarHtml/avatarBox): si hay foto la abre con zoom, si no hay la sube.
+   El lápiz siempre abre el menú de foto. La foto sale de USUARIOS.FOTO y la
+   trae priv.login; una sesión guardada de ANTES de esta versión no la tiene
+   (user.foto === undefined) → cae con gracia a las iniciales, y se refresca
+   sola con priv.miPerfil al entrar al Inicio. */
+function avatarHtmlPriv(user) {
+  const ini = esc(iniciales(user.nombre));
+  const foto = fotoUsuarioPriv(user);
+  const inner = foto
+    ? `<div class="mark has-photo" id="avatarBox"><img src="${esc(foto)}" alt="" onerror="this.parentNode.classList.remove('has-photo');this.replaceWith(document.createTextNode('${ini}'))"/></div>`
+    : `<div class="mark" id="avatarBox">${ini}</div>`;
+  return `<div class="avatar-wrap">${inner}<button class="avatar-edit" id="avatarEdit" title="Editar foto" aria-label="Editar foto">${I.pencil}</button></div>`;
+}
+/* La foto del panel: '' si no hay, o si quedó apuntando a la imagen por defecto */
+function fotoUsuarioPriv(user) {
+  const f = String((user && user.foto) || '').trim();
+  if (esFotoDefault(f)) return '';
+  return f;
+}
+function appbar(user, titulo) {
+  return `<div class="appbar">
+    ${avatarHtmlPriv(user)}
+    <div class="who"><b>${esc(titulo || primerNombre(user.nombre))}</b><span>${esc(rolLabel(user.rol))} · CC ${esc(user.documento)}</span></div>
+    ${getSessions().length > 1 ? `<button class="icon-btn" id="btnSwap" title="Cambiar de cuenta">${I.swap}</button>` : ''}
+    <button class="icon-btn" id="btnOut" title="Salir">${I.logout}</button>
+  </div>`;
+}
+function bindAppbar(user) {
+  const box = $('#avatarBox');
+  if (box) box.onclick = () => { const f = fotoUsuarioPriv(user); if (f) zoomImagen(f); else miFotoMenu(user); };
+  const ed = $('#avatarEdit'); if (ed) ed.onclick = () => miFotoMenu(user);
+  const out = $('#btnOut'); if (out) out.onclick = () => logout();
+  const swap = $('#btnSwap');
+  if (swap) swap.onclick = () => {
+    const sesiones = getSessions();
+    /* 17/07/2026: la X de "quitar de este equipo" se mudó aquí. Vivía en el
+       login, y el login ya no lista cuentas (se entra solo con el PIN). Sin
+       ella no habría forma de sacar una cuenta vieja del dispositivo. */
+    openSheet(`<div class="grip"></div><h2 class="h2">¿Con cuál cuenta sigues?</h2><div class="stack" style="margin-top:12px;">${sesiones.map(s => `<button class="acc-chip" data-doc="${esc(s.documento)}"><span class="av">${esc(iniciales(s.nombre))}</span><span class="acc-meta"><b>${esc(primerNombre(s.nombre))}</b><span>${esc(rolLabel(s.rol))}</span></span><span class="acc-x" data-forget="${esc(s.documento)}" title="Quitar de este equipo">${I.x}</span></button>`).join('')}</div>`);
+    layer.querySelectorAll('.acc-chip').forEach(c => c.onclick = (ev) => {
+      const fx = ev.target.closest('.acc-x');
+      if (fx) { forgetSession(fx.dataset.forget); closeLayer(); return (fx.dataset.forget === user.documento) ? logout() : go('home'); }
+      setActive(c.dataset.doc); closeLayer(); go('home');
+    });
+  };
+}
+
+/* ---------- Mi foto (Fase 9.2) ----------
+   Cualquier usuario cambia la SUYA — incluido el DESARROLLADOR. El candado
+   del Módulo 9 (nadie edita al DEV) sigue firme donde importa: en
+   priv.cfgUsuarioFoto, que es "el DEV le pone foto a OTRO". Este carril
+   (priv.miFoto) siempre actúa sobre quien llama, así que no hay nada que
+   proteger — y sin él nadie podría ponerse foto, porque hoy el único usuario
+   de la hoja ES el DEV.
+   Misma sábana, mismos límites y mismo Drive que Configuración → Usuarios. */
+function miFotoMenu(user) {
+  const foto = fotoUsuarioPriv(user);
+  openSheet(`<div class="grip"></div><h2 class="h2" style="margin-bottom:4px;">Mi foto de perfil</h2>
+    <p class="muted" style="margin-bottom:14px;">Elige una imagen (JPG, PNG o WEBP, máx. 6 MB).</p>
+    <div class="stack center">
+      <div class="foto-preview" id="mf-prev">${foto ? `<img src="${esc(foto)}" alt="" />` : `<div class="mf-ini">${esc(iniciales(user.nombre))}</div>`}</div>
+      <input type="file" id="mf-file" accept="image/png,image/jpeg,image/webp" style="display:none;" />
+      <button class="btn btn-ghost btn-block" id="mf-pick">Elegir imagen</button>
+      <button class="btn btn-primary btn-block" id="mf-save" disabled>Guardar foto</button>
+      ${foto ? `<button class="btn btn-quiet btn-block" id="mf-zoom">Ver en grande</button>
+                <button class="btn btn-quiet btn-block cfg-danger" id="mf-del">Quitar foto</button>` : ''}
+    </div>`);
+  let dataUrl = '';
+  $('#mf-pick').onclick = () => $('#mf-file').click();
+  $('#mf-file').onchange = e => {
+    const f = e.target.files[0]; if (!f) return;
+    if (f.size > 6 * 1024 * 1024) return toast('La imagen supera 6 MB', 'err');
+    const rd = new FileReader();
+    rd.onload = () => { dataUrl = rd.result; $('#mf-prev').innerHTML = `<img src="${dataUrl}" alt="" />`; $('#mf-save').disabled = false; };
+    rd.readAsDataURL(f);
+  };
+  $('#mf-save').onclick = async () => {
+    if (!dataUrl) return;
+    const btn = $('#mf-save'); saving(btn, true);
+    try {
+      const r = await api('priv.miFoto', {}, 'POST', { caller: user.documento, dataUrl });
+      saving(btn, false);
+      if (!r.ok) return toast(r.msg || 'No se pudo subir', 'err');
+      miFotoAplicar(user, r.foto); closeLayer(); toast('Foto actualizada', 'ok');
+    } catch (e) { saving(btn, false); fallaRed(e); }
+  };
+  const z = $('#mf-zoom'); if (z) z.onclick = () => { closeLayer(); zoomImagen(foto); };
+  const d = $('#mf-del');
+  if (d) d.onclick = async () => {
+    if (!await confirmar('¿Quitar tu foto?', crow('El archivo', 'se borra de Drive'))) return;
+    try {
+      const r = await api('priv.miFotoQuitar', {}, 'POST', { caller: user.documento });
+      if (!r.ok) return toast(r.msg || 'No se pudo', 'err');
+      miFotoAplicar(user, ''); closeLayer(); toast('Foto quitada', 'ok');
+    } catch (e) { fallaRed(e); }
+  };
+}
+/* Deja la foto en el usuario, en la sesión guardada del dispositivo y repinta */
+function miFotoAplicar(user, foto) {
+  user.foto = foto || '';
+  const s = getSessions().find(x => x.documento === user.documento);
+  if (s) { s.foto = user.foto; saveSession(s); }
+  pintarAvatarPriv(user);
+}
+
+/* ---------- Hojas inferiores (modales) ---------- */
+function openSheet(html, cls) {
+  closeLayer();
+  const bd = h('<div class="backdrop"></div>');
+  const sh = h(`<div class="sheet ${cls || ''}">${html}</div>`);
+  bd.onclick = closeLayer;
+  layer.append(bd, sh);
+  sh.querySelectorAll('[data-close]').forEach(b => b.onclick = closeLayer);
+  document.body.classList.add('sheet-open');
+}
+function closeLayer() { layer.innerHTML = ''; document.body.classList.remove('sheet-open'); }
+function hideSplash() { const s = $('#splash'); if (s && !s.classList.contains('hide')) { s.classList.add('hide'); setTimeout(() => s.remove(), 500); } }
+
+/* ============================================================
+   MÓDULO 5 · EVENTOS + AGENDA (Google Calendar)
+   ============================================================ */
+let M5_ME = '';
+function m5Auth() { return { caller: M5_ME }; }
+
+/* Fecha dd/MM/yyyy → Date (local); Date → dd/MM/yyyy; y helpers de <input type=date> */
+function parseFechaES(s) {
+  const m = String(s || '').match(/(\d{1,2})\/(\d{1,2})\/(\d{2,4})/);
+  if (!m) return null;
+  let y = +m[3]; if (m[3].length === 2) y += 2000;
+  return new Date(y, +m[2] - 1, +m[1]);
+}
+const pad2 = n => ('0' + n).slice(-2);
+function dateToDDMM(d) { return d ? `${pad2(d.getDate())}/${pad2(d.getMonth() + 1)}/${d.getFullYear()}` : ''; }
+function dateToInput(d) { return d ? `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}` : ''; }
+function inputToDDMM(v) { const m = String(v || '').match(/(\d{4})-(\d{2})-(\d{2})/); return m ? `${m[3]}/${m[2]}/${m[1]}` : ''; }
+function ddmmToInput(s) { const d = parseFechaES(s); return d ? dateToInput(d) : ''; }
+
+/* Fecha larga corta: "12 de julio de 2026" (reusa BD_MESES) */
+function fmtFechaCorta(s) {
+  const d = parseFechaES(s); if (!d) return s || '';
+  return `${d.getDate()} de ${BD_MESES[d.getMonth()]} de ${d.getFullYear()}`;
+}
+/* "Creada 13 de julio de 2026 – 4:35 PM" desde dd/MM/yyyy HH:mm:ss */
+function fmtCreada(s) {
+  const m = String(s || '').match(/(\d{2})\/(\d{2})\/(\d{4})(?:\s+(\d{2}):(\d{2}))?/);
+  if (!m) return '';
+  let out = `${+m[1]} de ${BD_MESES[+m[2] - 1]} de ${m[3]}`;
+  if (m[4] != null) {
+    let hh = +m[4]; const ap = hh >= 12 ? 'PM' : 'AM'; hh = hh % 12 || 12;
+    out += ` – ${hh}:${m[5]} ${ap}`;
+  }
+  return out;
+}
+/* AJUSTE 17/07/2026 · LAS HORAS SE VEN EN 12 HORAS.
+   Ojo: solo cambia lo que se MUESTRA. La hoja, el Calendario y los
+   <input type="time"> siguen hablando 24h ('18:27'), que es como se ordenan y
+   se comparan (evHora_ en el CORE guarda 'HH:mm'). Aquí se traduce al pintar.
+   Regla del usuario: 12:xx lleva "M" de mediodía, como se dice en Colombia
+   (12:50 M). La medianoche y lo que sigue va en AM (00:30 → 12:30 AM). */
+function hora12(v) {
+  const m = /^\s*(\d{1,2}):(\d{2})/.exec(String(v == null ? '' : v));
+  if (!m) return String(v == null ? '' : v).trim();     // texto raro: se devuelve tal cual
+  const h = Number(m[1]);
+  if (h > 23) return String(v).trim();
+  const suf = h === 12 ? 'M' : (h < 12 ? 'AM' : 'PM');  // 12:00–12:59 = mediodía
+  return `${(h % 12) || 12}:${m[2]} ${suf}`;
+}
+function rangoHoras(a, b) {
+  const x = a ? hora12(a) : '', y = b ? hora12(b) : '';
+  if (x && y) return `${x} – ${y}`;
+  return x || y || '';
+}
+
+/* Combobox de CONTACTO con búsqueda en el servidor (PRINCIPAL).
+   opts.free=true permite escribir libre (Agenda). onPick(nombre, tel10). */
+function bindContactCombo(idName, idTel, opts) {
+  opts = opts || {};
+  const input = $('#' + idName), list = $('#' + idName + '-list'); if (!input) return;
+  let t = null;
+  const paint = (items) => {
+    list.innerHTML = items.length
+      ? items.map(o => `<button type="button" class="combo-opt" data-nom="${esc(o.nombre)}" data-tel="${esc(o.contacto || '')}">${esc(o.nombre)} <span class="combo-sub">CC ${esc(o.documento)}</span></button>`).join('')
+      : `<div class="combo-empty">${opts.free ? 'Sin coincidencias — puedes escribirlo libre' : 'Sin resultados'}</div>`;
+    list.querySelectorAll('.combo-opt').forEach(b => b.onclick = () => {
+      input.value = b.dataset.nom; list.hidden = true;
+      if (idTel && $('#' + idTel)) $('#' + idTel).value = b.dataset.tel || '';
+    });
+    list.hidden = false;
+  };
+  input.oninput = () => {
+    clearTimeout(t); const q = input.value.trim();
+    if (q.length < 2) { list.hidden = true; return; }
+    t = setTimeout(async () => {
+      try { const r = await api('priv.contactoBuscar', { q, ...m5Auth() }); paint((r && r.items) || []); }
+      catch (e) { list.hidden = true; }
+    }, 240);
+  };
+  input.onfocus = () => { if (input.value.trim().length >= 2) input.oninput(); };
+}
+
+/* ============================================================
+   EVENTOS  (hoja EVENTOS · calendario CAL_EVENTOS)
+   ============================================================ */
+let EV_ALL = [], EV_FILT = [], EV_SHOWN = 0; const EV_BATCH = 60;
+
+function evEstadoClass(e) {
+  const x = String(e || '').toUpperCase();
+  if (x === 'CORRIENDO') return 'ev-corr';
+  if (x === 'TERMINADO') return 'ev-term';
+  return 'ev-prog';
+}
+function evEstadoLabel(e) { return String(e || 'PROGRAMADO').toUpperCase(); }
+
+function evCardHtml(c) {
+  const horas = rangoHoras(c.inicia, c.termina);
+  return `<article class="bd-card ev-card ${evEstadoClass(c.estado)}" data-id="${esc(c.id)}">
+    <div class="bd-top">
+      <div class="bd-id">
+        <b class="bd-nombre"><span class="ev-id">#${esc(c.id)}</span> ${esc(c.evento || 'Sin nombre')}</b>
+        <span class="bd-doc">${I.cal} ${esc(fmtFechaCorta(c.fecha) || '—')}</span>
+      </div>
+      <div class="ev-topright">
+        <span class="ev-badge ${evEstadoClass(c.estado)}">${esc(evEstadoLabel(c.estado))}</span>
+        <span class="ev-asis" title="Asistentes registrados">${I.users}<b>${Number(c.asistentes || 0).toLocaleString('es-CO')}</b></span>
+      </div>
+    </div>
+    <div class="bd-meta ev-meta">
+      <span><span class="bd-k">Lugar</span> ${esc(c.lugar || '—')}</span>
+      <span><span class="bd-k">Líder/Contacto</span> ${esc(c.contacto || '—')}</span>
+      ${c.telefono ? `<span><span class="bd-k">Teléfono</span> ${esc(String(c.telefono).replace(/^57/, ''))}</span>` : ''}
+      ${horas ? `<span><span class="bd-k">Horario</span> ${esc(horas)}</span>` : ''}
+    </div>
+    ${c.creada ? `<div class="bd-fecha">Creada ${esc(fmtCreada(c.creada))}</div>` : ''}
+    <div class="bd-acts ev-acts">
+      <button class="bd-btn" data-a="estado">Estado</button>
+      <button class="bd-btn" data-a="detalles">Detalles</button>
+      <button class="bd-btn" data-a="editar">Editar</button>
+      <button class="bd-btn bd-btn-danger" data-a="eliminar">Eliminar</button>
+    </div>
+  </article>`;
+}
+
+async function viewEventos(user) {
+  M5_ME = user.documento; appWide(true);
+  app.innerHTML = `${backbar('Eventos')}
+    <div class="pad">
+      <div class="bd-toolbar">
+        <div class="bd-search"><input class="input" id="ev-q" placeholder="Buscar por nombre, lugar, contacto o #id…" autocomplete="off" /></div>
+        <button class="btn btn-primary bd-add" id="ev-add">+ Agregar</button>
+      </div>
+      <div class="bd-chips" id="ev-chips">
+        ${['Todos', 'Programado', 'Corriendo', 'Terminado'].map((t, i) => `<button class="bd-chip ${i === 0 ? 'active' : ''}" data-f="${esc(t)}">${esc(t)}</button>`).join('')}
+      </div>
+      <div class="bd-count" id="ev-count"></div>
+      <div id="ev-body">${loadingBox('Cargando eventos…')}</div>
+      <div class="center" id="ev-more" style="margin-top:12px;"></div>
+    </div>`;
+  app.hidden = false; hideSplash();
+  $('#backbtn').onclick = () => go('home');
+  $('#ev-add').onclick = () => evAgregar();
+  try {
+    const r = await api('priv.eventos', m5Auth());
+    if (!r.ok) { $('#ev-body').innerHTML = `<p class="muted center">No se pudo cargar.</p>`; return; }
+    EV_ALL = r.items || [];
+    evApplyFilter();
+  } catch (e) { $('#ev-body').innerHTML = `${fallaHtml(e)}`; }
+  const q = $('#ev-q'); let t;
+  q.oninput = () => { clearTimeout(t); t = setTimeout(evApplyFilter, 160); };
+  $$('#ev-chips .bd-chip').forEach(ch => ch.onclick = () => { $$('#ev-chips .bd-chip').forEach(x => x.classList.remove('active')); ch.classList.add('active'); evApplyFilter(); });
+
+  vivoBind('eventos', M5_ME, vivoEventos);   // EN VIVO
+}
+
+/* ---- EN VIVO · Eventos ---- */
+async function vivoEventos(rev) {
+  const r = await api('priv.eventos', m5Auth(), 'GET', null, SILENCIO);
+  if (!r.ok || !vivoCambio(JSON.stringify(r.items))) return;
+  EV_ALL = r.items || [];
+  evApplyFilter(); vivoCerrarHoja(rev);
+}
+
+function evActiveFilter() { const a = $('#ev-chips .bd-chip.active'); return a ? a.dataset.f : 'Todos'; }
+function evApplyFilter() {
+  const q = (($('#ev-q') || {}).value || '').trim().toLowerCase();
+  const f = evActiveFilter().toUpperCase();
+  EV_FILT = EV_ALL.filter(c => {
+    if (f !== 'TODOS' && String(c.estado).toUpperCase() !== f) return false;
+    if (!q) return true;
+    const hay = ('#' + c.id + ' ' + (c.evento || '') + ' ' + (c.lugar || '') + ' ' + (c.contacto || '') + ' ' + (c.telefono || '')).toLowerCase();
+    return hay.includes(q);
+  });
+  EV_SHOWN = 0;
+  const cEl = $('#ev-count'); if (cEl) cEl.textContent = `${EV_FILT.length.toLocaleString('es-CO')} evento(s)`;
+  const body = $('#ev-body'); if (body) body.innerHTML = EV_FILT.length ? `<div class="bd-grid" id="ev-grid"></div>` : `<p class="muted center" style="margin-top:20px;">Sin eventos para este filtro.</p>`;
+  evRenderMore();
+}
+function evRenderMore() {
+  const grid = $('#ev-grid'); if (!grid) { const m = $('#ev-more'); if (m) m.innerHTML = ''; return; }
+  const next = EV_FILT.slice(EV_SHOWN, EV_SHOWN + EV_BATCH);
+  grid.insertAdjacentHTML('beforeend', next.map(evCardHtml).join(''));
+  EV_SHOWN += next.length;
+  $$('#ev-grid .ev-card').forEach(card => {
+    if (card._wired) return; card._wired = true;
+    card.querySelectorAll('.bd-btn').forEach(b => b.onclick = () => evAccion(b.dataset.a, card.dataset.id));
+  });
+  const more = $('#ev-more');
+  if (EV_SHOWN < EV_FILT.length) { more.innerHTML = `<button class="btn btn-ghost" id="ev-more-btn">Ver más (${(EV_FILT.length - EV_SHOWN).toLocaleString('es-CO')} restantes)</button>`; $('#ev-more-btn').onclick = evRenderMore; }
+  else more.innerHTML = '';
+}
+function evFind(id) { return EV_ALL.find(x => String(x.id) === String(id)); }
+function evUpsert(card, prepend) {
+  const i = EV_ALL.findIndex(x => String(x.id) === String(card.id));
+  if (i >= 0) EV_ALL[i] = card; else if (prepend) EV_ALL.unshift(card); else EV_ALL.push(card);
+  evApplyFilter();
+}
+function evAccion(a, id) {
+  if (a === 'estado') return evEstadoPicker(id);
+  if (a === 'detalles') return evDetalles(id);
+  if (a === 'editar') return evEditar(id);
+  if (a === 'eliminar') return evEliminar(id);
+}
+
+/* Texto para copiar al portapapeles */
+function evTextoCopia(c) {
+  const L = [];
+  L.push(`📅 EVENTO #${c.id} — ${c.evento}`);
+  L.push(`Estado: ${evEstadoLabel(c.estado)}`);
+  if (c.fecha) L.push(`Fecha: ${fmtFechaCorta(c.fecha)}`);
+  const h = rangoHoras(c.inicia, c.termina); if (h) L.push(`Horario: ${h}`);
+  if (c.lugar) L.push(`Lugar: ${c.lugar}`);
+  if (c.contacto) L.push(`Líder/Contacto: ${c.contacto}`);
+  if (c.telefono) L.push(`Teléfono: ${String(c.telefono).replace(/^57/, '')}`);
+  if (c.mensaje) L.push(`\nMensaje a la persona:\n${c.mensaje}`);
+  if (c.bitacora) L.push(`\nBitácora del grupo:\n${c.bitacora}`);
+  return L.join('\n');
+}
+
+async function evDetalles(id) {
+  openSheet(`<div class="grip"></div><h2 class="h2">Evento</h2>${loadingBox('Cargando…')}`);
+  let c;
+  try { const r = await api('priv.eventoVer', { id, ...m5Auth() }); if (!r.ok) { closeLayer(); return toast(r.msg || 'No se pudo cargar', 'err'); } c = r.evento; }
+  catch (e) { closeLayer(); return fallaRed(e); }
+  const rows = [
+    ['ID', '#' + c.id],
+    ['Estado', evEstadoLabel(c.estado)],
+    ['Fecha', fmtFechaCorta(c.fecha) || '—'],
+    ['Horario', rangoHoras(c.inicia, c.termina) || '—'],
+    ['Lugar', c.lugar || '—'],
+    ['Líder/Contacto', c.contacto || '—'],
+    ['Teléfono', c.telefono ? String(c.telefono).replace(/^57/, '') : '—'],
+    ['Mensaje persona', c.mensaje || '—'],
+    ['Bitácora grupo', c.bitacora || '—'],
+    ['En calendario', c.idCalendar ? 'Sí' : 'No'],
+    ['Creada', c.creada ? fmtCreada(c.creada) : '—']
+  ].map(([k, v]) => `<div class="det-row"><span>${esc(k)}</span><b>${esc(v)}</b></div>`).join('');
+  openSheet(`<div class="grip"></div>
+    <div class="det-head"><h2 class="h2">#${esc(c.id)} · ${esc(c.evento)}</h2><span class="ev-badge ${evEstadoClass(c.estado)}">${esc(evEstadoLabel(c.estado))}</span></div>
+    <div class="det-list">${rows}</div>
+    <section class="asis-sec" id="ev-asis-sec">
+      <div class="asis-head">
+        <h3 class="asis-tit">${I.users} Asistentes <span class="asis-n" id="ev-asis-n">—</span></h3>
+        <button class="btn btn-ghost asis-xls" id="ev-asis-xls" hidden>${I.download} Excel</button>
+      </div>
+      <div id="ev-asis-body">${loadingBox('Cargando asistentes…')}</div>
+    </section>
+    <div class="stack" style="margin-top:12px;">
+      <button class="btn btn-ghost btn-block" id="ev-copy">${I.copy} Copiar en portapapeles</button>
+      <button class="btn btn-primary btn-block" id="ev-edit">Editar</button>
+    </div>`, 'sheet-xl');
+  $('#ev-copy').onclick = async () => { try { await navigator.clipboard.writeText(evTextoCopia(c)); toast('Evento copiado', 'ok'); } catch { toast('No se pudo copiar', 'err'); } };
+  $('#ev-edit').onclick = () => { closeLayer(); evEditar(id); };
+  evAsistentes(id);
+}
+
+/* ---- Asistentes del evento (dentro del modal Detalles) ---- */
+let EV_AS = [], EV_AS_SHOWN = 0;
+const EV_AS_BATCH = 50;
+
+async function evAsistentes(id) {
+  const body = $('#ev-asis-body'); if (!body) return;
+  let r;
+  try { r = await api('priv.eventoAsistentes', { id, ...m5Auth() }); }
+  catch (e) { body.innerHTML = `<p class="muted center small">No se pudo cargar la asistencia.</p>`; return; }
+  if (!$('#ev-asis-body')) return;            // el modal se cerró mientras cargaba
+  if (!r.ok) { body.innerHTML = `<p class="muted center small">${esc(r.msg || 'No se pudo cargar la asistencia.')}</p>`; return; }
+  EV_AS = r.items || []; EV_AS_SHOWN = 0;
+  const n = $('#ev-asis-n'); if (n) n.textContent = EV_AS.length.toLocaleString('es-CO');
+  if (!EV_AS.length) { body.innerHTML = `<p class="muted center small" style="padding:14px 0;">Sin asistentes registrados aún.</p>`; return; }
+  body.innerHTML = `<div class="asis-wrap"><table class="asis-t">
+      <thead><tr><th class="asis-i">#</th><th>Nombre</th><th>Documento</th><th>Teléfono</th><th>Fecha y hora</th></tr></thead>
+      <tbody id="ev-asis-tb"></tbody></table></div>
+    <div class="center" id="ev-asis-more" style="margin-top:10px;"></div>`;
+  evAsisMore();
+  const xls = $('#ev-asis-xls');
+  if (xls) { xls.hidden = false; xls.onclick = () => evAsisExcel(id); }
+}
+
+function evAsisMore() {
+  const tb = $('#ev-asis-tb'); if (!tb) return;
+  const next = EV_AS.slice(EV_AS_SHOWN, EV_AS_SHOWN + EV_AS_BATCH);
+  tb.insertAdjacentHTML('beforeend', next.map((x, i) => `<tr>
+      <td class="asis-i" data-l="#">${(EV_AS_SHOWN + i + 1).toLocaleString('es-CO')}</td>
+      <td data-l="Nombre"><b>${esc(x.nombre || '—')}</b></td>
+      <td data-l="Documento">${esc(x.documento || '—')}</td>
+      <td data-l="Teléfono">${esc(x.contacto ? String(x.contacto).replace(/^57/, '') : '—')}</td>
+      <td data-l="Fecha y hora">${esc(x.fecha || '—')}</td>
+    </tr>`).join(''));
+  EV_AS_SHOWN += next.length;
+  const more = $('#ev-asis-more'); if (!more) return;
+  if (EV_AS_SHOWN < EV_AS.length) {
+    more.innerHTML = `<button class="btn btn-ghost" id="ev-asis-more-btn">Ver más (${(EV_AS.length - EV_AS_SHOWN).toLocaleString('es-CO')} restantes)</button>`;
+    $('#ev-asis-more-btn').onclick = evAsisMore;
+  } else more.innerHTML = '';
+}
+
+async function evAsisExcel(id) {
+  const btn = $('#ev-asis-xls'); saving(btn, true);
+  try {
+    const r = await api('priv.eventoAsistentesExcel', {}, 'POST', { id, caller: M5_ME });
+    saving(btn, false);
+    if (!r.ok) return toast(r.msg || 'No se pudo generar', 'err');
+    downloadB64(r.base64, r.mime, r.filename); toast('Archivo generado', 'ok');
+  } catch (e) { saving(btn, false); toast('Error al generar el archivo', 'err'); }
+}
+
+function evEstadoPicker(id) {
+  const c = evFind(id); if (!c) return toast('Evento no encontrado', 'err');
+  const opts = [['PROGRAMADO', 'ev-prog'], ['CORRIENDO', 'ev-corr'], ['TERMINADO', 'ev-term']];
+  openSheet(`<div class="grip"></div><h2 class="h2" style="margin-bottom:4px;">Cambiar estado</h2>
+    <p class="muted small">#${esc(c.id)} · ${esc(c.evento)}</p>
+    <div class="estado-opts">${opts.map(([e, cl]) => `<button class="estado-opt ${cl} ${String(c.estado).toUpperCase() === e ? 'sel' : ''}" data-e="${e}">${e}</button>`).join('')}</div>`);
+  layer.querySelectorAll('.estado-opt').forEach(b => b.onclick = async () => {
+    if (b.classList.contains('sel')) return closeLayer();
+    layer.querySelectorAll('.estado-opt').forEach(x => x.disabled = true);
+    try { const r = await api('priv.eventoEstado', {}, 'POST', { id, estado: b.dataset.e, ...m5Auth() }); if (!r.ok) { toast(r.msg || 'No se pudo cambiar', 'err'); layer.querySelectorAll('.estado-opt').forEach(x => x.disabled = false); return; } closeLayer(); toast('Estado actualizado', 'ok'); evUpsert(r.card); }
+    catch (e) { fallaRed(e); layer.querySelectorAll('.estado-opt').forEach(x => x.disabled = false); }
+  });
+}
+
+/* Modal Registro / Edición de Evento (contacto = UNO de PRINCIPAL) */
+/* AJUSTES 16/07: la fecha usa la rueda iOS SIN tope (hay 173 eventos
+   históricos que se deben poder editar) y con rueda de año. */
+function evFormHtml(titulo, c) {
+  c = c || {};
+  return `<div class="grip"></div><h2 class="h2" style="margin-bottom:10px;">${esc(titulo)}</h2>
+    <div class="stack">
+      ${field('ID del evento', inputEl('ev-fid', 'disabled'))}
+      ${field('Nombre del evento', inputEl('ev-fnombre', 'placeholder="Ej. Reunión de líderes N° 5"'))}
+      ${campoFecha('ev-ffecha', 'Fecha', { anios: true })}
+      ${field('Lugar (zona)', comboboxHtml('ev-flugar', 'Escribe para buscar…'))}
+      ${field('Líder / Contacto (de la base)', comboboxHtml('ev-fcont', 'Busca por nombre o documento…'))}
+      ${field('Teléfono', inputEl('ev-ftel', 'inputmode="numeric" maxlength="10" placeholder="Se completa al elegir contacto"'))}
+      <div class="ev-hrow">
+        ${field('Hora inicio', `<input class="input" id="ev-fini" type="time" />`)}
+        ${field('Hora fin', `<input class="input" id="ev-ffin" type="time" />`)}
+      </div>
+      ${field('Mensaje a la persona', `<textarea class="input ta" id="ev-fmsg" rows="3" placeholder="Opcional"></textarea>`)}
+      ${field('Bitácora del grupo', `<textarea class="input ta" id="ev-fbit" rows="3" placeholder="Opcional"></textarea>`)}
+      <button class="btn btn-primary btn-block" id="ev-save">${c.id != null ? 'Guardar cambios' : 'Crear evento'}</button>
+    </div>`;
+}
+function evFillForm(c) {
+  $('#ev-fid').value = c.id != null ? ('#' + c.id) : '(automático)';
+  $('#ev-fnombre').value = c.evento || '';
+  $('#ev-ffecha').value = ddmmToInput(c.fecha || '');
+  bindCampoFecha('ev-ffecha');
+  $('#ev-fcont').value = c.contacto || '';
+  $('#ev-ftel').value = c.telefono ? String(c.telefono).replace(/^57/, '') : '';
+  $('#ev-fini').value = c.inicia || '';
+  $('#ev-ffin').value = c.termina || '';
+  $('#ev-fmsg').value = c.mensaje || '';
+  $('#ev-fbit').value = c.bitacora || '';
+  onlyDigits($('#ev-ftel'));
+  getResidencias().then(l => { bindCombobox('ev-flugar', l); $('#ev-flugar').value = c.lugar || ''; });
+  bindContactCombo('ev-fcont', 'ev-ftel', { free: false });
+}
+function evReadForm() {
+  return {
+    evento: val('ev-fnombre'),
+    fecha: inputToDDMM(($('#ev-ffecha') || {}).value),
+    lugar: val('ev-flugar'),
+    contacto: val('ev-fcont'),
+    telefono: onlyDig(val('ev-ftel')),
+    inicia: ($('#ev-fini') || {}).value || '',
+    termina: ($('#ev-ffin') || {}).value || '',
+    mensaje: (($('#ev-fmsg') || {}).value || '').trim(),
+    bitacora: (($('#ev-fbit') || {}).value || '').trim()
+  };
+}
+function evValidForm(b) {
+  if (!b.evento) { toast('Escribe el nombre del evento', 'err'); return false; }
+  if (!b.fecha) { toast('Selecciona la fecha', 'err'); return false; }
+  if (b.telefono && b.telefono.length !== 10) { toast('Teléfono: 10 dígitos', 'err'); return false; }
+  if (b.inicia && b.termina && b.termina <= b.inicia) { toast('La hora fin debe ser mayor que la de inicio', 'err'); return false; }
+  return true;
+}
+
+async function evAgregar() {
+  openSheet(`<div class="grip"></div><h2 class="h2">Registro de Evento</h2>${loadingBox('Preparando…')}`);
+  try { await api('priv.eventoMeta', m5Auth()); } catch (e) { closeLayer(); return fallaRed(e); }
+  openSheet(evFormHtml('Registro de Evento', {}));
+  evFillForm({});
+  $('#ev-save').onclick = async () => {
+    const b = evReadForm(); if (!evValidForm(b)) return;
+    const btn = $('#ev-save'); saving(btn, true);
+    try { const r = await api('priv.eventoGuardar', {}, 'POST', { ...b, ...m5Auth() }); saving(btn, false); if (!r.ok) return toast(r.msg || 'No se pudo crear', 'err'); closeLayer(); toast('Evento creado y sincronizado con el calendario', 'ok'); if (($('#ev-q') || {}).value) $('#ev-q').value = ''; $$('#ev-chips .bd-chip').forEach((x, i) => x.classList.toggle('active', i === 0)); evUpsert(r.card, true); }
+    catch (e) { saving(btn, false); fallaRed(e); }
+  };
+}
+async function evEditar(id) {
+  openSheet(`<div class="grip"></div><h2 class="h2">Editar evento</h2>${loadingBox('Cargando…')}`);
+  let c;
+  try { const r = await api('priv.eventoVer', { id, ...m5Auth() }); if (!r.ok) { closeLayer(); return toast(r.msg, 'err'); } c = r.evento; }
+  catch (e) { closeLayer(); return fallaRed(e); }
+  openSheet(evFormHtml('Editar evento', c));
+  evFillForm(c);
+  $('#ev-save').onclick = async () => {
+    const b = evReadForm(); if (!evValidForm(b)) return;
+    const btn = $('#ev-save'); saving(btn, true);
+    try { const r = await api('priv.eventoEditar', {}, 'POST', { id, ...b, ...m5Auth() }); saving(btn, false); if (!r.ok) return toast(r.msg || 'No se pudo guardar', 'err'); closeLayer(); toast('Evento actualizado', 'ok'); evUpsert(r.card); }
+    catch (e) { saving(btn, false); fallaRed(e); }
+  };
+}
+async function evEliminar(id) {
+  const c = evFind(id); if (!c) return toast('Evento no encontrado', 'err');
+  const ok = await confirmar('¿Eliminar este evento?', crow('Evento', '#' + c.id + ' ' + c.evento) + crow('Fecha', fmtFechaCorta(c.fecha)) + `<p class="muted small" style="margin-top:8px;">También se elimina del calendario de Google. Esta acción no se puede deshacer.</p>`);
+  if (!ok) return;
+  try { const r = await api('priv.eventoEliminar', {}, 'POST', { id, ...m5Auth() }); if (!r.ok) return toast(r.msg || 'No se pudo eliminar', 'err'); EV_ALL = EV_ALL.filter(x => String(x.id) !== String(id)); evApplyFilter(); toast('Evento eliminado', 'ok'); }
+  catch (e) { fallaRed(e); }
+}
+
+/* ============================================================
+   AGENDA  (hoja CALENDARIO · calendario CAL_AGENDA)
+   Calendario profesional: Año / Mes / Día · buscar · Agregar Reunión
+   ============================================================ */
+let AG_ALL = [], AG_VIEW = 'mes', AG_CUR = new Date(), AG_Q = '';
+const AG_DOW = ['Lun', 'Mar', 'Mié', 'Jue', 'Vie', 'Sáb', 'Dom'];
+
+/* ---- AJUSTES 16/07 · pastillas de estado + selección múltiple ----
+   AG_EST  = estados marcados. Si hay alguno marcado, SOLO se muestran esos
+             en la vista que se tenga (día, mes o año): el filtro vive en
+             agReunionesDia(), que es por donde pasan las tres vistas.
+   AG_SEL  = ids seleccionados para marcar un estado en bloque.
+   REALIZADA siempre se marca A MANO: nunca se pone sola al pasar la fecha. */
+const AG_ESTADOS = ['PROGRAMADA', 'A REPROGRAMAR', 'REALIZADA'];
+const AG_EST = new Set();
+let AG_SEL = new Set(), AG_SELMODE = false;
+
+/* AGENDA ESTRICTA 31/07/2026 · los manda el backend en priv.agenda:
+   AG_ESTRICTA = interruptor AGENDA_ESTRICTA (Config → Avanzado).
+   AG_ESDEV    = el que está adentro es el DESARROLLADOR (exento). */
+let AG_ESTRICTA = true, AG_ESDEV = false;
+
+/* ============================================================
+   AJUSTE 20/07/2026 · NOTIFICACIONES DE AGENDA (al candidato / a la persona)
+   AG_NOTIF = { candidato:{nombre,pnombre,wa}, manejo, plantillas:{...} }
+   Se carga una vez al abrir Agenda (priv.agendaMeta). Los mensajes se arman
+   AQUÍ (el cliente ya tiene las reuniones y las horas) y se mandan directo
+   (WhatsApp del cliente) o por bot (endpoint que resuelve el destino).
+   ============================================================ */
+let AG_NOTIF = null;
+
+/* Íconos propios (no están en el set I): sol saliendo, sol, luna, aviso. */
+const AG_SVG = {
+  sunrise: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 18a5 5 0 0 0-10 0"/><line x1="12" y1="2" x2="12" y2="9"/><line x1="4.2" y1="10.2" x2="5.6" y2="11.6"/><line x1="1" y1="18" x2="3" y2="18"/><line x1="21" y1="18" x2="23" y2="18"/><line x1="18.4" y1="11.6" x2="19.8" y2="10.2"/><line x1="23" y1="22" x2="1" y2="22"/><polyline points="8 6 12 2 16 6"/></svg>',
+  sun: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.2" y1="4.2" x2="5.6" y2="5.6"/><line x1="18.4" y1="18.4" x2="19.8" y2="19.8"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.2" y1="19.8" x2="5.6" y2="18.4"/><line x1="18.4" y1="5.6" x2="19.8" y2="4.2"/></svg>',
+  moon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3 7 7 0 0 0 21 12.8z"/></svg>',
+  alert: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>'
+};
+
+const AG_FRANJAS = {
+  manana: { svg: AG_SVG.sunrise, label: 'Mañana', tiempo: 'buenos días', jornada: 'la mañana' },
+  tarde: { svg: AG_SVG.sun, label: 'Tarde', tiempo: 'buenas tardes', jornada: 'la tarde' },
+  noche: { svg: AG_SVG.moon, label: 'Noche', tiempo: 'buenas noches', jornada: 'la noche' }
+};
+
+async function agNotifCargar() {
+  try { AG_NOTIF = await api('priv.agendaMeta', m5Auth()); }
+  catch (e) { AG_NOTIF = null; }
+}
+
+/* Sustituye {var} y borra las líneas que quedan vacías porque su variable
+   estaba vacía (p. ej. {detalles} sin texto). Los saltos internos de una
+   variable multilínea ({lista_reuniones}, {bloque_aviso}) se conservan. */
+function agTplRender(body, vars) {
+  /* Respeta los saltos de línea de la plantilla. Solo se descarta una línea
+     cuando TIENE variables y TODAS quedaron vacías (así desaparece la línea de
+     {detalles} o {mensaje} cuando no hay dato). Las líneas en blanco puestas a
+     propósito (sin variables) se conservan. */
+  return String(body || '').split('\n').map(line => {
+    const toks = line.match(/\{(\w+)\}/g);
+    const rendered = line.replace(/\{(\w+)\}/g, (m, k) => (vars[k] != null ? vars[k] : ''));
+    if (toks && !toks.some(t => { const v = vars[t.slice(1, -1)]; return v != null && String(v).trim() !== ''; })) {
+      return null;
+    }
+    return rendered;
+  }).filter(l => l !== null).join('\n');
+}
+
+/* Minutos desde medianoche de una hora 'HH:mm' (24h). null si no hay. */
+function agMin(h) { const m = /^(\d{1,2}):(\d{2})/.exec(String(h || '')); return m ? (+m[1] * 60 + +m[2]) : null; }
+function agFranjaDe(inicia) {
+  const t = agMin(inicia); if (t == null) return null;
+  if (t < 13 * 60) return 'manana';
+  if (t < 18 * 60) return 'tarde';
+  return 'noche';
+}
+
+/* "Detalles: <texto>" o '' si el campo está vacío (rótulo embebido). */
+function agDetallesLinea(det) { const d = String(det || '').trim(); return d ? ('Detalles: ' + d) : ''; }
+
+/* Bloque compuesto de una reunión para el mensaje Avisar. */
+function agBloqueAviso(c) {
+  const L = [];
+  if (c.titulo) L.push(c.titulo);
+  if (c.fecha) L.push('🗓️ ' + fmtFechaCorta(c.fecha) + (c.inicia ? ' · ' + rangoHoras(c.inicia, c.termina) : ''));
+  if (c.lugar) L.push('📍 ' + c.lugar);
+  const det = agDetallesLinea(c.detalles); if (det) L.push(det);
+  return L.join('\n');
+}
+
+/* Reuniones PROGRAMADAS de HOY en la franja, enumeradas. {texto, count}. */
+function agListaReuniones(franja) {
+  const hoy = dateToDDMM(new Date());
+  const rs = AG_ALL
+    .filter(r => r.fecha === hoy && agEstadoNormJs(r.estado) === 'PROGRAMADA' && agFranjaDe(r.inicia) === franja)
+    .sort((a, b) => (a.inicia || '99').localeCompare(b.inicia || '99'));
+  const texto = rs.map((r, i) => {
+    const hora = rangoHoras(r.inicia, r.termina) || 'sin hora';
+    return `${i + 1}. ${hora} · ${r.titulo || 'Reunión'}${r.lugar ? ' — ' + r.lugar : ''}`;
+  }).join('\n');
+  return { texto, count: rs.length };
+}
+
+function agCandidatoOk(requiereWa) {
+  if (!AG_NOTIF || !AG_NOTIF.plantillas) { toast('No se pudo cargar la configuración de Agenda', 'err'); return false; }
+  if (requiereWa && !(AG_NOTIF.candidato && AG_NOTIF.candidato.wa)) {
+    toast('Configura el WhatsApp del candidato en Configuración → General → Agenda', 'err'); return false;
+  }
+  return true;
+}
+
+function agVarsBase() {
+  const c = (AG_NOTIF && AG_NOTIF.candidato) || {};
+  return { pn_candidato: c.pnombre || '', n_candidato: c.nombre || '', u_agenda: (AG_NOTIF && AG_NOTIF.manejo) || '' };
+}
+
+/* ---- Resumen del día (iconos Mañana/Tarde/Noche) ---- */
+function agResumenTexto(franja) {
+  const f = AG_FRANJAS[franja];
+  const lista = agListaReuniones(franja);
+  if (!lista.count) return null;
+  const vars = Object.assign(agVarsBase(), { tiempo: f.tiempo, jornada: f.jornada, lista_reuniones: lista.texto });
+  return { texto: agTplRender(AG_NOTIF.plantillas.resumen, vars), count: lista.count };
+}
+
+function agResumenModal(franja) {
+  if (!agCandidatoOk(true)) return;
+  const f = AG_FRANJAS[franja];
+  const r = agResumenTexto(franja);
+  if (!r) return toast(`No hay reuniones programadas en ${f.jornada} de hoy`, 'err');
+  openSheet(`<div class="grip"></div>
+    <h2 class="h2">Notificar resumen · ${esc(f.label)}</h2>
+    <p class="muted small">Se enviará al WhatsApp del candidato (${esc(AG_NOTIF.candidato.wa.replace(/^57/, ''))}) · ${r.count} reunión(es).</p>
+    <div class="ag-notif-prev">${esc(r.texto)}</div>
+    <div class="ag-wa-row" style="margin-top:12px;">
+      <button class="btn btn-primary" id="ag-res-dir">${I.wa} Enviar directo</button>
+      <button class="btn btn-ghost" id="ag-res-bot">Desde el bot</button>
+    </div>`);
+  $('#ag-res-dir').onclick = () => { ldWaOpen(AG_NOTIF.candidato.wa, r.texto); };
+  $('#ag-res-bot').onclick = (e) => agResumenBot(e.currentTarget, r.texto);
+}
+
+function agResumenBot(b, texto) {
+  if (!b || b.disabled) return;
+  if (!b._armed) { b._armed = true; b.dataset.orig = b.innerHTML; b.classList.add('ld-armed'); b.textContent = '¿Confirmar envío?'; b._t = setTimeout(() => { b._armed = false; b.classList.remove('ld-armed'); b.innerHTML = b.dataset.orig; }, 3500); return; }
+  clearTimeout(b._t); b._armed = false; b.classList.remove('ld-armed'); b.disabled = true; b.innerHTML = '<span class="spinner spinner-brand"></span>';
+  api('priv.agendaBotEnviar', {}, 'POST', { texto, ...m5Auth() })
+    .then(r => toast(r.msg || (r.ok ? 'Enviado' : 'No se pudo enviar'), r.ok ? 'ok' : 'err'))
+    .catch((e) => fallaRed(e))
+    .finally(() => { b.disabled = false; b.innerHTML = b.dataset.orig || 'Desde el bot'; });
+}
+
+/* ---- Avisar (Aviso / Previa / Decisión) → WhatsApp directo al candidato ---- */
+function agAvisarModal(c) {
+  if (!agCandidatoOk(true)) return;
+  openSheet(`<div class="grip"></div>
+    <h2 class="h2">Avisar al candidato</h2>
+    <p class="muted small">Se abrirá WhatsApp directo al candidato (${esc(AG_NOTIF.candidato.wa.replace(/^57/, ''))}).</p>
+    <div class="ag-avisar-grid">
+      <button class="btn btn-quiet" data-t="aviso">${I.bell} Aviso</button>
+      <button class="btn btn-quiet" data-t="previa">${I.clock} Previa</button>
+      <button class="btn btn-quiet" data-t="decision">${AG_SVG.alert} Decisión</button>
+    </div>`);
+  $$('#layer .ag-avisar-grid [data-t]').forEach(b => b.onclick = () => agAvisarEnviar(c, b.dataset.t));
+}
+
+function agAvisarEnviar(c, tipo) {
+  const tpl = AG_NOTIF.plantillas[tipo]; if (!tpl) return;
+  const vars = Object.assign(agVarsBase(), { bloque_aviso: agBloqueAviso(c) });
+  const texto = agTplRender(tpl, vars);
+  ldWaOpen(AG_NOTIF.candidato.wa, texto);
+}
+
+/* ---- Mensaje directo → WhatsApp directo a la PERSONA de la reunión ---- */
+function agDirectoEnviar(c) {
+  if (!agCandidatoOk(false)) return;
+  if (!c.telefono) return toast('La reunión no tiene teléfono de la persona', 'err');
+  const vars = Object.assign(agVarsBase(), {
+    contacto: c.contacto || '',
+    fecha_larga: c.fecha ? fmtFechaCorta(c.fecha) : '',
+    hora_inicio: c.inicia ? hora12(c.inicia) : '',
+    hora_fin: c.termina ? hora12(c.termina) : '',
+    lugar: c.lugar || '',
+    detalles: agDetallesLinea(c.detalles),
+    mensaje: c.mensaje || ''
+  });
+  ldWaOpen(c.telefono, agTplRender(AG_NOTIF.plantillas.directo, vars));
+}
+
+function agEstadoNormJs(e) {
+  const x = String(e || '').toUpperCase().trim();
+  return AG_ESTADOS.indexOf(x) !== -1 ? x : 'PROGRAMADA';
+}
+/* ¿la reunión cae en el rango que se está viendo? (para los contadores) */
+function agEnRango(r) {
+  const d = parseFechaES(r.fecha); if (!d) return false;
+  if (AG_VIEW === 'dia') return dateToDDMM(d) === dateToDDMM(AG_CUR);
+  if (AG_VIEW === 'mes') return d.getMonth() === AG_CUR.getMonth() && d.getFullYear() === AG_CUR.getFullYear();
+  return d.getFullYear() === AG_CUR.getFullYear();
+}
+
+function agEstadoClass(e) {
+  const x = String(e || '').toUpperCase();
+  if (x === 'REALIZADA') return 'ag-real';
+  if (x === 'A REPROGRAMAR') return 'ag-repro';
+  return 'ag-prog';
+}
+function agFind(id) { return AG_ALL.find(x => String(x.id) === String(id)); }
+
+/* ====================================================================
+   AGENDA ESTRICTA · 31/07/2026
+   --------------------------------------------------------------------
+   El backend repite TODAS estas reglas (Eventos_Priv.gs): esto es la cara
+   visible, no la cerradura. Reglas:
+   · PROGRAMADAS con fecha ANTERIOR a hoy (cualquier fecha, no solo ayer)
+     → agenda bloqueada.
+   · A REPROGRAMAR de MESES anteriores → agenda bloqueada.
+   · Bloqueada = no se crean reuniones y no se editan las de HOY EN
+     ADELANTE. Las atrasadas SÍ se editan: es la salida (cambiarles la
+     fecha). Los cambios de estado nunca se bloquean, ni de a una ni en
+     bloque: es la otra salida.
+   · Con fecha pasada y estado PROGRAMADA o REALIZADA no se elimina, solo
+     se edita. Las A REPROGRAMAR sí se eliminan.
+   · Exentos: el DESARROLLADOR y el interruptor AGENDA_ESTRICTA en NO.
+   ==================================================================== */
+function agHoy0() { const t = new Date(); return new Date(t.getFullYear(), t.getMonth(), t.getDate()); }
+function agMes1() { const t = new Date(); return new Date(t.getFullYear(), t.getMonth(), 1); }
+function agEsPasada(fecha) { const d = parseFechaES(fecha); return !!d && d < agHoy0(); }
+
+/* Lo atrasado, ignorando pastillas y búsqueda a propósito: el bloqueo no
+   depende de lo que el usuario tenga filtrado en pantalla. */
+function agAtrasadas() {
+  const hoy = agHoy0(), mes1 = agMes1(), prog = [], repro = [];
+  AG_ALL.forEach(r => {
+    const d = parseFechaES(r.fecha); if (!d) return;
+    const e = agEstadoNormJs(r.estado);
+    if (e === 'PROGRAMADA' && d < hoy) prog.push(r);
+    else if (e === 'A REPROGRAMAR' && d < mes1) repro.push(r);
+  });
+  const ord = (a, b) => (parseFechaES(a.fecha) - parseFechaES(b.fecha)) || (String(a.inicia || '99').localeCompare(String(b.inicia || '99')));
+  return { prog: prog.sort(ord), repro: repro.sort(ord) };
+}
+
+function agBloqueoMsg(nProg, nRepro) {
+  const base = 'No puedes dejar reuniones en estado PROGRAMADAS, debes llevar estrictamente los tiempos de la agenda. Cambia los estados a REALIZADAS para poder continuar usando la agenda hoy';
+  if (nProg && nRepro) return base + ', cambia las fechas de las reuniones A REPROGRAMAR o elimínalas.';
+  if (nProg) return base + '.';
+  return 'No puedes dejar reuniones en estado A REPROGRAMAR de meses anteriores, debes llevar estrictamente los tiempos de la agenda. Cambia las fechas de esas reuniones o elimínalas para poder continuar usando la agenda hoy.';
+}
+
+function agBloqueo() {
+  if (!AG_ESTRICTA || AG_ESDEV) return { on: false, prog: [], repro: [] };
+  const a = agAtrasadas();
+  return { on: !!(a.prog.length || a.repro.length), prog: a.prog, repro: a.repro };
+}
+
+function agNoEliminable(c) {
+  if (!AG_ESTRICTA || AG_ESDEV) return false;
+  const e = agEstadoNormJs(c.estado);
+  return agEsPasada(c.fecha) && (e === 'PROGRAMADA' || e === 'REALIZADA');
+}
+
+const AG_MSG_NODEL = 'Las reuniones de días pasados en PROGRAMADA o REALIZADA no se eliminan, solo se editan.';
+
+/* Banda de arriba: roja si está bloqueada, ámbar si HOY hay programadas sin
+   cerrar (aviso preventivo, no bloquea). Se repinta en cada agRender, así
+   que al marcar REALIZADA el candado se cae solo, sin recargar. */
+function agPintaBloqueo() {
+  const box = $('#ag-block'); if (!box) return;
+  const b = agBloqueo();
+  const add = $('#ag-add');
+  if (add) {
+    add.disabled = b.on;
+    add.classList.toggle('ag-locked', b.on);
+    add.title = b.on ? 'Agenda bloqueada' : '';
+  }
+  if (b.on) {
+    const n = b.prog.length + b.repro.length;
+    box.innerHTML = `<div class="ag-block">
+      <div class="ag-block-tx"><b>${I.lock} Agenda bloqueada</b><p>${esc(agBloqueoMsg(b.prog.length, b.repro.length))}</p></div>
+      <button class="btn ag-block-btn" id="ag-block-ver">Ver pendientes (${n})</button>
+    </div>`;
+    $('#ag-block-ver').onclick = () => agPendientesModal();
+    return;
+  }
+  box.innerHTML = '';
+}
+
+function agPendItemHtml(c, tipo) {
+  return `<div class="ag-pend-it">
+    <div class="ag-pend-tx">
+      <b>${esc(c.titulo || ('#' + c.id))}</b>
+      <span>${esc(fmtFechaCorta(c.fecha) || c.fecha)}${c.inicia ? ' · ' + esc(c.inicia) : ''} · <i class="ag-badge ${agEstadoClass(c.estado)}">${esc(agEstadoNormJs(c.estado))}</i></span>
+    </div>
+    <div class="ag-pend-acts">
+      ${tipo === 'prog' ? `<button class="btn btn-quiet" data-real="${esc(c.id)}">${I.check} Realizada</button>` : ''}
+      <button class="btn btn-quiet" data-edit="${esc(c.id)}">${I.pencil} Fecha</button>
+      ${tipo === 'repro' ? `<button class="btn btn-quiet ag-del" data-del="${esc(c.id)}">${I.trash} Eliminar</button>` : ''}
+    </div>
+  </div>`;
+}
+
+/* Lista de lo atrasado con la acción al lado. Es lo que hace que el bloqueo
+   sea una puerta y no una pared. */
+function agPendientesModal() {
+  const b = agBloqueo();
+  if (!b.on) { closeLayer(); return toast('No hay reuniones atrasadas', 'ok'); }
+  openSheet(`<div class="grip"></div>
+    <h2 class="h2">${I.lock} Reuniones pendientes</h2>
+    <p class="muted small" style="margin-top:6px;">${esc(agBloqueoMsg(b.prog.length, b.repro.length))}</p>
+    <div class="ag-pend">
+      ${b.prog.length ? `<h3 class="ag-pend-h">Programadas sin cerrar (${b.prog.length})</h3>${b.prog.map(c => agPendItemHtml(c, 'prog')).join('')}` : ''}
+      ${b.repro.length ? `<h3 class="ag-pend-h">A reprogramar de meses anteriores (${b.repro.length})</h3>${b.repro.map(c => agPendItemHtml(c, 'repro')).join('')}` : ''}
+    </div>`);
+  $$('#layer [data-real]').forEach(x => x.onclick = () => agPendMarcar(x.dataset.real, x));
+  $$('#layer [data-edit]').forEach(x => x.onclick = () => { closeLayer(); agEditar(x.dataset.edit); });
+  $$('#layer [data-del]').forEach(x => x.onclick = () => agEliminar(x.dataset.del));
+}
+
+async function agPendMarcar(id, btn) {
+  if (btn) saving(btn, true);
+  try {
+    const r = await api('priv.reunionEstado', {}, 'POST', { id, estado: 'REALIZADA', ...m5Auth() });
+    if (btn) saving(btn, false);
+    if (!r.ok) return toast(r.msg || 'No se pudo cambiar', 'err');
+    const i = AG_ALL.findIndex(x => String(x.id) === String(id));
+    if (i >= 0) AG_ALL[i] = r.card;
+    agRender();
+    const b = agBloqueo();
+    if (!b.on) { closeLayer(); return toast('Agenda desbloqueada', 'ok'); }
+    agPendientesModal();
+  } catch (e) { if (btn) saving(btn, false); fallaRed(e); }
+}
+
+function agAvisoBloqueo(b) {
+  b = b || agBloqueo();
+  const n = b.prog.length + b.repro.length;
+  openSheet(`<div class="grip"></div>
+    <h2 class="h2">${I.lock} Agenda bloqueada</h2>
+    <p class="muted" style="margin-top:8px;">${esc(agBloqueoMsg(b.prog.length, b.repro.length))}</p>
+    <button class="btn btn-primary btn-block" id="ag-bl-ver" style="margin-top:14px;">Ver reuniones pendientes (${n})</button>
+    <button class="btn btn-quiet btn-block" id="ag-bl-x" style="margin-top:8px;">Entendido</button>`);
+  $('#ag-bl-ver').onclick = () => agPendientesModal();
+  $('#ag-bl-x').onclick = () => closeLayer();
+}
+
+function agMatchesQ(r) { if (!AG_Q) return true; const hay = ((r.titulo || '') + ' ' + (r.lugar || '') + ' ' + (r.contacto || '') + ' ' + (r.telefono || '')).toLowerCase(); return hay.includes(AG_Q); }
+function agReunionesDia(d) {
+  const key = dateToDDMM(d);
+  return AG_ALL
+    .filter(r => r.fecha === key && agMatchesQ(r) && (!AG_EST.size || AG_EST.has(agEstadoNormJs(r.estado))))
+    .sort((a, b) => (a.inicia || '99').localeCompare(b.inicia || '99'));
+}
+
+/* Pastillas de estado con el conteo de lo que se está viendo */
+function agPintaPastillas() {
+  const cont = $('#ag-pills'); if (!cont) return;
+  const vis = AG_ALL.filter(r => agEnRango(r) && agMatchesQ(r));
+  const n = {}; AG_ESTADOS.forEach(e => n[e] = 0);
+  vis.forEach(r => n[agEstadoNormJs(r.estado)]++);
+  cont.innerHTML = AG_ESTADOS.map(e => `<button class="ag-pill ${agEstadoClass(e)} ${AG_EST.has(e) ? 'active' : ''}" data-e="${esc(e)}">
+      ${esc(e)} <span class="ag-pill-n">${n[e]}</span>
+    </button>`).join('') +
+    (AG_EST.size ? `<button class="ag-pill ag-pill-clear" id="ag-pill-clear">Ver todas</button>` : '');
+  $$('#ag-pills .ag-pill[data-e]').forEach(b => b.onclick = () => {
+    const e = b.dataset.e;
+    if (AG_EST.has(e)) AG_EST.delete(e); else AG_EST.add(e);
+    agRender();
+  });
+  const cl = $('#ag-pill-clear'); if (cl) cl.onclick = () => { AG_EST.clear(); agRender(); };
+}
+
+/* ---- Selección múltiple: barra inferior con los 3 estados ---- */
+function agSelToggle(id) {
+  const k = String(id);
+  if (AG_SEL.has(k)) AG_SEL.delete(k); else AG_SEL.add(k);
+  agRender();
+}
+function agSelModo(on) {
+  AG_SELMODE = !!on;
+  if (!AG_SELMODE) AG_SEL.clear();
+  agRender();
+}
+function agPintaBarraSel() {
+  const bar = $('#ag-selbar'); if (!bar) return;
+  bar.hidden = !AG_SELMODE;
+  document.body.classList.toggle('ag-selecting', AG_SELMODE);
+  const btn = $('#ag-selmode'); if (btn) btn.classList.toggle('active', AG_SELMODE);
+  if (!AG_SELMODE) return;
+  bar.innerHTML = `<div class="ag-selbar-in">
+      <b>${AG_SEL.size} seleccionada(s)</b>
+      <div class="ag-selbar-acts">
+        ${AG_ESTADOS.map(e => `<button class="btn btn-ghost ag-selbtn ${agEstadoClass(e)}" data-e="${esc(e)}" ${AG_SEL.size ? '' : 'disabled'}>${esc(e)}</button>`).join('')}
+        <button class="btn btn-quiet" id="ag-selcancel">Cancelar</button>
+      </div>
+    </div>`;
+  $$('#ag-selbar .ag-selbtn').forEach(b => b.onclick = () => agEstadoBloque(b.dataset.e));
+  $('#ag-selcancel').onclick = () => agSelModo(false);
+}
+async function agEstadoBloque(estado) {
+  const ids = Array.from(AG_SEL);
+  if (!ids.length) return toast('No hay reuniones seleccionadas', 'err');
+  const bar = $('#ag-selbar');
+  if (bar) bar.innerHTML = `<div class="ag-selbar-in"><b>Marcando ${ids.length}…</b><span class="spinner spinner-brand"></span></div>`;
+  try {
+    const r = await api('priv.reunionEstadoBulk', {}, 'POST', { ids, estado, ...m5Auth() });
+    if (!r.ok) { agRender(); return toast(r.msg || 'No se pudo cambiar', 'err'); }
+    (r.cards || []).forEach(c => { const i = AG_ALL.findIndex(x => String(x.id) === String(c.id)); if (i >= 0) AG_ALL[i] = c; });
+    AG_SEL.clear(); AG_SELMODE = false;
+    agRender();
+    toast(r.msg || 'Listo', (r.fallos && r.fallos.length) ? 'err' : 'ok');
+  } catch (e) { agRender(); fallaRed(e); }
+}
+
+async function viewAgenda(user) {
+  M5_ME = user.documento; appWide(true);
+  app.innerHTML = `${backbar('Agenda')}
+    <div class="pad">
+      <div class="ag-toolbar">
+        <div class="ag-nav">
+          <button class="icon-btn ag-ic" id="ag-prev" title="Anterior">${I.chevL}</button>
+          <button class="btn btn-ghost ag-today" id="ag-today">Hoy</button>
+          <button class="icon-btn ag-ic" id="ag-next" title="Siguiente">${I.chevR}</button>
+          <b class="ag-title" id="ag-title"></b>
+        </div>
+        <div class="ag-right">
+          <div class="ag-seg" id="ag-seg">
+            ${['año', 'mes', 'día'].map(v => `<button class="ag-seg-btn ${v === 'mes' ? 'active' : ''}" data-v="${v}">${v[0].toUpperCase() + v.slice(1)}</button>`).join('')}
+          </div>
+          <button class="btn btn-primary ag-add" id="ag-add">${I.plus} Reunión</button>
+        </div>
+      </div>
+      <div class="ag-search">
+        <input class="input" id="ag-q" placeholder="Buscar reunión por título, lugar o contacto…" autocomplete="off" />
+        <button class="btn btn-ghost ag-selmode" id="ag-selmode" title="Seleccionar varias">${I.check} Seleccionar</button>
+      </div>
+      <div class="ag-pillsrow">
+        <div class="ag-pills" id="ag-pills"></div>
+        <div class="ag-notif" id="ag-notif" title="Notificar resumen al candidato">
+          ${Object.keys(AG_FRANJAS).map(k => `<button class="ag-notif-ic" data-f="${k}" title="Resumen · ${esc(AG_FRANJAS[k].label)}" aria-label="Resumen ${esc(AG_FRANJAS[k].label)}">${AG_FRANJAS[k].svg}</button>`).join('')}
+        </div>
+      </div>
+      <div id="ag-block"></div>
+      <div id="ag-cal">${loadingBox('Cargando agenda…')}</div>
+      <div class="ag-selbar" id="ag-selbar" hidden></div>
+    </div>`;
+  app.hidden = false; hideSplash();
+  $('#backbtn').onclick = () => go('home');
+  $('#ag-add').onclick = () => agAgregar(AG_CUR);
+  $('#ag-prev').onclick = () => { agShift(-1); };
+  $('#ag-next').onclick = () => { agShift(1); };
+  $('#ag-today').onclick = () => { AG_CUR = new Date(); agRender(); };
+  $('#ag-selmode').onclick = () => agSelModo(!AG_SELMODE);
+  $$('#ag-seg .ag-seg-btn').forEach(b => b.onclick = () => { AG_VIEW = b.dataset.v === 'año' ? 'anio' : b.dataset.v === 'día' ? 'dia' : 'mes'; $$('#ag-seg .ag-seg-btn').forEach(x => x.classList.toggle('active', x === b)); agRender(); });
+  const q = $('#ag-q'); let t; q.oninput = () => { clearTimeout(t); t = setTimeout(() => { AG_Q = q.value.trim().toLowerCase(); agRender(); }, 180); };
+  $$('#ag-notif .ag-notif-ic').forEach(b => b.onclick = () => agResumenModal(b.dataset.f));
+  agNotifCargar();   // AJUSTE 20/07: candidato + plantillas para las notificaciones
+  try { const r = await api('priv.agenda', m5Auth()); AG_ALL = (r && r.items) || []; AG_ESTRICTA = !(r && r.estricta === false); AG_ESDEV = !!(r && r.esDev); }
+  catch (e) { $('#ag-cal').innerHTML = `${fallaHtml(e)}`; return; }
+  agRender();
+
+  vivoBind('agenda', M5_ME, vivoAgenda);   // EN VIVO
+}
+
+/* ---- EN VIVO · Agenda ----
+   Se respeta dónde está parado el usuario: agRender() repinta el mismo mes/día
+   y la misma búsqueda (AG_CUR, AG_VIEW y AG_Q no se tocan). */
+async function vivoAgenda(rev) {
+  const r = await api('priv.agenda', m5Auth(), 'GET', null, SILENCIO);
+  const items = (r && r.items) || [];
+  AG_ESTRICTA = !(r && r.estricta === false); AG_ESDEV = !!(r && r.esDev);
+  if (!vivoCambio(JSON.stringify(items))) return;
+  AG_ALL = items;
+  agRender(); vivoCerrarHoja(rev);
+}
+
+function agShift(dir) {
+  const d = new Date(AG_CUR);
+  if (AG_VIEW === 'anio') d.setFullYear(d.getFullYear() + dir);
+  else if (AG_VIEW === 'dia') d.setDate(d.getDate() + dir);
+  else d.setMonth(d.getMonth() + dir);
+  AG_CUR = d; agRender();
+}
+
+/* ====================================================================
+   AJUSTE 18/07/2026 · AGENDA — vista mensual con puntos de estado + modal
+   del día, vista anual con puntos por estado, y línea "ahora" en vivo en
+   el día. El filtro de pastillas y la búsqueda se respetan porque todo
+   parte de agReunionesDia(). No se toca el backend ni el modal de detalle
+   (agVer) ni el de agregar (agAgregar). */
+let AG_DAYTIMER = null;
+
+function agRender() {
+  const cal = $('#ag-cal'); if (!cal) return;
+  const title = $('#ag-title');
+  agStopDayLive();
+  agPintaPastillas();
+  agPintaBarraSel();
+  agPintaBloqueo();   /* AGENDA ESTRICTA 31/07 */
+  if (AG_VIEW === 'anio') { if (title) title.textContent = AG_CUR.getFullYear(); cal.innerHTML = agRenderAnio(); agWireYear(); }
+  else if (AG_VIEW === 'dia') { if (title) title.textContent = `${AG_CUR.getDate()} de ${BD_MESES[AG_CUR.getMonth()]} de ${AG_CUR.getFullYear()}`; cal.innerHTML = agRenderDia(); agWireChips(); agArmDayLive(); }
+  else { if (title) title.textContent = `${BD_MESES[AG_CUR.getMonth()][0].toUpperCase() + BD_MESES[AG_CUR.getMonth()].slice(1)} ${AG_CUR.getFullYear()}`; cal.innerHTML = agRenderMes(); agWireMonth(); }
+}
+
+/* semana empieza lunes; devuelve índice 0..6 (Lun..Dom) */
+function dowMon(d) { return (d.getDay() + 6) % 7; }
+function agDowLabel(d) { return AG_DOW[dowMon(d)]; }
+function agEsHoy(d) { const t = new Date(); return d.getDate() === t.getDate() && d.getMonth() === t.getMonth() && d.getFullYear() === t.getFullYear(); }
+
+/* Resumen por estado de un día (respeta filtro + búsqueda). Solo los estados
+   presentes, en orden PROGRAMADA · A REPROGRAMAR · REALIZADA. */
+function agResumenDia(d) {
+  const rs = agReunionesDia(d);
+  const n = { 'PROGRAMADA': 0, 'A REPROGRAMAR': 0, 'REALIZADA': 0 };
+  rs.forEach(r => n[agEstadoNormJs(r.estado)]++);
+  return AG_ESTADOS.filter(e => n[e] > 0).map(e => ({ estado: e, clase: agEstadoClass(e), n: n[e] }));
+}
+
+/* Nombre del estado para la barra del mes. "A REPROGRAMAR" se abrevia
+   (decisión del usuario 23/07): en una celda de calendario no cabe entera. */
+function agEstadoCorto(e) { return String(e || '') === 'A REPROGRAMAR' ? 'REPROGRAMAR' : String(e || ''); }
+
+/* ---- MES: celdas parejas con barra de estado + conteo ---- */
+function agRenderMes() {
+  const y = AG_CUR.getFullYear(), m = AG_CUR.getMonth();
+  const first = new Date(y, m, 1);
+  const start = new Date(first); start.setDate(1 - dowMon(first));
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  let cells = '';
+  for (let i = 0; i < 42; i++) {
+    const d = new Date(start); d.setDate(start.getDate() + i);
+    const inMonth = d.getMonth() === m;
+    const isToday = d.getTime() === today.getTime();
+    const res = inMonth ? agResumenDia(d) : [];
+    /* AJUSTE 23/07: el puntico pasó a BARRA de color que aprovecha el ancho de
+       la celda. El conteo se mantiene a la izquierda; el nombre del estado solo
+       aparece cuando la pantalla da (≥820px, ver style.css) — en móvil la barra
+       va sin texto. El markup es el mismo en las dos: lo decide el CSS, así la
+       celda nunca se deforma. */
+    const dots = res.map(x => `<span class="ag-dot ${x.clase}" title="${esc(x.n + ' ' + x.estado)}"><b class="ag-dot-n">${x.n}</b><span class="ag-dot-bar"><span>${esc(agEstadoCorto(x.estado))}</span></span></span>`).join('');
+    cells += `<div class="ag-cell ${inMonth ? '' : 'ag-out'} ${isToday ? 'ag-today-cell' : ''} ${dots ? 'ag-has' : ''}" data-day="${dateToDDMM(d)}">
+      <div class="ag-cell-h"><span class="ag-dnum">${d.getDate()}</span></div>
+      <div class="ag-cell-body">${dots ? `<div class="ag-dots">${dots}</div>` : ''}</div>
+    </div>`;
+  }
+  return `<div class="ag-monthwrap">
+    <div class="ag-dow">${AG_DOW.map(x => `<span>${x}</span>`).join('')}</div>
+    <div class="ag-grid">${cells}</div>
+  </div>`;
+}
+function agWireMonth() {
+  $$('#ag-cal .ag-cell').forEach(c => c.onclick = () => {
+    const d = parseFechaES(c.dataset.day); if (!d) return;
+    const rs = agReunionesDia(d);
+    if (rs.length) agModalDia(d);          // día con reuniones → modal del día
+    else if (!AG_SELMODE) agAgregar(d);    // día vacío → agregar
+  });
+}
+
+/* ---- Modal del día (lista de reuniones + Agregar) ---- */
+/* overFrac (0..1): si viene, la línea "ahora" se dibuja SOBRE esta tarjeta a esa
+   altura (reunión en curso). Sin overFrac (modal del mes, tarjetas normales) no
+   se dibuja overlay. */
+function agDayItemsHtml(rs, overFrac) {
+  return rs.map(r => {
+    const t = new Date();
+    const over = (overFrac != null)
+      ? `<span class="ag-now ag-now-over" style="top:${Math.max(0, Math.min(100, overFrac * 100)).toFixed(1)}%;"><span class="ag-now-dot"></span><span class="ag-now-h">${esc(hora12(pad2(t.getHours()) + ':' + pad2(t.getMinutes())))}</span><span class="ag-now-line"></span></span>`
+      : '';
+    return `<button class="ag-day-item ${agEstadoClass(r.estado)} ${AG_SEL.has(String(r.id)) ? 'ag-picked' : ''} ${overFrac != null ? 'ag-day-live' : ''}" data-id="${esc(r.id)}">
+    ${over}<div class="ag-day-time">${esc(r.inicia ? hora12(r.inicia) : '—')}${r.termina ? `<span>${esc(hora12(r.termina))}</span>` : ''}</div>
+    <div class="ag-day-main"><b>${esc(r.titulo)}</b><span>${esc([r.lugar, r.contacto].filter(Boolean).join(' · ') || '—')}</span></div>
+    <span class="ag-badge ${agEstadoClass(r.estado)}">${esc(r.estado)}</span>
+  </button>`;
+  }).join('');
+}
+function agSelPick(id) {
+  const k = String(id);
+  if (AG_SEL.has(k)) AG_SEL.delete(k); else AG_SEL.add(k);
+  agPintaBarraSel();
+}
+function agModalDia(d) {
+  const rs = agReunionesDia(d);
+  openSheet(`<div class="grip"></div>
+    <div class="ag-md-head">
+      <div class="ag-md-when"><span class="ag-md-dow">${esc(agDowLabel(d))}</span><h2 class="h2 ag-md-title">${d.getDate()} de ${esc(BD_MESES[d.getMonth()])}</h2></div>
+      <span class="ag-md-count">${rs.length}</span>
+    </div>
+    <div class="ag-md-list">${rs.length ? agDayItemsHtml(rs) : `<p class="muted center" style="margin:18px 0;">Sin reuniones este día.</p>`}</div>
+    <button class="btn btn-primary btn-block ag-md-add" id="ag-md-add">${I.plus} Agregar reunión</button>`, 'ag-md');
+  $('#ag-md-add').onclick = () => { closeLayer(); agAgregar(d); };
+  $$('#layer .ag-day-item').forEach(b => b.onclick = () => {
+    if (AG_SELMODE) { agSelPick(b.dataset.id); agModalDia(d); }
+    else { closeLayer(); agVer(b.dataset.id); }
+  });
+}
+
+/* ---- DÍA: lista + línea "ahora" en vivo (solo si es hoy) ---- */
+function agNowMinutes() { const t = new Date(); return t.getHours() * 60 + t.getMinutes(); }
+function agMinutos(hhmm) { const m = /^(\d{1,2}):(\d{2})/.exec(String(hhmm || '')); return m ? (+m[1]) * 60 + (+m[2]) : 99999; }
+function agNowLineHtml() {
+  const t = new Date();
+  return `<div class="ag-now"><span class="ag-now-dot"></span><span class="ag-now-h">${hora12(pad2(t.getHours()) + ':' + pad2(t.getMinutes()))}</span><span class="ag-now-line"></span></div>`;
+}
+function agRenderDia() {
+  const rs = agReunionesDia(AG_CUR);
+  const hoy = agEsHoy(AG_CUR);
+  const now = hoy ? agNowLineHtml() : '';
+  if (!rs.length) return `<div class="ag-daywrap">${now}<p class="muted center" style="margin:30px 0;">${AG_EST.size ? 'Sin reuniones de ese estado este día.' : 'Sin reuniones este día.'}<br><button class="btn btn-ghost" id="ag-day-add" style="margin-top:12px;">${I.plus} Agregar reunión</button></p></div>`;
+  const nowMin = agNowMinutes();
+  let out = '', placed = false;
+  rs.forEach(r => {
+    const ini = agMinutos(r.inicia);
+    const fin = r.termina ? agMinutos(r.termina) : ini;
+    // En curso: inicia <= ahora < termina → la línea va SOBRE esta tarjeta.
+    const dentro = hoy && r.termina && fin > ini && ini <= nowMin && nowMin < fin;
+    if (dentro) {
+      out += agDayItemsHtml([r], (nowMin - ini) / (fin - ini));
+      placed = true;                                   // ya se pintó sobre la tarjeta
+    } else {
+      if (hoy && !placed && ini >= nowMin) { out += now; placed = true; }   // antes de la próxima
+      out += agDayItemsHtml([r]);
+    }
+  });
+  if (hoy && !placed) out += now;                       // ya terminó todo → debajo del bloque
+  return `<div class="ag-daywrap">${out}</div>`;
+}
+function agStopDayLive() { if (AG_DAYTIMER) { clearInterval(AG_DAYTIMER); AG_DAYTIMER = null; } }
+function agArmDayLive() {
+  agStopDayLive();
+  if (AG_VIEW !== 'dia' || !agEsHoy(AG_CUR)) return;
+  AG_DAYTIMER = setInterval(() => {
+    const cal = $('#ag-cal');
+    if (!cal || AG_VIEW !== 'dia' || !agEsHoy(AG_CUR)) { agStopDayLive(); return; }
+    cal.innerHTML = agRenderDia(); agWireChips();
+  }, 60000);
+}
+
+/* ---- AÑO: número + puntos por estado (no deforma la celda) ---- */
+function agRenderAnio() {
+  const y = AG_CUR.getFullYear();
+  let months = '';
+  for (let m = 0; m < 12; m++) {
+    const first = new Date(y, m, 1);
+    const start = new Date(first); start.setDate(1 - dowMon(first));
+    let cells = '';
+    for (let i = 0; i < 42; i++) {
+      const d = new Date(start); d.setDate(start.getDate() + i);
+      const inMonth = d.getMonth() === m;
+      const res = inMonth ? agResumenDia(d) : [];
+      const dots = res.map(x => `<span class="ag-y-dot ${x.clase}"></span>`).join('');
+      cells += `<span class="ag-y-d ${inMonth ? '' : 'ag-out'} ${dots ? 'ag-y-has' : ''}"><span class="ag-y-n">${inMonth ? d.getDate() : ''}</span>${dots ? `<span class="ag-y-dots">${dots}</span>` : ''}</span>`;
+    }
+    months += `<button class="ag-y-month" data-m="${m}">
+      <div class="ag-y-name">${BD_MESES[m][0].toUpperCase() + BD_MESES[m].slice(1)}</div>
+      <div class="ag-y-dow">${AG_DOW.map(x => `<span>${x[0]}</span>`).join('')}</div>
+      <div class="ag-y-grid">${cells}</div>
+    </button>`;
+  }
+  return `<div class="ag-yearwrap">${months}</div>`;
+}
+function agWireYear() {
+  $$('#ag-cal .ag-y-month').forEach(b => b.onclick = () => { AG_CUR = new Date(AG_CUR.getFullYear(), +b.dataset.m, 1); AG_VIEW = 'mes'; $$('#ag-seg .ag-seg-btn').forEach(x => x.classList.toggle('active', x.dataset.v === 'mes')); agRender(); });
+}
+function agWireChips() {
+  $$('#ag-cal .ag-day-item').forEach(b => b.onclick = () => AG_SELMODE ? agSelToggle(b.dataset.id) : agVer(b.dataset.id));
+  const add = $('#ag-day-add'); if (add) add.onclick = () => agAgregar(AG_CUR);
+}
+
+/* Texto de bitácora para copiar a grupo */
+function agTextoBitacora(c) {
+  const L = [];
+  L.push(`🗓️ ${c.titulo}`);
+  if (c.fecha) L.push(`Fecha: ${fmtFechaCorta(c.fecha)}${c.inicia ? ' · ' + rangoHoras(c.inicia, c.termina) : ''}`);
+  if (c.lugar) L.push(`Lugar: ${c.lugar}`);
+  if (c.contacto) L.push(`Contacto: ${c.contacto}`);
+  L.push(`Estado: ${c.estado}`);
+  if (c.bitacora) L.push(`\n${c.bitacora}`);
+  return L.join('\n');
+}
+
+async function agVer(id) {
+  openSheet(`<div class="grip"></div><h2 class="h2">Reunión</h2>${loadingBox('Cargando…')}`);
+  let c;
+  try { const r = await api('priv.reunionVer', { id, ...m5Auth() }); if (!r.ok) { closeLayer(); return toast(r.msg || 'No se pudo cargar', 'err'); } c = r.reunion; }
+  catch (e) { closeLayer(); return fallaRed(e); }
+  const tel = c.telefono ? String(c.telefono).replace(/^57/, '') : '';
+  const rows = [
+    ['ID', '#' + c.id],
+    ['Estado', c.estado],
+    ['Fecha', fmtFechaCorta(c.fecha) || '—'],
+    ['Horario', rangoHoras(c.inicia, c.termina) || '—'],
+    ['Lugar', c.lugar || '—'],
+    ['Detalles', c.detalles || '—'],
+    ['Contacto', c.contacto || '—'],
+    ['Teléfono', tel || '—'],
+    ['Mensaje persona', c.mensaje || '—'],
+    ['Bitácora grupo', c.bitacora || '—'],
+    ['En calendario', c.idCalendar ? 'Sí' : 'No'],
+    ['Creada', c.creada ? fmtCreada(c.creada) : '—']
+  ].map(([k, v]) => `<div class="det-row"><span>${esc(k)}</span><b>${esc(v)}</b></div>`).join('');
+  openSheet(`<div class="grip"></div>
+    <div class="det-head"><h2 class="h2">${esc(c.titulo)}</h2><span class="ag-badge ${agEstadoClass(c.estado)}">${esc(c.estado)}</span></div>
+    <div class="det-list">${rows}</div>
+    <div class="ag-wa-row">
+      <button class="btn btn-primary" id="ag-wa-dir" ${c.telefono ? '' : 'disabled'}>${I.wa} Mensaje directo</button>
+      <button class="btn btn-ghost" id="ag-wa-bot" ${c.telefono ? '' : 'disabled'}>Enviar por bot</button>
+    </div>
+    <button class="btn btn-ghost btn-block" id="ag-copy" style="margin-top:8px;">${I.copy} Copiar bitácora a grupo</button>
+    <button class="btn btn-ghost btn-block" id="ag-avisar" style="margin-top:8px;">${I.bell} Avisar</button>
+    <div class="ag-ver-grid">
+      <button class="btn btn-quiet" id="ag-edit">${I.pencil} Editar</button>
+      <button class="btn btn-quiet" id="ag-repro">${I.repeat} A reprogramar</button>
+      <button class="btn btn-quiet" id="ag-real">${I.check} Realizada</button>
+      <button class="btn btn-quiet ag-del" id="ag-del">${I.trash} Eliminar</button>
+    </div>`);
+  $('#ag-wa-dir').onclick = () => { if (c.telefono) agDirectoEnviar(c); else toast('Sin teléfono', 'err'); };
+  $('#ag-wa-bot').onclick = () => agWaBot(c);
+  $('#ag-copy').onclick = async () => { try { await navigator.clipboard.writeText(agTextoBitacora(c)); toast('Bitácora copiada', 'ok'); } catch { toast('No se pudo copiar', 'err'); } };
+  $('#ag-avisar').onclick = () => agAvisarModal(c);
+  /* AGENDA ESTRICTA 31/07: Editar se cierra solo para las de hoy en adelante
+     (las atrasadas se editan: es la salida). Eliminar se cierra para las
+     pasadas en PROGRAMADA o REALIZADA. */
+  const agBl = agBloqueo();
+  if (agBl.on && !agEsPasada(c.fecha)) { const be = $('#ag-edit'); if (be) { be.disabled = true; be.title = 'Agenda bloqueada'; } }
+  if (agNoEliminable(c)) { const bd = $('#ag-del'); if (bd) { bd.disabled = true; bd.title = AG_MSG_NODEL; } }
+  $('#ag-edit').onclick = () => { closeLayer(); agEditar(id); };
+  $('#ag-repro').onclick = () => agEstadoSet(id, 'A REPROGRAMAR');
+  $('#ag-real').onclick = () => agEstadoSet(id, 'REALIZADA');
+  $('#ag-del').onclick = () => agEliminar(id);
+}
+
+/* Enviar Mensaje persona por BuilderBot (doble toque de confirmación) */
+function agWaBot(c) {
+  const b = $('#ag-wa-bot'); if (!b || b.disabled) return;
+  if (!c.mensaje) return toast('No hay "Mensaje persona" para enviar', 'err');
+  if (!b._armed) { b._armed = true; const orig = b.innerHTML; b.dataset.orig = orig; b.classList.add('ld-armed'); b.textContent = '¿Confirmar envío?'; b._t = setTimeout(() => { b._armed = false; b.classList.remove('ld-armed'); b.innerHTML = orig; }, 3500); return; }
+  clearTimeout(b._t); b._armed = false; b.classList.remove('ld-armed'); b.disabled = true; b.innerHTML = '<span class="spinner spinner-brand"></span>';
+  api('priv.reunionWaBot', {}, 'POST', { id: c.id, texto: c.mensaje, ...m5Auth() })
+    .then(r => { toast(r.msg || (r.ok ? 'Enviado' : 'No se pudo enviar'), r.ok ? 'ok' : 'err'); })
+    .catch((e) => fallaRed(e))
+    .finally(() => { b.disabled = false; b.innerHTML = b.dataset.orig || 'Enviar por bot'; });
+}
+
+async function agEstadoSet(id, estado) {
+  try { const r = await api('priv.reunionEstado', {}, 'POST', { id, estado, ...m5Auth() }); if (!r.ok) return toast(r.msg || 'No se pudo cambiar', 'err'); const i = AG_ALL.findIndex(x => String(x.id) === String(id)); if (i >= 0) AG_ALL[i] = r.card; closeLayer(); toast('Reunión: ' + estado, 'ok'); agRender(); }
+  catch (e) { fallaRed(e); }
+}
+async function agEliminar(id) {
+  const c = agFind(id) || { id };
+  if (agNoEliminable(c)) return toast(AG_MSG_NODEL, 'err');
+  
+  const ok = await confirmar('¿Eliminar esta reunión?', crow('Reunión', (c.titulo || '#' + id)) + (c.fecha ? crow('Fecha', fmtFechaCorta(c.fecha)) : '') + `<p class="muted small" style="margin-top:8px;">También se elimina su evento del calendario de Google.</p>`);
+  if (!ok) return;
+  try { const r = await api('priv.reunionEliminar', {}, 'POST', { id, ...m5Auth() }); if (!r.ok) return toast(r.msg || 'No se pudo eliminar', 'err'); AG_ALL = AG_ALL.filter(x => String(x.id) !== String(id)); closeLayer(); toast('Reunión eliminada', 'ok'); agRender(); }
+  catch (e) { fallaRed(e); }
+}
+
+/* Modal Agregar / Editar Reunión (contacto de PRINCIPAL o libre) */
+/* AJUSTES 16/07: la fecha usa la rueda iOS con tope de HOY en adelante
+   (día, mes) y año actual automático. */
+function agFormHtml(titulo, c) {
+  c = c || {};
+  return `<div class="grip"></div><h2 class="h2" style="margin-bottom:10px;">${esc(titulo)}</h2>
+    <div class="stack">
+      ${field('ID de reunión', inputEl('ag-fid', 'disabled'))}
+      ${field('Título de la reunión', inputEl('ag-ftit', 'placeholder="Ej. Visita a líderes de Topacio"'))}
+      ${campoFecha('ag-ffecha', 'Fecha', { minHoy: !agEsPasada(c.fecha) })}
+      ${field('Lugar (zona)', comboboxHtml('ag-flugar', 'Escribe para buscar…'))}
+      ${field('Contacto (de la base o libre)', comboboxHtml('ag-fcont', 'Busca en la base o escríbelo…'))}
+      ${field('Teléfono', inputEl('ag-ftel', 'inputmode="numeric" maxlength="10" placeholder="10 dígitos"'))}
+      <div class="ev-hrow">
+        ${field('Hora inicio', `<input class="input" id="ag-fini" type="time" />`)}
+        ${field('Hora fin', `<input class="input" id="ag-ffin" type="time" />`)}
+      </div>
+      ${field('Detalles', `<textarea class="input ta" id="ag-fdet" rows="2" placeholder="Dirección, punto de referencia… (si eliges OTRO en Lugar, escríbela aquí)"></textarea>`)}
+      ${field('Mensaje a la persona', `<textarea class="input ta" id="ag-fmsg" rows="3" placeholder="Se puede enviar por WhatsApp"></textarea>`)}
+      ${field('Bitácora del grupo', `<textarea class="input ta" id="ag-fbit" rows="3" placeholder="Opcional"></textarea>`)}
+      <p class="muted small" id="ag-invmsg"></p>
+      <button class="btn btn-primary btn-block" id="ag-save">${c.id != null ? 'Guardar cambios' : 'Crear reunión'}</button>
+    </div>`;
+}
+function agFillForm(c, invitados) {
+  $('#ag-fid').value = c.id != null ? ('#' + c.id) : '(automático)';
+  $('#ag-ftit').value = c.titulo || '';
+  $('#ag-ffecha').value = ddmmToInput(c.fecha || '');
+  bindCampoFecha('ag-ffecha');
+  $('#ag-fcont').value = c.contacto || '';
+  $('#ag-ftel').value = c.telefono ? String(c.telefono).replace(/^57/, '') : '';
+  $('#ag-fini').value = c.inicia || '';
+  $('#ag-ffin').value = c.termina || '';
+  $('#ag-fdet').value = c.detalles || '';
+  $('#ag-fmsg').value = c.mensaje || '';
+  $('#ag-fbit').value = c.bitacora || '';
+  onlyDigits($('#ag-ftel'));
+  /* AJUSTE 20/07: "OTRO" como opción de Lugar (ubicación libre solo de reuniones). */
+  getResidencias().then(l => { bindCombobox('ag-flugar', ['OTRO'].concat(l)); $('#ag-flugar').value = c.lugar || ''; });
+  bindContactCombo('ag-fcont', 'ag-ftel', { free: true });
+  const im = $('#ag-invmsg');
+  if (im) im.textContent = invitados > 0
+    ? `Se creará el evento de calendario con administración a ${invitados} usuario(s) (menos el desarrollador).`
+    : `Aún no hay usuarios ADMIN con correo: el evento se crea sin invitados por ahora.`;
+}
+function agReadForm() {
+  return {
+    titulo: val('ag-ftit'),
+    fecha: inputToDDMM(($('#ag-ffecha') || {}).value),
+    lugar: val('ag-flugar'),
+    contacto: val('ag-fcont'),
+    telefono: onlyDig(val('ag-ftel')),
+    inicia: ($('#ag-fini') || {}).value || '',
+    termina: ($('#ag-ffin') || {}).value || '',
+    detalles: (($('#ag-fdet') || {}).value || '').trim(),
+    mensaje: (($('#ag-fmsg') || {}).value || '').trim(),
+    bitacora: (($('#ag-fbit') || {}).value || '').trim()
+  };
+}
+function agValidForm(b) {
+  if (!b.titulo) { toast('Escribe el título de la reunión', 'err'); return false; }
+  if (!b.fecha) { toast('Selecciona la fecha', 'err'); return false; }
+  if (!b.contacto) { toast('Escribe o elige el contacto', 'err'); return false; }
+  if (!b.telefono) { toast('Escribe el teléfono del contacto', 'err'); return false; }
+  if (b.telefono.length !== 10) { toast('Teléfono: 10 dígitos', 'err'); return false; }
+  if (b.inicia && b.termina && b.termina <= b.inicia) { toast('La hora fin debe ser mayor que la de inicio', 'err'); return false; }
+  return true;
+}
+async function agAgregar(prefillDate) {
+  const bl = agBloqueo(); if (bl.on) return agAvisoBloqueo(bl);   /* AGENDA ESTRICTA 31/07 */
+  openSheet(`<div class="grip"></div><h2 class="h2">Agregar reunión</h2>${loadingBox('Preparando…')}`);
+  let meta;
+  try { meta = await api('priv.reunionMeta', m5Auth()); } catch (e) { closeLayer(); return fallaRed(e); }
+  openSheet(agFormHtml('Agregar reunión', {}));
+  agFillForm(prefillDate ? { fecha: dateToDDMM(prefillDate) } : {}, meta.invitados || 0);
+  $('#ag-save').onclick = async () => {
+    const b = agReadForm(); if (!agValidForm(b)) return;
+    const btn = $('#ag-save'); saving(btn, true);
+    try { const r = await api('priv.reunionGuardar', {}, 'POST', { ...b, ...m5Auth() }); saving(btn, false); if (!r.ok) return toast(r.msg || 'No se pudo crear', 'err'); AG_ALL.unshift(r.card); closeLayer(); toast('Reunión creada y sincronizada con el calendario', 'ok'); const d = parseFechaES(r.card.fecha); if (d) AG_CUR = d; agRender(); }
+    catch (e) { saving(btn, false); fallaRed(e); }
+  };
+}
+async function agEditar(id) {
+  /* AGENDA ESTRICTA 31/07: bloqueada solo para las de hoy en adelante. */
+  const bl = agBloqueo();
+  if (bl.on) { const c0 = agFind(id); if (!c0 || !agEsPasada(c0.fecha)) return agAvisoBloqueo(bl); }
+  openSheet(`<div class="grip"></div><h2 class="h2">Editar reunión</h2>${loadingBox('Cargando…')}`);
+  let c, meta;
+  try { const [rv, rm] = await Promise.all([api('priv.reunionVer', { id, ...m5Auth() }), api('priv.reunionMeta', m5Auth())]); if (!rv.ok) { closeLayer(); return toast(rv.msg, 'err'); } c = rv.reunion; meta = rm; }
+  catch (e) { closeLayer(); return fallaRed(e); }
+  openSheet(agFormHtml('Editar reunión', c));
+  agFillForm(c, meta.invitados || 0);
+  $('#ag-save').onclick = async () => {
+    const b = agReadForm(); if (!agValidForm(b)) return;
+    const btn = $('#ag-save'); saving(btn, true);
+    try { const r = await api('priv.reunionEditar', {}, 'POST', { id, ...b, ...m5Auth() }); saving(btn, false); if (!r.ok) return toast(r.msg || 'No se pudo guardar', 'err'); const i = AG_ALL.findIndex(x => String(x.id) === String(id)); if (i >= 0) AG_ALL[i] = r.card; closeLayer(); toast('Reunión actualizada', 'ok'); const d = parseFechaES(r.card.fecha); if (d) AG_CUR = d; agRender(); }
+    catch (e) { saving(btn, false); fallaRed(e); }
+  };
+}
+
+/* ============================================================
+   MÓDULO 6 · COMPROMISOS
+   ============================================================ */
+let CM_ALL = [], CM_FILT = [], CM_SHOWN = 0, CM_CONT = {}, CM_PLANT = '';
+const CM_BATCH = 60;
+
+function cmEstadoClass(e) {
+  const x = String(e || '').toUpperCase();
+  if (x === 'ASIGNADO') return 'cm-asgn';   // Lote B1
+  if (x === 'CUMPLIDO') return 'cm-cump';
+  if (x === 'DESCARTADO') return 'cm-desc';
+  return 'cm-pend';
+}
+
+/* Texto listo para WhatsApp (plantilla del servidor).
+   Igual que en Líderes: el %0A ya no se usa, el replace es red de seguridad. */
+function cmWaText(c) {
+  const t = CM_PLANT || '';
+  return t.replace(/\[ASIGNADO\]/g, c.asignado || '')
+    .replace(/\[COMPROMISO\]/g, c.compromiso || '')
+    .replace(/\[NOMBRE\]/g, c.nombre || '')
+    .replace(/\[CONTACTO\]/g, c.contacto || '')
+    .replace(/%0A/g, '\n');
+}
+
+/* Antigüedad: días transcurridos desde la fecha del compromiso */
+function cmDias(c) {
+  if (!c.ts) return null;
+  const hoy = new Date(); hoy.setHours(0, 0, 0, 0);
+  const d = new Date(c.ts); d.setHours(0, 0, 0, 0);
+  return Math.max(0, Math.round((hoy - d) / 86400000));
+}
+function cmAntigHtml(c) {
+  const n = cmDias(c);
+  if (n === null) return '';
+  const txt = n === 0 ? 'hoy' : n === 1 ? 'hace 1 día' : `hace ${n.toLocaleString('es-CO')} días`;
+  if (c.estado !== 'PENDIENTE') return `<span class="cm-antig">${I.clock} ${esc(txt)}</span>`;
+  const nivel = n > 30 ? 'cm-a3' : n > 7 ? 'cm-a2' : 'cm-a1';
+  return `<span class="cm-antig ${nivel}">${I.clock} ${esc(txt)}</span>`;
+}
+
+function cmCardHtml(c) {
+  return `<article class="bd-card cm-card ${cmEstadoClass(c.estado)}" data-id="${esc(c.id)}">
+    <div class="bd-top">
+      ${avatarHtml(c.nombre, c.foto)}
+      <div class="bd-id">
+        <b class="bd-nombre">${esc(c.nombre || 'Sin nombre')}</b>
+        <span class="bd-doc">${esc(c.residencia || '—')}</span>
+      </div>
+      <span class="cm-badge ${cmEstadoClass(c.estado)}">${esc(c.estado)}</span>
+    </div>
+    <p class="cm-texto">${esc(c.compromiso || '—')}</p>
+    ${cmSubHtml(c)}
+    <div class="cm-foot">
+      <span class="cm-asig">${c.asignado ? avatarHtml(c.asignado, c.fotoAsg, 'av-xs') : I.star} <b>${esc(c.asignado || 'Sin asignar')}</b></span>
+      ${cmAntigHtml(c)}
+    </div>
+    <div class="bd-acts cm-acts">
+      <button class="bd-btn" data-a="estado">Estado</button>
+      <button class="bd-btn" data-a="detalles">Detalles</button>
+      <button class="bd-btn cm-btn-send" data-a="enviar" ${c.telefono ? '' : 'disabled'}>Enviar</button>
+      <button class="bd-btn" data-a="editar">Editar</button>
+      <button class="bd-btn bd-btn-danger" data-a="eliminar">Eliminar</button>
+    </div>
+  </article>`;
+}
+
+/* Lote B1: línea de creador + resumen de bitácora bajo el texto de la tarjeta */
+function cmSubHtml(c) {
+  const partes = [];
+  if (c.usuarioNombre) partes.push(`<span class="cm-creador">${I.users} Creado por <b>${esc(c.usuarioNombre)}</b></span>`);
+  const n = (c.traza || []).length;
+  if (n) partes.push(`<span class="cm-tzcount" title="${esc(c.trazaResumen || '')}">${I.pencil} ${n} en bitácora</span>`);
+  return partes.length ? `<div class="cm-sub">${partes.join('')}</div>` : '';
+}
+
+/* Lote B1: pinta el hilo de bitácora (entradas ya formateadas por el CORE) */
+function cmTzListHtml(entries) {
+  if (!entries || !entries.length) return `<p class="muted small tz-empty">Sin entradas en la bitácora todavía.</p>`;
+  return entries.map(e => `<div class="tz-item ${e.origen === 'pub' ? 'tz-pub' : 'tz-priv'}">
+    <div class="tz-meta"><b>${esc(e.autor || (e.origen === 'pub' ? 'Líder' : 'Panel'))}</b><span>${esc(e.fecha || '')}</span></div>
+    <p class="tz-texto">${esc(e.texto || '')}</p>
+  </div>`).join('');
+}
+
+function cmResumenHtml() {
+  const a = CM_CONT.ASIGNADO || 0, p = CM_CONT.PENDIENTE || 0, cu = CM_CONT.CUMPLIDO || 0, d = CM_CONT.DESCARTADO || 0;
+  const tot = a + p + cu + d;
+  const pct = tot ? Math.round((cu / tot) * 100) : 0;
+  return `<div class="cm-resumen">
+    <div class="cm-kpis cm-kpis-4">
+      <button class="cm-kpi cm-asgn" data-f="Asignado"><b>${a.toLocaleString('es-CO')}</b><span>Asignados</span></button>
+      <button class="cm-kpi cm-pend" data-f="Pendiente"><b>${p.toLocaleString('es-CO')}</b><span>Pendientes</span></button>
+      <button class="cm-kpi cm-cump" data-f="Cumplido"><b>${cu.toLocaleString('es-CO')}</b><span>Cumplidos</span></button>
+      <button class="cm-kpi cm-desc" data-f="Descartado"><b>${d.toLocaleString('es-CO')}</b><span>Descartados</span></button>
+    </div>
+    <div class="cm-prog">
+      <div class="cm-prog-top"><span>Cumplimiento</span><b>${pct}%</b></div>
+      <div class="cm-bar"><i style="width:${pct}%"></i></div>
+    </div>
+  </div>`;
+}
+
+async function viewCompromisos(user) {
+  M5_ME = user.documento; appWide(true, true);
+  app.innerHTML = `${backbar('Compromisos')}
+    <div class="pad">
+      <div id="cm-resumen"></div>
+      <div class="bd-toolbar">
+        <div class="bd-search"><input class="input" id="cm-q" placeholder="Buscar por persona, compromiso, asignado, creador o zona…" autocomplete="off" /></div>
+        <button class="btn btn-primary bd-add" id="cm-add">+ Agregar</button>
+      </div>
+      <div class="cm-nav-sol"><button class="btn btn-ghost btn-block" id="cm-ir-sol">${I.repeat} Ir a Solicitudes</button></div>
+      <div class="bd-chips" id="cm-chips">
+        ${['Todos', 'Asignado', 'Pendiente', 'Cumplido', 'Descartado'].map((t, i) => `<button class="bd-chip ${i === 0 ? 'active' : ''}" data-f="${esc(t)}">${esc(t)}</button>`).join('')}
+      </div>
+      <div class="bd-count" id="cm-count"></div>
+      <div id="cm-body">${loadingBox('Cargando compromisos…')}</div>
+      <div class="center" id="cm-more" style="margin-top:12px;"></div>
+    </div>`;
+  app.hidden = false; hideSplash();
+  $('#backbtn').onclick = () => go('home');
+  $('#cm-add').onclick = () => cmAgregar();
+  const irSol = $('#cm-ir-sol'); if (irSol) irSol.onclick = () => go('solicitudes');
+  const q = $('#cm-q'); let t;
+  q.oninput = () => { clearTimeout(t); t = setTimeout(cmApplyFilter, 160); };
+  $$('#cm-chips .bd-chip').forEach(ch => ch.onclick = () => cmSetFilter(ch.dataset.f));
+  let primera = true;
+  try {
+    await rapCargar('priv.compromisos', m5Auth(), (r) => {
+      if (!$('#cm-body')) return;
+      if (!r || r.ok === false) { if (primera) $('#cm-body').innerHTML = `<p class="muted center">No se pudo cargar.</p>`; return; }
+      CM_ALL = r.items || []; CM_CONT = r.contadores || {}; CM_PLANT = r.plantilla || '';
+      primera = false;
+      cmPintarResumen();
+      cmApplyFilter();
+    });
+  } catch (e) { if ($('#cm-body') && primera) $('#cm-body').innerHTML = `${fallaHtml(e)}`; return; }
+
+  vivoBind('compromisos', M5_ME, vivoCompromisos);   // EN VIVO
+}
+
+/* ---- EN VIVO · Compromisos ---- */
+async function vivoCompromisos(rev) {
+  const r = await api('priv.compromisos', Object.assign(m5Auth(), RAP.params()), 'GET', null, SILENCIO);
+  if (!r || r.ok === false) return;
+  RAP.guardar('priv.compromisos', r, r.__rapCrudo || r);
+  if (!vivoCambio(JSON.stringify(r.items))) return;
+  CM_ALL = r.items || []; CM_CONT = r.contadores || {}; CM_PLANT = r.plantilla || CM_PLANT;
+  cmPintarResumen(); cmApplyFilter();
+  /* Lote B1: si hay una bitácora abierta escribiéndose, NO se cierra la hoja
+     (se perdería el borrador). El listado de abajo sí se refresca en silencio. */
+  if (!document.querySelector('#cm-tz-in')) vivoCerrarHoja(rev);
+}
+
+function cmPintarResumen() {
+  const el = $('#cm-resumen'); if (!el) return;
+  el.innerHTML = cmResumenHtml();
+  el.querySelectorAll('.cm-kpi').forEach(k => k.onclick = () => cmSetFilter(k.dataset.f));
+}
+function cmSetFilter(f) {
+  const chips = $$('#cm-chips .bd-chip');
+  const activo = (($('#cm-chips .bd-chip.active') || {}).dataset || {}).f;
+  const destino = (activo === f) ? 'Todos' : f;   // volver a tocar = quitar filtro
+  chips.forEach(x => x.classList.toggle('active', x.dataset.f === destino));
+  cmApplyFilter();
+}
+function cmActiveFilter() { const a = $('#cm-chips .bd-chip.active'); return a ? a.dataset.f : 'Todos'; }
+
+function cmApplyFilter() {
+  const q = (($('#cm-q') || {}).value || '').trim().toLowerCase();
+  const f = cmActiveFilter().toUpperCase();
+  CM_FILT = CM_ALL.filter(c => {
+    if (f !== 'TODOS' && String(c.estado).toUpperCase() !== f) return false;
+    if (!q) return true;
+    const hay = ((c.nombre || '') + ' ' + (c.compromiso || '') + ' ' + (c.asignado || '') + ' ' + (c.residencia || '') + ' ' + (c.contacto || '') + ' ' + (c.usuarioNombre || '')).toLowerCase();
+    return hay.includes(q);
+  });
+  CM_FILT.sort((a, b) => (b.ts || 0) - (a.ts || 0));   // más reciente primero
+  CM_SHOWN = 0;
+  const cEl = $('#cm-count'); if (cEl) cEl.textContent = `${CM_FILT.length.toLocaleString('es-CO')} compromiso(s) · del más reciente al más antiguo`;
+  const body = $('#cm-body');
+  if (body) body.innerHTML = CM_FILT.length ? `<div class="bd-grid" id="cm-grid"></div>` : `<p class="muted center" style="margin-top:20px;">Sin compromisos para este filtro.</p>`;
+  cmRenderMore();
+}
+function cmRenderMore() {
+  const grid = $('#cm-grid'); if (!grid) { const m = $('#cm-more'); if (m) m.innerHTML = ''; return; }
+  const next = CM_FILT.slice(CM_SHOWN, CM_SHOWN + CM_BATCH);
+  grid.insertAdjacentHTML('beforeend', next.map(cmCardHtml).join(''));
+  CM_SHOWN += next.length;
+  $$('#cm-grid .cm-card').forEach(card => {
+    if (card._wired) return; card._wired = true;
+    card.querySelectorAll('.bd-btn').forEach(b => b.onclick = () => cmAccion(b.dataset.a, card.dataset.id));
+  });
+  const more = $('#cm-more');
+  if (CM_SHOWN < CM_FILT.length) { more.innerHTML = `<button class="btn btn-ghost" id="cm-more-btn">Ver más (${(CM_FILT.length - CM_SHOWN).toLocaleString('es-CO')} restantes)</button>`; $('#cm-more-btn').onclick = cmRenderMore; }
+  else more.innerHTML = '';
+}
+function cmFind(id) { return CM_ALL.find(x => String(x.id) === String(id)); }
+function cmRecontar() {
+  rapSync('priv.compromisos', CM_ALL);   // toda escritura pasa por aquí
+  CM_CONT = { ASIGNADO: 0, PENDIENTE: 0, CUMPLIDO: 0, DESCARTADO: 0 };
+  CM_ALL.forEach(c => { CM_CONT[c.estado] = (CM_CONT[c.estado] || 0) + 1; });
+  cmPintarResumen();
+}
+function cmUpsert(card) {
+  const i = CM_ALL.findIndex(x => String(x.id) === String(card.id));
+  if (i >= 0 && card.foto === undefined) { card.foto = CM_ALL[i].foto; if (card.asignado === CM_ALL[i].asignado) card.fotoAsg = CM_ALL[i].fotoAsg; }
+  if (i >= 0) CM_ALL[i] = card; else CM_ALL.push(card);
+  CM_ALL.sort((a, b) => (a.ts || 0) - (b.ts || 0));   // más antiguo primero
+  cmRecontar(); cmApplyFilter();
+}
+function cmAccion(a, id) {
+  if (a === 'estado') return cmEstadoPicker(id);
+  if (a === 'detalles') return cmDetalles(id);
+  if (a === 'enviar') return cmEnviar(id);
+  if (a === 'editar') return cmEditar(id);
+  if (a === 'eliminar') return cmEliminar(id);
+}
+
+/* ---- Detalles (+ copiar) ---- */
+function cmTextoCopia(c) {
+  const L = [];
+  L.push(`📌 COMPROMISO — ${c.estado}`);
+  L.push(`Persona: ${c.nombre}`);
+  if (c.residencia) L.push(`Zona: ${c.residencia}`);
+  if (c.contacto) L.push(`Contacto: ${String(c.contacto).replace(/^57/, '')}`);
+  L.push(`\n${c.compromiso}`);
+  L.push(`\nAsignado: ${c.asignado || '—'}`);
+  if (c.fecha) L.push(`Registrado: ${fmtCreada(c.fecha)}`);
+  return L.join('\n');
+}
+async function cmDetalles(id) {
+  openSheet(`<div class="grip"></div><h2 class="h2">Compromiso</h2>${loadingBox('Cargando…')}`);
+  let c;
+  try { const r = await api('priv.compromisoVer', { id, ...m5Auth() }); if (!r.ok) { closeLayer(); return toast(r.msg || 'No se pudo cargar', 'err'); } c = r.compromiso; }
+  catch (e) { closeLayer(); return fallaRed(e); }
+  const dias = cmDias(c);
+  const rows = [
+    ['Estado', c.estado],
+    ['Persona', c.nombre || '—'],
+    ['Zona', c.residencia || '—'],
+    ['Contacto', c.contacto ? String(c.contacto).replace(/^57/, '') : '—'],
+    ['Compromiso', c.compromiso || '—'],
+    ['Asignado', c.asignado || '—'],
+    ['Tel. asignado', c.telefono ? String(c.telefono).replace(/^57/, '') : '—'],
+    ['Creado por', c.usuarioNombre || '—'],
+    ['Registrado', c.fecha ? fmtCreada(c.fecha) : '—'],
+    ['Antigüedad', dias === null ? '—' : (dias === 0 ? 'hoy' : dias + ' día(s)')],
+    ['ID', c.id]
+  ].map(([k, v]) => `<div class="det-row"><span>${esc(k)}</span><b>${esc(v)}</b></div>`).join('');
+  openSheet(`<div class="grip"></div>
+    <div class="det-head"><h2 class="h2">${esc(c.nombre)}</h2><span class="cm-badge ${cmEstadoClass(c.estado)}">${esc(c.estado)}</span></div>
+    <div class="det-list">${rows}</div>
+    <div class="tz-wrap" id="cm-tz">
+      <div class="tz-head"><span>${I.pencil} Bitácora / trazabilidad</span><em id="cm-tz-res">${esc(c.trazaResumen || '')}</em></div>
+      <div class="tz-list" id="cm-tz-list">${cmTzListHtml(c.traza)}</div>
+      <textarea class="input ta" id="cm-tz-in" rows="2" placeholder="Escribe una entrada de la bitácora…"></textarea>
+      <button class="btn btn-ghost btn-block" id="cm-tz-add">${I.plus} Agregar a la bitácora</button>
+    </div>
+    <div class="stack" style="margin-top:12px;">
+      <button class="btn btn-ghost btn-block" id="cm-copy">${I.copy} Copiar en portapapeles</button>
+      <button class="btn btn-primary btn-block" id="cm-edit">Editar</button>
+    </div>`);
+  $('#cm-copy').onclick = async () => { try { await navigator.clipboard.writeText(cmTextoCopia(c)); toast('Compromiso copiado', 'ok'); } catch { toast('No se pudo copiar', 'err'); } };
+  $('#cm-edit').onclick = () => { closeLayer(); cmEditar(id); };
+  $('#cm-tz-add').onclick = () => cmTzAgregar(id);
+}
+
+/* ---- Apendar una entrada a la bitácora (motor priv.compromisoTraza) · Lote B1 ---- */
+async function cmTzAgregar(id) {
+  const inp = $('#cm-tz-in'); if (!inp) return;
+  const texto = (inp.value || '').trim();
+  if (!texto) return toast('Escribe la entrada de la bitácora', 'err');
+  const btn = $('#cm-tz-add'); if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner spinner-brand"></span>'; }
+  try {
+    const r = await api('priv.compromisoTraza', {}, 'POST', { id, texto, ...m5Auth() });
+    if (!r.ok) { toast(r.msg || 'No se pudo guardar', 'err'); return; }
+    inp.value = '';
+    const list = $('#cm-tz-list'); if (list) list.innerHTML = cmTzListHtml(r.entries);
+    const res = $('#cm-tz-res'); if (res) res.textContent = r.resumen || '';
+    if (r.card) cmUpsert(r.card);   // refresca tarjeta/contadores por debajo (sin cerrar la hoja)
+    toast('Bitácora actualizada', 'ok');
+  } catch (e) { fallaRed(e); }
+  finally { if ($('#cm-tz-add')) { const b = $('#cm-tz-add'); b.disabled = false; b.innerHTML = `${I.plus} Agregar a la bitácora`; } }
+}
+
+/* ---- Cambiar estado ---- */
+function cmEstadoPicker(id) {
+  const c = cmFind(id); if (!c) return toast('Compromiso no encontrado', 'err');
+  const opts = [['ASIGNADO', 'cm-asgn'], ['PENDIENTE', 'cm-pend'], ['CUMPLIDO', 'cm-cump'], ['DESCARTADO', 'cm-desc']];
+  openSheet(`<div class="grip"></div><h2 class="h2" style="margin-bottom:4px;">Cambiar estado</h2>
+    <p class="muted small">${esc(c.nombre)} · ${esc((c.compromiso || '').slice(0, 60))}${(c.compromiso || '').length > 60 ? '…' : ''}</p>
+    <div class="estado-opts">${opts.map(([e, cl]) => `<button class="estado-opt ${cl} ${String(c.estado).toUpperCase() === e ? 'sel' : ''}" data-e="${e}">${e}</button>`).join('')}</div>`);
+  layer.querySelectorAll('.estado-opt').forEach(b => b.onclick = async () => {
+    if (b.classList.contains('sel')) return closeLayer();
+    layer.querySelectorAll('.estado-opt').forEach(x => x.disabled = true);
+    try {
+      const r = await api('priv.compromisoEstado', {}, 'POST', { id, estado: b.dataset.e, ...m5Auth() });
+      if (!r.ok) { toast(r.msg || 'No se pudo cambiar', 'err'); layer.querySelectorAll('.estado-opt').forEach(x => x.disabled = false); return; }
+      closeLayer(); toast('Estado actualizado', 'ok'); cmUpsert(r.card);
+    } catch (e) { fallaRed(e); layer.querySelectorAll('.estado-opt').forEach(x => x.disabled = false); }
+  });
+}
+
+/* ---- Enviar al asignado (WhatsApp directo o bot), con vista previa editable ---- */
+async function cmEnviar(id) {
+  openSheet(`<div class="grip"></div><h2 class="h2">Enviar compromiso</h2>${loadingBox('Preparando mensaje…')}`);
+  let c;
+  try { const r = await api('priv.compromisoVer', { id, ...m5Auth() }); if (!r.ok) { closeLayer(); return toast(r.msg || 'No se pudo cargar', 'err'); } c = r.compromiso; }
+  catch (e) { closeLayer(); return fallaRed(e); }
+  if (!c.telefono) { closeLayer(); return toast('El asignado no tiene teléfono registrado', 'err'); }
+  const texto = (c.mensaje ? c.mensaje.replace(/%0A/g, '\n') : cmWaText(c));
+  openSheet(`<div class="grip"></div>
+    <h2 class="h2" style="margin-bottom:4px;">Enviar compromiso</h2>
+    <p class="muted small">Para <b>${esc(c.asignado)}</b> · ${esc(String(c.telefono).replace(/^57/, ''))}</p>
+    ${field('Mensaje (puedes ajustarlo antes de enviar)', `<textarea class="input ta cm-prev" id="cm-msg" rows="9"></textarea>`)}
+    <div class="ag-wa-row">
+      <button class="btn btn-primary" id="cm-wa-dir">${I.wa} WhatsApp directo</button>
+      <button class="btn btn-ghost" id="cm-wa-bot">Enviar por bot</button>
+    </div>`);
+  $('#cm-msg').value = texto;
+  $('#cm-wa-dir').onclick = () => ldWaOpen(c.telefono, $('#cm-msg').value);
+  $('#cm-wa-bot').onclick = () => cmWaBot(c);
+}
+/* Bot con doble toque de confirmación (mismo patrón que Líderes/Agenda) */
+function cmWaBot(c) {
+  const b = $('#cm-wa-bot'); if (!b || b.disabled) return;
+  if (!b._armed) {
+    b._armed = true; b.dataset.orig = b.innerHTML; b.classList.add('ld-armed'); b.textContent = '¿Confirmar envío?';
+    b._t = setTimeout(() => { b._armed = false; b.classList.remove('ld-armed'); b.innerHTML = b.dataset.orig; }, 3500);
+    return;
+  }
+  clearTimeout(b._t); b._armed = false; b.classList.remove('ld-armed'); b.disabled = true;
+  b.innerHTML = '<span class="spinner spinner-brand"></span>';
+  api('priv.compromisoWaBot', {}, 'POST', { id: c.id, texto: ($('#cm-msg') || {}).value || '', ...m5Auth() })
+    .then(r => { toast(r.msg || (r.ok ? 'Enviado' : 'No se pudo enviar'), r.ok ? 'ok' : 'err'); if (r.ok) closeLayer(); })
+    .catch((e) => fallaRed(e))
+    .finally(() => { if ($('#cm-wa-bot')) { b.disabled = false; b.innerHTML = b.dataset.orig || 'Enviar por bot'; } });
+}
+
+/* ---- Combo de persona de PRINCIPAL que además guarda el DOCUMENTO ---- */
+function cmPersonaCombo(idName, idInfo) {
+  const input = $('#' + idName), list = $('#' + idName + '-list'); if (!input) return;
+  let t = null;
+  const info = idInfo ? $('#' + idInfo) : null;
+  const paint = (items) => {
+    list.innerHTML = items.length
+      ? items.map(o => `<button type="button" class="combo-opt" data-doc="${esc(o.documento)}" data-nom="${esc(o.nombre)}" data-tel="${esc(o.contacto || '')}">${esc(o.nombre)} <span class="combo-sub">CC ${esc(o.documento)}</span></button>`).join('')
+      : `<div class="combo-empty">Sin resultados en la base</div>`;
+    list.querySelectorAll('.combo-opt').forEach(b => b.onclick = () => {
+      input.value = b.dataset.nom; input.dataset.doc = b.dataset.doc; list.hidden = true;
+      if (info) info.textContent = b.dataset.tel ? ('Tel. ' + b.dataset.tel) : 'Sin teléfono en la base';
+    });
+    list.hidden = false;
+  };
+  input.oninput = () => {
+    input.dataset.doc = '';                       // al escribir libre se pierde el vínculo
+    if (info) info.textContent = '';
+    clearTimeout(t); const q = input.value.trim();
+    if (q.length < 2) { list.hidden = true; return; }
+    t = setTimeout(async () => {
+      try { const r = await api('priv.contactoBuscar', { q, ...m5Auth() }); paint((r && r.items) || []); }
+      catch (e) { list.hidden = true; }
+    }, 240);
+  };
+  input.onfocus = () => { if (input.value.trim().length >= 2 && !input.dataset.doc) input.oninput(); };
+}
+
+/* ---- Formulario Agregar / Editar ---- */
+function cmFormHtml(titulo, c) {
+  c = c || {};
+  return `<div class="grip"></div><h2 class="h2" style="margin-bottom:10px;">${esc(titulo)}</h2>
+    <div class="stack">
+      ${field('Nombre (de la base)', comboboxHtml('cm-fnom', 'Busca por nombre o documento…') + `<p class="muted small cm-hint" id="cm-fnom-info"></p>`)}
+      ${field('Compromiso', `<textarea class="input ta" id="cm-fcomp" rows="4" placeholder="¿Qué se comprometió a hacer?"></textarea>`)}
+      ${field('Asignado (de la base)', comboboxHtml('cm-fasig', 'Busca por nombre o documento…') + `<p class="muted small cm-hint" id="cm-fasig-info"></p>`)}
+      ${c.id ? '' : `<p class="muted small">La fecha y la hora se registran automáticamente.</p>`}
+      <button class="btn btn-primary btn-block" id="cm-save">${c.id ? 'Guardar cambios' : 'Crear compromiso'}</button>
+    </div>`;
+}
+function cmFillForm(c) {
+  $('#cm-fnom').value = c.nombre || '';
+  $('#cm-fcomp').value = c.compromiso || '';
+  $('#cm-fasig').value = c.asignado || '';
+  if (c.contacto) $('#cm-fnom-info').textContent = 'Tel. ' + String(c.contacto).replace(/^57/, '');
+  if (c.telefono) $('#cm-fasig-info').textContent = 'Tel. ' + String(c.telefono).replace(/^57/, '');
+  cmPersonaCombo('cm-fnom', 'cm-fnom-info');
+  cmPersonaCombo('cm-fasig', 'cm-fasig-info');
+}
+function cmReadForm() {
+  return {
+    nombre: val('cm-fnom'),
+    nombreDoc: (($('#cm-fnom') || {}).dataset || {}).doc || '',
+    compromiso: (($('#cm-fcomp') || {}).value || '').trim(),
+    asignado: val('cm-fasig'),
+    asignadoDoc: (($('#cm-fasig') || {}).dataset || {}).doc || ''
+  };
+}
+function cmValidForm(b) {
+  if (!b.nombre) { toast('Elige el nombre de la persona', 'err'); return false; }
+  if (!b.compromiso) { toast('Escribe el compromiso', 'err'); return false; }
+  if (!b.asignado) { toast('Elige el asignado', 'err'); return false; }
+  return true;
+}
+function cmAgregar() {
+  openSheet(cmFormHtml('Nuevo compromiso', {}));
+  cmFillForm({});
+  $('#cm-save').onclick = async () => {
+    const b = cmReadForm(); if (!cmValidForm(b)) return;
+    const btn = $('#cm-save'); saving(btn, true);
+    try {
+      const r = await api('priv.compromisoGuardar', {}, 'POST', { ...b, ...m5Auth() });
+      saving(btn, false);
+      if (!r.ok) return toast(r.msg || 'No se pudo crear', 'err');
+      closeLayer(); toast('Compromiso creado', 'ok');
+      if (($('#cm-q') || {}).value) $('#cm-q').value = '';
+      $$('#cm-chips .bd-chip').forEach((x, i) => x.classList.toggle('active', i === 0));
+      cmUpsert(r.card);
+    } catch (e) { saving(btn, false); fallaRed(e); }
+  };
+}
+async function cmEditar(id) {
+  openSheet(`<div class="grip"></div><h2 class="h2">Editar compromiso</h2>${loadingBox('Cargando…')}`);
+  let c;
+  try { const r = await api('priv.compromisoVer', { id, ...m5Auth() }); if (!r.ok) { closeLayer(); return toast(r.msg, 'err'); } c = r.compromiso; }
+  catch (e) { closeLayer(); return fallaRed(e); }
+  openSheet(cmFormHtml('Editar compromiso', c));
+  cmFillForm(c);
+  $('#cm-save').onclick = async () => {
+    const b = cmReadForm(); if (!cmValidForm(b)) return;
+    const btn = $('#cm-save'); saving(btn, true);
+    try {
+      const r = await api('priv.compromisoEditar', {}, 'POST', { id, ...b, ...m5Auth() });
+      saving(btn, false);
+      if (!r.ok) return toast(r.msg || 'No se pudo guardar', 'err');
+      closeLayer(); toast('Compromiso actualizado', 'ok'); cmUpsert(r.card);
+    } catch (e) { saving(btn, false); fallaRed(e); }
+  };
+}
+async function cmEliminar(id) {
+  const c = cmFind(id); if (!c) return toast('Compromiso no encontrado', 'err');
+  const ok = await confirmar('¿Eliminar este compromiso?', crow('Persona', c.nombre) + crow('Compromiso', (c.compromiso || '').slice(0, 80)) + `<p class="muted small" style="margin-top:8px;">Esta acción no se puede deshacer.</p>`);
+  if (!ok) return;
+  try {
+    const r = await api('priv.compromisoEliminar', {}, 'POST', { id, ...m5Auth() });
+    if (!r.ok) return toast(r.msg || 'No se pudo eliminar', 'err');
+    CM_ALL = CM_ALL.filter(x => String(x.id) !== String(id));
+    cmRecontar(); cmApplyFilter(); toast('Compromiso eliminado', 'ok');
+  } catch (e) { fallaRed(e); }
+}
+
+/* ============================================================
+   SOLICITUDES (app privada · Lote B1·F)
+   Gemela liviana de Compromisos: la crea el panel y va dirigida a un LÍDER.
+   Reutiliza estilos cm-*, el hilo tz-* y el combo de la base.
+   ============================================================ */
+let SL_ALL = [], SL_FILT = [], SL_SHOWN = 0, SL_CONT = {}, SL_ME = '';
+const SL_BATCH = 60;
+
+function slResumenHtml() {
+  const a = SL_CONT.ASIGNADO || 0, p = SL_CONT.PENDIENTE || 0, cu = SL_CONT.CUMPLIDO || 0, d = SL_CONT.DESCARTADO || 0;
+  const tot = a + p + cu + d, pct = tot ? Math.round((cu / tot) * 100) : 0;
+  return `<div class="cm-resumen">
+    <div class="cm-kpis cm-kpis-4">
+      <button class="cm-kpi cm-asgn" data-f="Asignado"><b>${a.toLocaleString('es-CO')}</b><span>Asignadas</span></button>
+      <button class="cm-kpi cm-pend" data-f="Pendiente"><b>${p.toLocaleString('es-CO')}</b><span>Pendientes</span></button>
+      <button class="cm-kpi cm-cump" data-f="Cumplido"><b>${cu.toLocaleString('es-CO')}</b><span>Cumplidas</span></button>
+      <button class="cm-kpi cm-desc" data-f="Descartado"><b>${d.toLocaleString('es-CO')}</b><span>Descartadas</span></button>
+    </div>
+    <div class="cm-prog">
+      <div class="cm-prog-top"><span>Cumplimiento</span><b>${pct}%</b></div>
+      <div class="cm-bar"><i style="width:${pct}%"></i></div>
+    </div>
+  </div>`;
+}
+
+function slCardHtml(c) {
+  const n = (c.traza || []).length;
+  return `<article class="bd-card cm-card ${cmEstadoClass(c.estado)}" data-id="${esc(c.id)}">
+    <div class="bd-top">
+      ${avatarHtml(c.asignado || '?', c.fotoAsg)}
+      <div class="bd-id"><b class="bd-nombre">${esc(c.asignado || 'Sin asignar')}</b><span class="bd-doc">Asignado</span></div>
+      <span class="cm-badge ${cmEstadoClass(c.estado)}">${esc(c.estado)}</span>
+    </div>
+    <p class="cm-texto">${esc(c.solicitud || '—')}</p>
+    <div class="cm-sub">
+      ${c.usuarioNombre ? `<span class="cm-creador">${I.users} Creado por <b>${esc(c.usuarioNombre)}</b></span>` : ''}
+      ${n ? `<span class="cm-tzcount" title="${esc(c.trazaResumen || '')}">${I.pencil} ${n} en bitácora</span>` : ''}
+    </div>
+    <div class="bd-acts cm-acts">
+      <button class="bd-btn" data-a="estado">Estado</button>
+      <button class="bd-btn" data-a="detalles">Detalles</button>
+      <button class="bd-btn cm-btn-send" data-a="enviar" ${c.telefono ? '' : 'disabled'}>Enviar</button>
+      <button class="bd-btn" data-a="editar">Editar</button>
+      <button class="bd-btn bd-btn-danger" data-a="eliminar">Eliminar</button>
+    </div>
+  </article>`;
+}
+
+async function viewSolicitudes(user) {
+  SL_ME = user.documento; appWide(true, true);
+  app.innerHTML = `${backbar('Solicitudes')}
+    <div class="pad">
+      <div id="sl-resumen"></div>
+      <div class="bd-toolbar">
+        <div class="bd-search"><input class="input" id="sl-q" placeholder="Buscar por solicitud, asignado o creador…" autocomplete="off" /></div>
+        <button class="btn btn-primary bd-add" id="sl-add">+ Nueva</button>
+      </div>
+      <div class="cm-nav-sol"><button class="btn btn-ghost btn-block" id="sl-ir-com">${I.repeat} Ir a Compromisos</button></div>
+      <div class="bd-chips" id="sl-chips">
+        ${['Todos', 'Asignado', 'Pendiente', 'Cumplido', 'Descartado'].map((t, i) => `<button class="bd-chip ${i === 0 ? 'active' : ''}" data-f="${esc(t)}">${esc(t)}</button>`).join('')}
+      </div>
+      <div class="bd-count" id="sl-count"></div>
+      <div id="sl-body">${loadingBox('Cargando solicitudes…')}</div>
+      <div class="center" id="sl-more" style="margin-top:12px;"></div>
+    </div>`;
+  app.hidden = false; hideSplash();
+  $('#backbtn').onclick = () => go('compromisos');
+  $('#sl-add').onclick = () => slAgregar();
+  $('#sl-ir-com').onclick = () => go('compromisos');
+  const q = $('#sl-q'); let t;
+  q.oninput = () => { clearTimeout(t); t = setTimeout(slApplyFilter, 160); };
+  $$('#sl-chips .bd-chip').forEach(ch => ch.onclick = () => slSetFilter(ch.dataset.f));
+  let primera = true;
+  try {
+    await rapCargar('priv.solicitudes', m5Auth(), (r) => {
+      if (!$('#sl-body')) return;
+      if (!r || r.ok === false) { if (primera) $('#sl-body').innerHTML = `<p class="muted center">No se pudo cargar.</p>`; return; }
+      SL_ALL = r.items || []; SL_CONT = r.contadores || {};
+      primera = false;
+      slPintarResumen(); slApplyFilter();
+    });
+  } catch (e) { if ($('#sl-body') && primera) $('#sl-body').innerHTML = `${fallaHtml(e)}`; return; }
+  vivoBind('solicitudes', SL_ME, vivoSolicitudes);
+}
+
+async function vivoSolicitudes(rev) {
+  const r = await api('priv.solicitudes', Object.assign(m5Auth(), RAP.params()), 'GET', null, SILENCIO);
+  if (!r || r.ok === false) return;
+  RAP.guardar('priv.solicitudes', r, r.__rapCrudo || r);
+  if (!vivoCambio(JSON.stringify(r.items))) return;
+  SL_ALL = r.items || []; SL_CONT = r.contadores || {};
+  slPintarResumen(); slApplyFilter();
+  if (!document.querySelector('#sl-tz-in')) vivoCerrarHoja(rev);
+}
+
+function slPintarResumen() {
+  const el = $('#sl-resumen'); if (!el) return;
+  el.innerHTML = slResumenHtml();
+  el.querySelectorAll('.cm-kpi').forEach(k => k.onclick = () => slSetFilter(k.dataset.f));
+}
+function slSetFilter(f) {
+  const chips = $$('#sl-chips .bd-chip');
+  const activo = (($('#sl-chips .bd-chip.active') || {}).dataset || {}).f;
+  const destino = (activo === f) ? 'Todos' : f;
+  chips.forEach(x => x.classList.toggle('active', x.dataset.f === destino));
+  slApplyFilter();
+}
+function slActiveFilter() { const a = $('#sl-chips .bd-chip.active'); return a ? a.dataset.f : 'Todos'; }
+function slApplyFilter() {
+  const q = (($('#sl-q') || {}).value || '').trim().toLowerCase();
+  const f = slActiveFilter().toUpperCase();
+  SL_FILT = SL_ALL.filter(c => {
+    if (f !== 'TODOS' && String(c.estado).toUpperCase() !== f) return false;
+    if (!q) return true;
+    return ((c.solicitud || '') + ' ' + (c.asignado || '') + ' ' + (c.usuarioNombre || '')).toLowerCase().includes(q);
+  });
+  SL_FILT.sort((a, b) => (b.ts || 0) - (a.ts || 0));
+  SL_SHOWN = 0;
+  const cEl = $('#sl-count'); if (cEl) cEl.textContent = `${SL_FILT.length.toLocaleString('es-CO')} solicitud(es) · de la más reciente a la más antigua`;
+  const body = $('#sl-body');
+  if (body) body.innerHTML = SL_FILT.length ? `<div class="bd-grid" id="sl-grid"></div>` : `<p class="muted center" style="margin-top:20px;">Sin solicitudes para este filtro.</p>`;
+  slRenderMore();
+}
+function slRenderMore() {
+  const grid = $('#sl-grid'); if (!grid) { const m = $('#sl-more'); if (m) m.innerHTML = ''; return; }
+  const next = SL_FILT.slice(SL_SHOWN, SL_SHOWN + SL_BATCH);
+  grid.insertAdjacentHTML('beforeend', next.map(slCardHtml).join(''));
+  SL_SHOWN += next.length;
+  $$('#sl-grid .cm-card').forEach(card => { if (card._wired) return; card._wired = true; card.querySelectorAll('.bd-btn').forEach(b => b.onclick = () => slAccion(b.dataset.a, card.dataset.id)); });
+  const more = $('#sl-more');
+  if (SL_SHOWN < SL_FILT.length) { more.innerHTML = `<button class="btn btn-ghost" id="sl-more-btn">Ver más (${(SL_FILT.length - SL_SHOWN).toLocaleString('es-CO')} restantes)</button>`; $('#sl-more-btn').onclick = slRenderMore; }
+  else more.innerHTML = '';
+}
+function slFind(id) { return SL_ALL.find(x => String(x.id) === String(id)); }
+function slRecontar() { rapSync('priv.solicitudes', SL_ALL); SL_CONT = { ASIGNADO: 0, PENDIENTE: 0, CUMPLIDO: 0, DESCARTADO: 0 }; SL_ALL.forEach(c => { SL_CONT[c.estado] = (SL_CONT[c.estado] || 0) + 1; }); slPintarResumen(); }
+function slUpsert(card) { const i = SL_ALL.findIndex(x => String(x.id) === String(card.id)); if (i >= 0 && card.fotoAsg === undefined && card.asignado === SL_ALL[i].asignado) card.fotoAsg = SL_ALL[i].fotoAsg; if (i >= 0) SL_ALL[i] = card; else SL_ALL.push(card); SL_ALL.sort((a, b) => (a.ts || 0) - (b.ts || 0)); slRecontar(); slApplyFilter(); }
+function slAccion(a, id) {
+  if (a === 'estado') return slEstadoPicker(id);
+  if (a === 'detalles') return slDetalle(id);
+  if (a === 'enviar') return slEnviar(id);
+  if (a === 'editar') return slEditar(id);
+  if (a === 'eliminar') return slEliminar(id);
+}
+
+/* Texto para copiar al portapapeles (gemelo de cmTextoCopia) */
+function slTextoCopia(c) {
+  const L = [];
+  L.push(`📌 SOLICITUD — ${c.estado}`);
+  L.push(`\n${c.solicitud}`);
+  L.push(`\nAsignado: ${c.asignado || '—'}`);
+  if (c.fecha) L.push(`Registrado: ${fmtCreada(c.fecha)}`);
+  return L.join('\n');
+}
+
+/* ---- Enviar al asignado (WhatsApp directo o bot) · gemelo de cmEnviar ---- */
+async function slEnviar(id) {
+  openSheet(`<div class="grip"></div><h2 class="h2">Enviar solicitud</h2>${loadingBox('Preparando mensaje…')}`);
+  let c;
+  try { const r = await api('priv.solicitudVer', { id, ...m5Auth() }); if (!r.ok) { closeLayer(); return toast(r.msg || 'No se pudo cargar', 'err'); } c = r.solicitud; }
+  catch (e) { closeLayer(); return fallaRed(e); }
+  if (!c.telefono) { closeLayer(); return toast('El asignado no tiene teléfono registrado', 'err'); }
+  const texto = (c.mensaje ? c.mensaje.replace(/%0A/g, '\n') : '');
+  openSheet(`<div class="grip"></div>
+    <h2 class="h2" style="margin-bottom:4px;">Enviar solicitud</h2>
+    <p class="muted small">Para <b>${esc(c.asignado)}</b> · ${esc(String(c.telefono).replace(/^57/, ''))}</p>
+    ${field('Mensaje (puedes ajustarlo antes de enviar)', `<textarea class="input ta cm-prev" id="sl-msg" rows="8"></textarea>`)}
+    <div class="ag-wa-row">
+      <button class="btn btn-primary" id="sl-wa-dir">${I.wa} WhatsApp directo</button>
+      <button class="btn btn-ghost" id="sl-wa-bot">Enviar por bot</button>
+    </div>`);
+  $('#sl-msg').value = texto;
+  $('#sl-wa-dir').onclick = () => ldWaOpen(c.telefono, $('#sl-msg').value);
+  $('#sl-wa-bot').onclick = () => slWaBot(c);
+}
+/* Bot con doble toque de confirmación (mismo patrón que compromisos) */
+function slWaBot(c) {
+  const b = $('#sl-wa-bot'); if (!b || b.disabled) return;
+  if (!b._armed) {
+    b._armed = true; b.dataset.orig = b.innerHTML; b.classList.add('ld-armed'); b.textContent = '¿Confirmar envío?';
+    b._t = setTimeout(() => { b._armed = false; b.classList.remove('ld-armed'); b.innerHTML = b.dataset.orig; }, 3500);
+    return;
+  }
+  clearTimeout(b._t); b._armed = false; b.classList.remove('ld-armed'); b.disabled = true;
+  b.innerHTML = '<span class="spinner spinner-brand"></span>';
+  api('priv.solicitudWaBot', {}, 'POST', { id: c.id, texto: ($('#sl-msg') || {}).value || '', ...m5Auth() })
+    .then(r => { toast(r.msg || (r.ok ? 'Enviado' : 'No se pudo enviar'), r.ok ? 'ok' : 'err'); if (r.ok) closeLayer(); })
+    .catch((e) => fallaRed(e))
+    .finally(() => { if ($('#sl-wa-bot')) { b.disabled = false; b.innerHTML = b.dataset.orig || 'Enviar por bot'; } });
+}
+
+async function slDetalle(id) {
+  openSheet(`<div class="grip"></div><h2 class="h2">Solicitud</h2>${loadingBox('Cargando…')}`);
+  let c;
+  try { const r = await api('priv.solicitudVer', { id, ...m5Auth() }); if (!r.ok) { closeLayer(); return toast(r.msg || 'No se pudo cargar', 'err'); } c = r.solicitud; }
+  catch (e) { closeLayer(); return fallaRed(e); }
+  const rows = [
+    ['Estado', c.estado],
+    ['Solicitud', c.solicitud || '—'],
+    ['Asignado', c.asignado || '—'],
+    ['Tel. asignado', c.telefono ? String(c.telefono).replace(/^57/, '') : '—'],
+    ['Creado por', c.usuarioNombre || '—'],
+    ['Registrado', c.fecha ? fmtCreada(c.fecha) : '—'],
+    ['ID', c.id]
+  ].map(([k, v]) => `<div class="det-row"><span>${esc(k)}</span><b>${esc(v)}</b></div>`).join('');
+  openSheet(`<div class="grip"></div>
+    <div class="det-head"><h2 class="h2">Solicitud</h2><span class="cm-badge ${cmEstadoClass(c.estado)}">${esc(c.estado)}</span></div>
+    <div class="det-list">${rows}</div>
+    <div class="tz-wrap" id="sl-tz">
+      <div class="tz-head"><span>${I.pencil} Bitácora / trazabilidad</span><em id="sl-tz-res">${esc(c.trazaResumen || '')}</em></div>
+      <div class="tz-list" id="sl-tz-list">${cmTzListHtml(c.traza)}</div>
+      <textarea class="input ta" id="sl-tz-in" rows="2" placeholder="Escribe una entrada de la bitácora…"></textarea>
+      <button class="btn btn-ghost btn-block" id="sl-tz-add">${I.plus} Agregar a la bitácora</button>
+    </div>
+    <div class="stack" style="margin-top:12px;">
+      <button class="btn btn-ghost btn-block" id="sl-copy">${I.copy} Copiar en portapapeles</button>
+      <button class="btn btn-primary btn-block" id="sl-edit">Editar</button>
+    </div>`);
+  $('#sl-copy').onclick = async () => { try { await navigator.clipboard.writeText(slTextoCopia(c)); toast('Solicitud copiada', 'ok'); } catch { toast('No se pudo copiar', 'err'); } };
+  $('#sl-edit').onclick = () => { closeLayer(); slEditar(id); };
+  $('#sl-tz-add').onclick = () => slTzAgregar(id);
+}
+
+async function slTzAgregar(id) {
+  const inp = $('#sl-tz-in'); if (!inp) return;
+  const texto = (inp.value || '').trim();
+  if (!texto) return toast('Escribe la entrada de la bitácora', 'err');
+  const btn = $('#sl-tz-add'); if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner spinner-brand"></span>'; }
+  try {
+    const r = await api('priv.solicitudTraza', {}, 'POST', { id, texto, ...m5Auth() });
+    if (!r.ok) { toast(r.msg || 'No se pudo guardar', 'err'); return; }
+    inp.value = '';
+    const list = $('#sl-tz-list'); if (list) list.innerHTML = cmTzListHtml(r.entries);
+    const res = $('#sl-tz-res'); if (res) res.textContent = r.resumen || '';
+    if (r.card) slUpsert(r.card);
+    toast('Bitácora actualizada', 'ok');
+  } catch (e) { fallaRed(e); }
+  finally { if ($('#sl-tz-add')) { const b = $('#sl-tz-add'); b.disabled = false; b.innerHTML = `${I.plus} Agregar a la bitácora`; } }
+}
+
+function slEstadoPicker(id) {
+  const c = slFind(id); if (!c) return toast('Solicitud no encontrada', 'err');
+  const opts = [['ASIGNADO', 'cm-asgn'], ['PENDIENTE', 'cm-pend'], ['CUMPLIDO', 'cm-cump'], ['DESCARTADO', 'cm-desc']];
+  openSheet(`<div class="grip"></div><h2 class="h2" style="margin-bottom:4px;">Cambiar estado</h2>
+    <p class="muted small">${esc((c.solicitud || '').slice(0, 70))}${(c.solicitud || '').length > 70 ? '…' : ''}</p>
+    <div class="estado-opts">${opts.map(([e, cl]) => `<button class="estado-opt ${cl} ${String(c.estado).toUpperCase() === e ? 'sel' : ''}" data-e="${e}">${e}</button>`).join('')}</div>`);
+  layer.querySelectorAll('.estado-opt').forEach(b => b.onclick = async () => {
+    if (b.classList.contains('sel')) return closeLayer();
+    layer.querySelectorAll('.estado-opt').forEach(x => x.disabled = true);
+    try {
+      const r = await api('priv.solicitudEstado', {}, 'POST', { id, estado: b.dataset.e, ...m5Auth() });
+      if (!r.ok) { toast(r.msg || 'No se pudo cambiar', 'err'); layer.querySelectorAll('.estado-opt').forEach(x => x.disabled = false); return; }
+      closeLayer(); toast('Estado actualizado', 'ok'); slUpsert(r.card);
+    } catch (e) { fallaRed(e); layer.querySelectorAll('.estado-opt').forEach(x => x.disabled = false); }
+  });
+}
+
+function slFormHtml(titulo, c) {
+  c = c || {};
+  return `<div class="grip"></div><h2 class="h2" style="margin-bottom:10px;">${esc(titulo)}</h2>
+    <div class="stack">
+      ${field('Solicitud', `<textarea class="input ta" id="sl-fsol" rows="4" placeholder="¿Qué le solicitas al líder?"></textarea>`)}
+      ${field('Asignado (de la base)', comboboxHtml('sl-fasig', 'Busca por nombre o documento…') + `<p class="muted small cm-hint" id="sl-fasig-info"></p>`)}
+      ${c.id ? '' : field('Bitácora (opcional)', `<textarea class="input ta" id="sl-fbita" rows="2" placeholder="Primera nota del hilo (opcional)"></textarea>`)}
+      ${c.id ? '' : `<p class="muted small">La fecha y la hora se registran automáticamente.</p>`}
+      <button class="btn btn-primary btn-block" id="sl-save">${c.id ? 'Guardar cambios' : 'Crear solicitud'}</button>
+    </div>`;
+}
+function slFillForm(c) {
+  $('#sl-fsol').value = c.solicitud || '';
+  $('#sl-fasig').value = c.asignado || '';
+  if (c.telefono) $('#sl-fasig-info').textContent = 'Tel. ' + String(c.telefono).replace(/^57/, '');
+  cmPersonaCombo('sl-fasig', 'sl-fasig-info');
+}
+function slReadForm() {
+  return {
+    solicitud: (($('#sl-fsol') || {}).value || '').trim(),
+    asignado: val('sl-fasig'),
+    asignadoDoc: (($('#sl-fasig') || {}).dataset || {}).doc || '',
+    bitacora: (($('#sl-fbita') || {}).value || '').trim()
+  };
+}
+function slValidForm(b) {
+  if (!b.solicitud) { toast('Escribe la solicitud', 'err'); return false; }
+  if (!b.asignado) { toast('Elige el asignado', 'err'); return false; }
+  return true;
+}
+function slAgregar() {
+  openSheet(slFormHtml('Nueva solicitud', {}));
+  slFillForm({});
+  $('#sl-save').onclick = async () => {
+    const b = slReadForm(); if (!slValidForm(b)) return;
+    const btn = $('#sl-save'); saving(btn, true);
+    try {
+      const r = await api('priv.solicitudGuardar', {}, 'POST', { ...b, ...m5Auth() });
+      saving(btn, false);
+      if (!r.ok) return toast(r.msg || 'No se pudo crear', 'err');
+      closeLayer(); toast('Solicitud creada', 'ok');
+      if (($('#sl-q') || {}).value) $('#sl-q').value = '';
+      $$('#sl-chips .bd-chip').forEach((x, i) => x.classList.toggle('active', i === 0));
+      slUpsert(r.card);
+    } catch (e) { saving(btn, false); fallaRed(e); }
+  };
+}
+async function slEditar(id) {
+  openSheet(`<div class="grip"></div><h2 class="h2">Editar solicitud</h2>${loadingBox('Cargando…')}`);
+  let c;
+  try { const r = await api('priv.solicitudVer', { id, ...m5Auth() }); if (!r.ok) { closeLayer(); return toast(r.msg, 'err'); } c = r.solicitud; }
+  catch (e) { closeLayer(); return fallaRed(e); }
+  openSheet(slFormHtml('Editar solicitud', c));
+  slFillForm(c);
+  $('#sl-save').onclick = async () => {
+    const b = slReadForm(); if (!slValidForm(b)) return;
+    const btn = $('#sl-save'); saving(btn, true);
+    try {
+      const r = await api('priv.solicitudEditar', {}, 'POST', { id, ...b, ...m5Auth() });
+      saving(btn, false);
+      if (!r.ok) return toast(r.msg || 'No se pudo guardar', 'err');
+      closeLayer(); toast('Solicitud actualizada', 'ok'); slUpsert(r.card);
+    } catch (e) { saving(btn, false); fallaRed(e); }
+  };
+}
+async function slEliminar(id) {
+  const c = slFind(id); if (!c) return toast('Solicitud no encontrada', 'err');
+  const ok = await confirmar('¿Eliminar esta solicitud?', crow('Asignado', c.asignado) + crow('Solicitud', (c.solicitud || '').slice(0, 80)) + `<p class="muted small" style="margin-top:8px;">Esta acción no se puede deshacer.</p>`);
+  if (!ok) return;
+  try {
+    const r = await api('priv.solicitudEliminar', {}, 'POST', { id, ...m5Auth() });
+    if (!r.ok) return toast(r.msg || 'No se pudo eliminar', 'err');
+    SL_ALL = SL_ALL.filter(x => String(x.id) !== String(id));
+    slRecontar(); slApplyFilter(); toast('Solicitud eliminada', 'ok');
+  } catch (e) { fallaRed(e); }
+}
+
+/* ============================================================
+   ARRANQUE  (gate de instalación como SEP-GROUP)
+   ============================================================ */
+/* 08/11/2026 · regla de publicación (modo fresco): el SW se registra sin la
+   caché HTTP (updateViaCache 'none') y pide update() al cargar; si un SW nuevo
+   toma el control de una página que ya tenía uno, se recarga UNA vez por
+   versión (freno en sessionStorage). La primera instalación no recarga. */
+if ('serviceWorker' in navigator) window.addEventListener('load', () => {
+  const habia = !!navigator.serviceWorker.controller;
+  navigator.serviceWorker.register('sw.js', { updateViaCache: 'none' }).then(r => { try { const u = r.update(); if (u && u.catch) u.catch(() => {}); } catch (e) {} }).catch(() => {});   /* 10/11 · sin señal el update() rechaza: no es un error de la app */
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    if (!habia) return;
+    const k = nsKey('jpriv_sw_cc_' + (typeof APP_VERSION !== 'undefined' ? APP_VERSION : ''));
+    try { if (sessionStorage.getItem(k)) return; sessionStorage.setItem(k, '1'); } catch (e) { return; }
+    if (window.RED && RED.escriturasEnVuelo > 0) return;
+    const capa = document.getElementById('layer');
+    if (capa && capa.children.length) return;   /* no se recarga encima de una hoja abierta (se perdería lo escrito) */
+    location.reload();
+  });
+});
+async function initApp() {
+  if (typeof APP_VERSION !== 'undefined' && APP_VERSION) { APP_VERSION_LOADED = String(APP_VERSION); paintVersion(APP_VERSION_LOADED); }
+  checkVersion(); setInterval(checkVersion, 60000);
+  const installed = await detectInstalled();
+  const hash = location.hash || '';
+  const arranqueLimpio = (hash === '' || hash === '#/' || hash.startsWith('#/login'));
+  const yaContinuoWeb = sessionStorage.getItem(nsKey('continuedWeb')) === '1';
+  if (!installed && !yaContinuoWeb && arranqueLimpio) { location.hash = '#/instalar'; }
+  render();
+}
+initApp();
+
+/* ============================================================
+   MÓDULO 7 · NOTIFICACIONES
+   Aquí se escriben las noticias que salen en "Ponte al día" de la
+   app pública. Al enviar, el CORE dispara el push (FCM) y deja la
+   señal en RTDB para quien tenga la app abierta.
+   ============================================================ */
+let NT_ALL = [], NT_FILT = [], NT_SHOWN = 0, NT_CONT = {}, NT_ALCANCE = 0, NT_PUSHTIT = '', NT_FBLISTO = true, NT_FBMSG = '';
+const NT_BATCH = 40;
+
+function ntEstadoClass(e) { return String(e || '').toUpperCase() === 'BORRADOR' ? 'nt-bor' : 'nt-pub'; }
+
+/* El enlace puede ser cualquier URL, no solo una red social (formularios, mapas,
+   documentos…). Esta detección debe ir igual que la de la app pública, que es
+   donde se pinta el botón que ve la gente. */
+const NT_REDES = {
+  facebook: 'Facebook', instagram: 'Instagram', x: 'X',
+  youtube: 'YouTube', tiktok: 'TikTok', whatsapp: 'WhatsApp',
+  forms: 'Formulario', maps: 'Ubicación', doc: 'Documento', web: 'Enlace'
+};
+const NT_BOTON = {
+  facebook: 'Ver en Facebook', instagram: 'Ver en Instagram', x: 'Ver en X',
+  youtube: 'Ver el video', tiktok: 'Ver en TikTok', whatsapp: 'Abrir en WhatsApp',
+  forms: 'Responder el formulario', maps: 'Ver la ubicación', doc: 'Abrir el documento',
+  web: 'Abrir enlace'
+};
+function ntRedDe(url) {
+  const u = String(url || '').trim().toLowerCase();
+  if (!u) return '';
+  if (/facebook\.com|fb\.watch|fb\.me/.test(u)) return 'facebook';
+  if (/instagram\.com|instagr\.am/.test(u)) return 'instagram';
+  if (/(^|\/\/)(www\.)?(x\.com|twitter\.com)/.test(u)) return 'x';
+  if (/youtube\.com|youtu\.be/.test(u)) return 'youtube';
+  if (/tiktok\.com/.test(u)) return 'tiktok';
+  if (/wa\.me|whatsapp\.com/.test(u)) return 'whatsapp';
+  if (/forms\.gle|docs\.google\.com\/forms|forms\.office\.com|typeform\.com/.test(u)) return 'forms';
+  if (/google\.[a-z.]+\/maps|maps\.app\.goo\.gl|goo\.gl\/maps|waze\.com/.test(u)) return 'maps';
+  if (/docs\.google\.com|drive\.google\.com|\.pdf($|\?)|sheets\.google\.com/.test(u)) return 'doc';
+  return 'web';
+}
+function ntDominio(url) {
+  try { return new URL(String(url)).hostname.replace(/^www\./, ''); } catch { return ''; }
+}
+/* El texto EXACTO que verá la gente en la app pública */
+function ntBotonTxt(enlace) {
+  const t = ntRedDe(enlace);
+  if (t !== 'web') return NT_BOTON[t] || NT_BOTON.web;
+  const d = ntDominio(enlace);
+  return d ? `Ver en ${d}` : NT_BOTON.web;
+}
+
+/* Recorte del cuerpo para la tarjeta, respetando los saltos */
+function ntResumen(txt, lineas) {
+  const L = String(txt || '').split('\n');
+  const corte = L.slice(0, lineas || 3).join('\n');
+  return corte + (L.length > (lineas || 3) ? '…' : '');
+}
+
+function ntCardHtml(n) {
+  const tipo = ntRedDe(n.enlace);
+  const red = tipo ? (NT_REDES[tipo] || 'Enlace') : '';
+  const envio = n.estado === 'BORRADOR'
+    ? `<span class="nt-envio nt-envio-no">Sin enviar</span>`
+    : (n.enviados
+      ? `<span class="nt-envio">📤 ${n.enviados.toLocaleString('es-CO')} enviado(s)${n.fallidos ? ' · ' + n.fallidos.toLocaleString('es-CO') + ' fallido(s)' : ''}</span>`
+      : `<span class="nt-envio nt-envio-no">Publicada · sin push</span>`);
+  return `<article class="bd-card nt-card ${ntEstadoClass(n.estado)}" data-id="${esc(n.id)}">
+    <div class="bd-top">
+      <div class="bd-id">
+        <b class="bd-nombre">${esc(n.titulo || 'Sin título')}</b>
+        <span class="bd-doc">${esc(fmtCreada(n.fecha) || n.fecha || '—')}</span>
+      </div>
+      <span class="nt-badge ${ntEstadoClass(n.estado)}">${esc(n.estado)}</span>
+    </div>
+    <div class="nt-prev">${esc(ntResumen(n.cuerpo, 3))}</div>
+    <div class="nt-foot">
+      ${red ? `<span class="nt-red nt-red-${esc(tipo)}">${esc(red)}</span>` : ''}
+      ${envio}
+    </div>
+    <div class="bd-acts nt-acts">
+      <button class="bd-btn" data-a="detalles">Detalles</button>
+      <button class="bd-btn" data-a="editar">Editar</button>
+      <button class="bd-btn nt-btn-send" data-a="enviar">${n.estado === 'BORRADOR' ? 'Publicar y enviar' : 'Reenviar push'}</button>
+      <button class="bd-btn bd-btn-danger" data-a="eliminar">Eliminar</button>
+    </div>
+  </article>`;
+}
+
+function ntResumenHtml() {
+  const pu = NT_CONT.PUBLICADA || 0, bo = NT_CONT.BORRADOR || 0;
+  return `<div class="nt-resumen">
+    <div class="nt-kpis">
+      <button class="nt-kpi nt-pub" data-f="Publicada"><b>${pu.toLocaleString('es-CO')}</b><span>Publicadas</span></button>
+      <button class="nt-kpi nt-bor" data-f="Borrador"><b>${bo.toLocaleString('es-CO')}</b><span>Borradores</span></button>
+      <div class="nt-kpi nt-alc"><b>${NT_ALCANCE.toLocaleString('es-CO')}</b><span>Dispositivos con avisos</span></div>
+    </div>
+    ${NT_FBLISTO ? '' : `<div class="nt-warn">${I.bell}<div><b>El push está apagado.</b> ${esc(NT_FBMSG || 'Falta la cuenta de servicio de Firebase.')}<br><span class="nt-warn-tip">Corre <code>probarFirebase()</code> en el editor de Apps Script: te dice paso por paso qué falta. Mientras tanto las noticias sí se guardan y sí se ven en la app pública.</span></div></div>`}
+  </div>`;
+}
+
+async function viewNotificaciones(user) {
+  M5_ME = user.documento; appWide(true);
+  app.innerHTML = `${backbar('Notificaciones')}
+    <div class="pad">
+      <p class="nt-note">Lo que publiques aquí sale en <b>“Ponte al día”</b> de la app pública. Al enviar, avisamos a todos los que activaron las notificaciones.</p>
+      <div id="nt-resumen"></div>
+      <div class="bd-toolbar">
+        <div class="bd-search"><input class="input" id="nt-q" placeholder="Buscar por título o contenido…" autocomplete="off" /></div>
+        <button class="btn btn-primary bd-add" id="nt-add">+ Agregar</button>
+      </div>
+      <div class="bd-chips" id="nt-chips">
+        ${['Todas', 'Publicada', 'Borrador'].map((t, i) => `<button class="bd-chip ${i === 0 ? 'active' : ''}" data-f="${esc(t)}">${esc(t)}</button>`).join('')}
+      </div>
+      <div class="bd-count" id="nt-count"></div>
+      <div id="nt-body">${loadingBox('Cargando noticias…')}</div>
+      <div class="center" id="nt-more" style="margin-top:12px;"></div>
+    </div>`;
+  app.hidden = false; hideSplash();
+  $('#backbtn').onclick = () => go('home');
+  $('#nt-add').onclick = () => ntAgregar();
+  try {
+    const r = await api('priv.notificaciones', m5Auth());
+    if (!r.ok) { $('#nt-body').innerHTML = `<p class="muted center">No se pudo cargar.</p>`; return; }
+    NT_ALL = (r.items || []).slice().sort((a, b) => (b.ts || 0) - (a.ts || 0));   // más reciente primero (el CORE ya ordena; esto lo blinda)
+    NT_CONT = r.contadores || {};
+    NT_ALCANCE = r.alcance || 0; NT_PUSHTIT = r.pushTitulo || '';
+    NT_FBLISTO = r.firebaseListo !== false; NT_FBMSG = r.firebaseMsg || '';
+    ntPintarResumen(); ntApplyFilter();
+  } catch (e) { $('#nt-body').innerHTML = `${fallaHtml(e)}`; return; }
+  const q = $('#nt-q'); let t;
+  q.oninput = () => { clearTimeout(t); t = setTimeout(ntApplyFilter, 160); };
+  $$('#nt-chips .bd-chip').forEach(ch => ch.onclick = () => ntSetFilter(ch.dataset.f));
+
+  vivoBind('notificaciones', M5_ME, vivoNotificaciones);   // EN VIVO
+}
+
+/* ---- EN VIVO · Notificaciones ---- */
+async function vivoNotificaciones(rev) {
+  const r = await api('priv.notificaciones', m5Auth(), 'GET', null, SILENCIO);
+  if (!r.ok || !vivoCambio(JSON.stringify(r.items))) return;
+  NT_ALL = (r.items || []).slice().sort((a, b) => (b.ts || 0) - (a.ts || 0));
+  NT_CONT = r.contadores || {}; NT_ALCANCE = r.alcance || 0;
+  ntPintarResumen(); ntApplyFilter(); vivoCerrarHoja(rev);
+}
+
+function ntPintarResumen() {
+  const el = $('#nt-resumen'); if (!el) return;
+  el.innerHTML = ntResumenHtml();
+  el.querySelectorAll('.nt-kpi[data-f]').forEach(k => k.onclick = () => ntSetFilter(k.dataset.f));
+}
+function ntSetFilter(f) {
+  const chips = $$('#nt-chips .bd-chip');
+  const activo = (($('#nt-chips .bd-chip.active') || {}).dataset || {}).f;
+  const destino = (activo === f) ? 'Todas' : f;   // volver a tocar = quitar el filtro
+  chips.forEach(x => x.classList.toggle('active', x.dataset.f === destino));
+  ntApplyFilter();
+}
+function ntActiveFilter() { const a = $('#nt-chips .bd-chip.active'); return a ? a.dataset.f : 'Todas'; }
+
+function ntApplyFilter() {
+  const q = (($('#nt-q') || {}).value || '').trim().toLowerCase();
+  const f = ntActiveFilter().toUpperCase();
+  NT_FILT = NT_ALL.filter(n => {
+    if (f !== 'TODAS' && String(n.estado).toUpperCase() !== f) return false;
+    if (!q) return true;
+    return ((n.titulo || '') + ' ' + (n.cuerpo || '') + ' ' + (n.enlace || '')).toLowerCase().includes(q);
+  });
+  NT_SHOWN = 0;
+  const cEl = $('#nt-count'); if (cEl) cEl.textContent = `${NT_FILT.length.toLocaleString('es-CO')} noticia(s) · de la más reciente a la más antigua`;
+  const body = $('#nt-body');
+  if (body) body.innerHTML = NT_FILT.length ? `<div class="bd-grid" id="nt-grid"></div>` : `<p class="muted center" style="margin-top:20px;">Sin noticias para este filtro.</p>`;
+  ntRenderMore();
+}
+function ntRenderMore() {
+  const grid = $('#nt-grid'); if (!grid) { const m = $('#nt-more'); if (m) m.innerHTML = ''; return; }
+  const next = NT_FILT.slice(NT_SHOWN, NT_SHOWN + NT_BATCH);
+  grid.insertAdjacentHTML('beforeend', next.map(ntCardHtml).join(''));
+  NT_SHOWN += next.length;
+  $$('#nt-grid .nt-card').forEach(card => {
+    if (card._wired) return; card._wired = true;
+    card.querySelectorAll('.bd-btn').forEach(b => b.onclick = () => ntAccion(b.dataset.a, card.dataset.id));
+  });
+  const more = $('#nt-more');
+  if (NT_SHOWN < NT_FILT.length) { more.innerHTML = `<button class="btn btn-ghost" id="nt-more-btn">Ver más (${(NT_FILT.length - NT_SHOWN).toLocaleString('es-CO')} restantes)</button>`; $('#nt-more-btn').onclick = ntRenderMore; }
+  else more.innerHTML = '';
+}
+function ntFind(id) { return NT_ALL.find(x => String(x.id) === String(id)); }
+function ntRecontar() {
+  NT_CONT = { PUBLICADA: 0, BORRADOR: 0 };
+  NT_ALL.forEach(n => { NT_CONT[n.estado] = (NT_CONT[n.estado] || 0) + 1; });
+  ntPintarResumen();
+}
+function ntUpsert(card) {
+  const i = NT_ALL.findIndex(x => String(x.id) === String(card.id));
+  if (i >= 0) NT_ALL[i] = card; else NT_ALL.push(card);
+  NT_ALL.sort((a, b) => (b.ts || 0) - (a.ts || 0));   // más reciente primero
+  ntRecontar(); ntApplyFilter();
+}
+function ntAccion(a, id) {
+  if (a === 'detalles') return ntDetalles(id);
+  if (a === 'editar') return ntEditar(id);
+  if (a === 'enviar') return ntEnviar(id);
+  if (a === 'eliminar') return ntEliminar(id);
+}
+
+/* ---- Vista previa: así se ve la tarjeta en la app pública ---- */
+function ntPreviewHtml(titulo, cuerpo, enlace) {
+  const red = ntRedDe(enlace);
+  return `<div class="nt-sim">
+    <div class="nt-sim-h">Así se verá en “Ponte al día”</div>
+    <div class="nt-sim-card">
+      <b class="nt-sim-tit">${esc(titulo || 'Título de la noticia')}</b>
+      <div class="nt-sim-cuerpo">${esc(cuerpo || 'El cuerpo de la noticia…')}</div>
+      ${enlace ? `<span class="nt-sim-link nt-red-${esc(red)}">${esc(ntBotonTxt(enlace))}</span>` : ''}
+    </div>
+    <div class="nt-sim-h">Así se verá el aviso en el celular</div>
+    <div class="nt-sim-push">
+      <img src="${APP_ICON}" alt="" />
+      <div><b>${esc(NT_PUSHTIT || (MV.candidato + ' publicó una noticia'))}</b><span>${esc(titulo || 'Título de la noticia')}</span></div>
+    </div>
+  </div>`;
+}
+
+/* ---- Detalles (+ copiar) ---- */
+function ntTextoCopia(n) {
+  const L = [];
+  L.push(`📰 ${n.titulo}`);
+  L.push('');
+  L.push(n.cuerpo || '');
+  if (n.enlace) { L.push(''); L.push(n.enlace); }
+  if (n.fecha) { L.push(''); L.push(`Publicada: ${fmtCreada(n.fecha) || n.fecha}`); }
+  return L.join('\n');
+}
+async function ntDetalles(id) {
+  openSheet(`<div class="grip"></div><h2 class="h2">Noticia</h2>${loadingBox('Cargando…')}`);
+  let n;
+  try { const r = await api('priv.notifVer', { id, ...m5Auth() }); if (!r.ok) { closeLayer(); return toast(r.msg || 'No se pudo cargar', 'err'); } n = r.noticia; }
+  catch (e) { closeLayer(); return fallaRed(e); }
+  const rows = [
+    ['Estado', n.estado],
+    ['Publicada', n.fecha ? (fmtCreada(n.fecha) || n.fecha) : '—'],
+    ['Actualizada', n.actualizada ? (fmtCreada(n.actualizada) || n.actualizada) : '—'],
+    ['Enlace', n.enlace || '—'],
+    ['Push enviados', n.enviados ? n.enviados.toLocaleString('es-CO') : '—'],
+    ['Push fallidos', n.fallidos ? n.fallidos.toLocaleString('es-CO') : '—'],
+    ['ID', n.id]
+  ].map(([k, v]) => `<div class="det-row"><span>${esc(k)}</span><b>${esc(v)}</b></div>`).join('');
+  openSheet(`<div class="grip"></div>
+    <div class="det-head"><h2 class="h2">${esc(n.titulo)}</h2><span class="nt-badge ${ntEstadoClass(n.estado)}">${esc(n.estado)}</span></div>
+    ${ntPreviewHtml(n.titulo, n.cuerpo, n.enlace)}
+    <div class="det-list" style="margin-top:12px;">${rows}</div>
+    <div class="stack" style="margin-top:12px;">
+      <button class="btn btn-ghost btn-block" id="nt-copy">${I.copy} Copiar en portapapeles</button>
+      <button class="btn btn-primary btn-block" id="nt-edit">Editar</button>
+    </div>`);
+  $('#nt-copy').onclick = async () => { try { await navigator.clipboard.writeText(ntTextoCopia(n)); toast('Noticia copiada', 'ok'); } catch { toast('No se pudo copiar', 'err'); } };
+  $('#nt-edit').onclick = () => { closeLayer(); ntEditar(id); };
+}
+
+/* ---- Modal de registro / edición ---- */
+function ntFormHtml(n, esNueva) {
+  return `<div class="grip"></div>
+    <h2 class="h2" style="margin-bottom:4px;">${esNueva ? 'Nueva noticia' : 'Editar noticia'}</h2>
+    <p class="muted" style="margin-bottom:14px;">Los saltos de línea se respetan tal cual los escribas.</p>
+    ${field('Título', inputEl('nt-f-tit', `maxlength="120" placeholder="Título de la noticia" value="${esc((n && n.titulo) || '')}"`))}
+    <label class="field"><span>Cuerpo</span>
+      <textarea class="input area" id="nt-f-cue" rows="7" placeholder="Escribe la noticia…">${esc((n && n.cuerpo) || '')}</textarea>
+    </label>
+    <div class="nt-cont" id="nt-cont"></div>
+    ${field('Enlace de red social (opcional)', inputEl('nt-f-enl', `placeholder="https://facebook.com/… o el enlace que quieras" value="${esc((n && n.enlace) || '')}"`))}
+    <div id="nt-prev"></div>
+    ${esNueva ? `<label class="check nt-check"><input type="checkbox" id="nt-f-env" checked /><span>Enviar la notificación al guardar <b class="small muted">(a ${NT_ALCANCE.toLocaleString('es-CO')} dispositivo(s))</b></span></label>` : ''}
+    <div class="stack" style="margin-top:16px;">
+      <button class="btn btn-primary btn-block" id="nt-f-ok">${esNueva ? 'Guardar' : 'Guardar cambios'}</button>
+      <button class="btn btn-quiet btn-block" data-close>Cancelar</button>
+    </div>`;
+}
+function ntBindForm() {
+  const t = $('#nt-f-tit'), c = $('#nt-f-cue'), e = $('#nt-f-enl');
+  const pintar = () => {
+    const cont = $('#nt-cont');
+    if (cont) cont.textContent = `${(c.value || '').length} caracteres · ${(c.value || '').split('\n').length} línea(s)`;
+    const pv = $('#nt-prev');
+    if (pv) pv.innerHTML = ntPreviewHtml(t.value.trim(), c.value, e.value.trim());
+  };
+  [t, c, e].forEach(el => { if (el) el.oninput = pintar; });
+  pintar();
+}
+function ntLeerForm() {
+  return { titulo: val('nt-f-tit'), cuerpo: ($('#nt-f-cue') || {}).value || '', enlace: val('nt-f-enl') };
+}
+
+function ntAgregar() {
+  openSheet(ntFormHtml(null, true));
+  ntBindForm();
+  $('#nt-f-ok').onclick = async (ev) => {
+    const btn = ev.currentTarget;
+    const b = ntLeerForm();
+    if (!b.titulo) return toast('Escribe el título', 'err');
+    if (!b.cuerpo.trim()) return toast('Escribe el cuerpo', 'err');
+    const enviar = !!($('#nt-f-env') || {}).checked;
+    if (enviar) {
+      const ok = await confirmar('Publicar y avisar', [
+        crow('Título', b.titulo),
+        crow('Enlace', b.enlace || 'Sin enlace'),
+        crow('Aviso a', `${NT_ALCANCE.toLocaleString('es-CO')} dispositivo(s)`)
+      ].join(''));
+      if (!ok) { openSheet(ntFormHtml({ titulo: b.titulo, cuerpo: b.cuerpo, enlace: b.enlace }, true)); ntBindForm(); return; }
+    }
+    saving(btn, true);
+    try {
+      const r = await api('priv.notifGuardar', {}, 'POST', { ...b, enviar, ...m5Auth() });
+      saving(btn, false);
+      if (!r.ok) return toast(r.msg || 'No se pudo guardar', 'err');
+      closeLayer(); ntUpsert(r.card);
+      if (r.push && r.push.msg) toast(r.push.msg, 'err');
+      else if (enviar) { toast(`Publicada · push a ${(r.push && r.push.enviados) || 0} dispositivo(s)`, 'ok'); celebrarNt(); }
+      else toast('Borrador guardado', 'ok');
+    } catch (e) { saving(btn, false); fallaRed(e); }
+  };
+}
+
+function ntEditar(id) {
+  const n = ntFind(id); if (!n) return toast('No se encontró la noticia', 'err');
+  openSheet(ntFormHtml(n, false));
+  ntBindForm();
+  $('#nt-f-ok').onclick = async (ev) => {
+    const btn = ev.currentTarget;
+    const b = ntLeerForm();
+    if (!b.titulo) return toast('Escribe el título', 'err');
+    if (!b.cuerpo.trim()) return toast('Escribe el cuerpo', 'err');
+    saving(btn, true);
+    try {
+      const r = await api('priv.notifEditar', {}, 'POST', { id, ...b, ...m5Auth() });
+      saving(btn, false);
+      if (!r.ok) return toast(r.msg || 'No se pudo guardar', 'err');
+      closeLayer(); ntUpsert(r.card); toast('Noticia actualizada', 'ok');
+    } catch (e) { saving(btn, false); fallaRed(e); }
+  };
+}
+
+/* ---- Publicar / reenviar el push (doble toque, como en Líderes) ---- */
+async function ntEnviar(id) {
+  const n = ntFind(id); if (!n) return toast('No se encontró la noticia', 'err');
+  const esBorrador = n.estado === 'BORRADOR';
+  openSheet(`<div class="grip"></div>
+    <h2 class="h2" style="margin-bottom:4px;">${esBorrador ? 'Publicar y avisar' : 'Reenviar el aviso'}</h2>
+    <p class="muted" style="margin-bottom:12px;">${esBorrador
+      ? 'La noticia quedará visible en la app pública y avisaremos a todos.'
+      : 'Esta noticia ya está publicada. Se volverá a avisar a todos los dispositivos.'}</p>
+    ${ntPreviewHtml(n.titulo, n.cuerpo, n.enlace)}
+    <div class="det-list" style="margin-top:12px;">
+      <div class="det-row"><span>Se avisa a</span><b>${NT_ALCANCE.toLocaleString('es-CO')} dispositivo(s)</b></div>
+      ${n.enviados ? `<div class="det-row"><span>Último envío</span><b>${n.enviados.toLocaleString('es-CO')} enviado(s)</b></div>` : ''}
+    </div>
+    <div class="stack" style="margin-top:16px;">
+      <button class="btn btn-primary btn-block" id="nt-go">${esBorrador ? 'Publicar y enviar' : 'Reenviar push'}</button>
+      <button class="btn btn-quiet btn-block" data-close>Cancelar</button>
+    </div>`);
+  let armado = false;
+  $('#nt-go').onclick = async (ev) => {
+    const btn = ev.currentTarget;
+    if (!armado) { armado = true; btn.textContent = 'Toca otra vez para confirmar'; btn.classList.add('nt-armed'); return; }
+    saving(btn, true);
+    try {
+      const r = await api('priv.notifEnviar', {}, 'POST', { id, ...m5Auth() });
+      saving(btn, false);
+      if (!r.ok) return toast(r.msg || 'No se pudo enviar', 'err');
+      closeLayer(); ntUpsert(r.card);
+      toast(r.msg || 'Push enviado', (r.push && r.push.enviados) ? 'ok' : 'err');
+      if (r.push && r.push.enviados) celebrarNt();
+    } catch (e) { saving(btn, false); fallaRed(e); }
+  };
+}
+
+/* ---- Eliminar (borra de verdad) ---- */
+async function ntEliminar(id) {
+  const n = ntFind(id); if (!n) return toast('No se encontró la noticia', 'err');
+  const ok = await confirmar('¿Eliminar la noticia?', [
+    crow('Título', n.titulo),
+    crow('Estado', n.estado),
+    crow('Ojo', 'Se borra de la hoja y desaparece de la app pública')
+  ].join(''));
+  if (!ok) return;
+  try {
+    const r = await api('priv.notifEliminar', {}, 'POST', { id, ...m5Auth() });
+    if (!r.ok) return toast(r.msg || 'No se pudo eliminar', 'err');
+    NT_ALL = NT_ALL.filter(x => String(x.id) !== String(id));
+    ntRecontar(); ntApplyFilter(); toast('Noticia eliminada', 'ok');
+  } catch (e) { fallaRed(e); }
+}
+
+/* Pequeño gesto al publicar */
+function celebrarNt() {
+  const el = h('<div class="nt-celebra">🔔</div>');
+  layer.appendChild(el);
+  setTimeout(() => el.remove(), 1100);
+}
+
+/* ============================================================
+   MÓDULO 8 · ANÁLISIS DE PROCESOS  (Servicios · Ideas · Comercio)
+   ------------------------------------------------------------
+   Tres pestañas, una vista. Cada pestaña carga su data la primera
+   vez que se abre y queda en caché hasta salir de la vista.
+   Backend: priv.an* (Analisis_Priv.gs).
+   ============================================================ */
+
+const AN_TABS = [
+  { id: 'servicios', label: 'Servicios' },
+  { id: 'gestiones', label: 'Reseñas' },   /* 07/11/2026 · reseñas de Solicitudes y Gestiones (SUAREZ) */
+  { id: 'ideas',     label: 'Ideas' },
+  { id: 'comercio',  label: 'Comercio' }
+];
+
+let AN = null;      // estado de la vista (se reinicia en cada entrada)
+let AN_ME = '';     // documento del usuario logueado (guard del CORE)
+
+/* Cada módulo lleva su propio caller: el auth()/BD_ME global es solo de Base de Datos y
+   queda vacío si se entra directo aquí desde el Home. Mismo patrón que ldAuth()/m5Auth(). */
+function anAuth() { return { caller: AN_ME }; }
+
+/* Colores por estado de SERVICIOS (clases an-e-*) */
+const AN_SERV_EST = [
+  { k: 'INGRESADA',   c: 'ing', label: 'Ingresada' },
+  { k: 'PENDIENTE',   c: 'pen', label: 'Pendiente' },
+  { k: 'SEGUIMIENTO', c: 'seg', label: 'Seguimiento' },
+  { k: 'ATENDIDA',    c: 'ate', label: 'Atendida' },
+  { k: 'RECURRENTE',  c: 'rec', label: 'Recurrente' }
+];
+const AN_SERV_CLS = {};
+AN_SERV_EST.forEach(e => AN_SERV_CLS[e.k] = e.c);
+
+/* Estados de IDEAS · colores del pliego:
+   PENDIENTE=rojo · LEIDA=gris · A TENER EN CUENTA=verde · ANOTADA=azul */
+const AN_IDEA_EST = [
+  { k: 'PENDIENTE',         c: 'pend', label: 'Pendiente' },
+  { k: 'LEIDA',             c: 'leida', label: 'Leída' },
+  { k: 'A TENER EN CUENTA', c: 'cuenta', label: 'A tener en cuenta' },
+  { k: 'ANOTADA',           c: 'anot', label: 'Anotada' }
+];
+const AN_IDEA_CLS = {};
+AN_IDEA_EST.forEach(e => AN_IDEA_CLS[e.k] = e.c);
+/* Solo estas dos se pueden seleccionar para un documento (decisión 15/07) */
+const AN_SELECCIONABLES = new Set(['A TENER EN CUENTA', 'ANOTADA']);
+
+function anLabelIdea(k) { const h = AN_IDEA_EST.find(e => e.k === k); return h ? h.label : k; }
+
+/* ============================================================
+   SHELL DE LA VISTA (13/10/2026 · Fase 2 · rediseño)
+   ------------------------------------------------------------
+   · UN viaje: priv.analisis trae Servicios + Ideas + Comercios + Reseñas
+     juntos (comprimido, < 40 KB). Cambiar de pestaña ya no va al servidor,
+     y la segunda visita de la sesión pinta al instante desde la caché.
+   · Pestaña nueva RESUMEN (la de entrada): las tres áreas lado a lado con
+     sus cifras, la actividad de los últimos meses y los puntos de atención.
+     Cada cifra es un atajo: lleva a su pestaña YA filtrada.
+   · Navegable: la pestaña vive en la dirección (#/analisis?tab=ideas), así
+     una recarga vuelve al mismo sitio; y "atrás" desde una pestaña regresa
+     al Resumen antes de salir al Inicio.
+   ============================================================ */
+const AN_TABS_TODAS = [{ id: 'resumen', label: 'Resumen' }].concat(AN_TABS);
+const AN_PERM = { servicios: 'an.serv.ver', gestiones: 'an.serv.ver', ideas: 'an.ideas.ver', comercio: 'an.com.ver' };
+
+function anTabDeHash() {
+  const m = /[?&]tab=([a-z]+)/.exec(location.hash || '');
+  return m ? m[1] : '';
+}
+function anIrTab(tab) {
+  if (!AN || AN.tab === tab) return;
+  AN.tab = tab;
+  try { history.replaceState(null, '', '#/analisis' + (tab === 'resumen' ? '' : '?tab=' + tab)); } catch (e) {}
+  $$('#an-tabs .seg-b').forEach(x => x.classList.toggle('active', x.dataset.tab === tab));
+  anPintarTab();
+  try { window.scrollTo({ top: 0, behavior: 'smooth' }); } catch (e) { window.scrollTo(0, 0); }
+}
+
+/* Reparte lo que llegó en un viaje a las cuatro piezas (cada una puede venir
+   con ok:false si un invitado no tiene esa pastilla). */
+function anRepartir(d) {
+  const ok = x => (x && x.ok !== false) ? x : null;
+  AN.serv = ok(d && d.serv); AN.ideas = ok(d && d.ideas); AN.com = ok(d && d.com);
+  AN.res = ok(d && d.res) || { items: [], resenas: [], global: null };
+  AN.gest = ok(d && d.gest);   /* 07/11/2026 · null si el CORE desplegado aún no la trae */
+  AN.listo = true;
+}
+/* Tras una escritura ya aplicada en pantalla: la caché de sesión se queda con
+   lo de memoria y se borra la copia local. */
+function anSync() {
+  const c = RAP.tomar('priv.analisis');
+  if (c && c.data) { c.data.serv = AN.serv || c.data.serv; c.data.ideas = AN.ideas || c.data.ideas; c.data.com = AN.com || c.data.com; c.data.res = AN.res || c.data.res; c.data.gest = AN.gest || c.data.gest; }
+  RAP.tocar('priv.analisis');
+}
+async function anRecargar() {
+  const d = await rapTraer('priv.analisis', Object.assign(anAuth(), RAP.params()), SILENCIO);
+  if (!d || d.ok === false) return false;
+  RAP.guardar('priv.analisis', d, d.__rapCrudo || d);
+  anRepartir(d);
+  return true;
+}
+
+async function viewAnalisis(user) {
+  AN_ME = user.documento;
+  const puede = t => t === 'resumen' || permOk(AN_PERM[t]);
+  const pedida = anTabDeHash();
+  const anTab0 = (pedida && AN_TABS_TODAS.some(t => t.id === pedida) && puede(pedida)) ? pedida : 'resumen';
+  AN = {
+    tab: anTab0, user, listo: false,
+    serv: null, ideas: null, com: null, res: null,   // res = estrellas y reseñas (03/08/2026)
+    sFiltro: { est: new Set(), medio: new Set(), servicio: '', prof: '', q: '', eje: 'servicio' },
+    iFiltro: { est: new Set(), cat: new Set(), q: '' },
+    iSel: new Set(),
+    cFiltro: { est: 'TODOS', cat: 'TODAS', q: '' }
+  };
+  app.innerHTML = `${backbar('Análisis de Procesos')}
+    <div class="pad stack">
+      <div class="an-tabs seg" id="an-tabs">
+        ${AN_TABS_TODAS.filter(t => puede(t.id)).map(t => `<button class="seg-b ${t.id === anTab0 ? 'active' : ''}" data-tab="${t.id}">${esc(t.label)}</button>`).join('')}
+      </div>
+      <div id="an-body">${loadingBox('Cargando…')}</div>
+    </div>`;
+  app.hidden = false; hideSplash();   /* 07/11/2026: al abrir directo en #/analisis el splash se quedaba encima */
+  appWide(true, true);
+  $('#backbtn').onclick = () => { if (AN && AN.tab !== 'resumen') anIrTab('resumen'); else go('home'); };
+  $$('#an-tabs .seg-b').forEach(b => b.onclick = () => anIrTab(b.dataset.tab));
+
+  let primera = true;
+  try {
+    await rapCargar('priv.analisis', anAuth(), (d) => {
+      if (!$('#an-body')) return;
+      if (!d || d.ok === false) { if (primera) $('#an-body').innerHTML = `<p class="center muted" style="padding:26px 0;">No se pudo cargar.</p>`; return; }
+      anRepartir(d);
+      primera = false;
+      anPintarTab();
+    });
+  } catch (e) {
+    if ($('#an-body') && primera) $('#an-body').innerHTML = `<p class="center muted" style="padding:26px 0;">No se pudo cargar. ${esc(e.message || '')}</p>`;
+  }
+
+  vivoBind('analisis', AN_ME, vivoAnalisis);   // EN VIVO
+}
+
+/* ---- EN VIVO · Análisis de Procesos ----
+   Un solo viaje trae las cuatro piezas; se repinta la pestaña que se mira. */
+async function vivoAnalisis(rev) {
+  if (!AN) return;
+  const d = await rapTraer('priv.analisis', Object.assign(anAuth(), RAP.params()), SILENCIO);
+  if (!d || d.ok === false || !AN) return;
+  RAP.guardar('priv.analisis', d, d.__rapCrudo || d);
+  if (!vivoCambio(JSON.stringify(d))) return;
+  anRepartir(d);
+  anPintarTab();
+  vivoCerrarHoja(rev);
+}
+
+function anPintarTab() {
+  const body = $('#an-body');
+  if (!body || !AN || !AN.listo) return;
+  const tab = AN.tab;
+  if (tab === 'resumen') return anResumenPintar();
+  if (tab === 'gestiones') return window.anGestPintar ? anGestPintar() : null;
+  const pieza = { servicios: AN.serv, ideas: AN.ideas, comercio: AN.com }[tab];
+  if (!pieza) { body.innerHTML = `<p class="center muted" style="padding:26px 0;">No tienes acceso a esta pestaña o no se pudo cargar.</p>`; return; }
+  if (tab === 'servicios') return anServPintar();
+  if (tab === 'ideas') return anIdeasPintar();
+  return anComPintar();
+}
+
+/* ============================================================
+   PESTAÑA 0 · RESUMEN
+   ============================================================ */
+const AN_MESES = ['ene', 'feb', 'mar', 'abr', 'may', 'jun', 'jul', 'ago', 'sep', 'oct', 'nov', 'dic'];
+function anMesDe(f) {
+  const m = String(f || '').match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+  if (m) return m[3] + '-' + String(m[2]).padStart(2, '0');
+  const i = String(f || '').match(/(\d{4})-(\d{2})-\d{2}/);
+  return i ? i[1] + '-' + i[2] : '';
+}
+function anUltimosMeses(n) {
+  const out = [], d = new Date();
+  for (let i = n - 1; i >= 0; i--) { const x = new Date(d.getFullYear(), d.getMonth() - i, 1); out.push(x.getFullYear() + '-' + String(x.getMonth() + 1).padStart(2, '0')); }
+  return out;
+}
+function anPct(a, b) { return b ? Math.round(a * 100 / b) : 0; }
+
+function anResumenPintar() {
+  const serv = AN.serv ? (AN.serv.items || []) : null;
+  const ideas = AN.ideas ? (AN.ideas.ideas || []) : null;
+  const com = AN.com ? (AN.com.items || []) : null;
+  const g = (AN.res && AN.res.global) || null;
+  const cuenta = (arr, f) => arr ? arr.filter(f).length : 0;
+
+  /* --- tarjetas por área --- */
+  const tarjeta = (tab, titulo, total, sub, stats, barra) => `
+    <section class="an-area" data-ir="${tab}">
+      <header class="an-area-h"><span class="an-area-t">${esc(titulo)}</span><button type="button" class="an-area-go" data-ir="${tab}">Ver detalle ${I.chevR || '›'}</button></header>
+      <div class="an-area-big"><b>${Number(total).toLocaleString('es-CO')}</b><span>${esc(sub)}</span></div>
+      ${barra || ''}
+      <div class="an-area-stats">${stats.map(s => `<button type="button" class="an-stat ${s.cls || ''}" data-ir="${tab}" data-fx="${esc(s.fx || '')}"><b>${Number(s.n).toLocaleString('es-CO')}</b><span>${esc(s.l)}</span></button>`).join('')}</div>
+    </section>`;
+  const barraEst = (arr, estados, clsPre) => {
+    if (!arr || !arr.length) return '';
+    return `<div class="an-area-bar">${estados.map(e => { const n = cuenta(arr, x => x.estado === e.k); return n ? `<i class="${clsPre}${e.c}" style="flex:${n}" title="${esc(e.label)}: ${n}"></i>` : ''; }).join('')}</div>`;
+  };
+  const areas = [];
+  if (serv) {
+    const ate = cuenta(serv, x => x.estado === 'ATENDIDA');
+    areas.push(tarjeta('servicios', 'Servicios', serv.length, `solicitudes · ${anPct(ate, serv.length)}% resueltas`, [
+      { n: ate, l: 'Atendidas', fx: 'est:ATENDIDA', cls: 'an-st-ok' },
+      { n: serv.length - ate, l: 'En proceso', fx: 'proceso', cls: 'an-st-warn' },
+      { n: cuenta(serv, x => !x.responsable), l: 'Sin profesional', fx: 'sinprof', cls: 'an-st-bad' }
+    ], barraEst(serv, AN_SERV_EST, 'an-e-')));
+  }
+  if (ideas) {
+    areas.push(tarjeta('ideas', 'Ideas', ideas.length, 'propuestas de la comunidad', [
+      { n: cuenta(ideas, x => x.estado === 'PENDIENTE'), l: 'Pendientes', fx: 'iest:PENDIENTE', cls: 'an-st-bad' },
+      { n: cuenta(ideas, x => x.estado === 'A TENER EN CUENTA'), l: 'A tener en cuenta', fx: 'iest:A TENER EN CUENTA', cls: 'an-st-ok' },
+      { n: cuenta(ideas, x => x.estado === 'ANOTADA'), l: 'Anotadas', fx: 'iest:ANOTADA' }
+    ], barraEst(ideas, AN_IDEA_EST, 'an-ib-')));
+  }
+  if (com) {
+    const act = cuenta(com, x => x.visible);
+    const sinResp = g ? Math.max(0, (g.resenas || 0) - (g.respondidas || 0)) : 0;
+    areas.push(tarjeta('comercio', 'Comercio', com.length, `comercios · ${g && g.estrellas ? String(g.promedio).replace('.', ',') + ' ★ promedio' : 'sin calificaciones aún'}`, [
+      { n: act, l: 'En la app', fx: 'cest:ACTIVOS', cls: 'an-st-ok' },
+      { n: com.length - act, l: 'Ocultos', fx: 'cest:INACTIVOS' },
+      { n: sinResp, l: 'Reseñas sin responder', fx: '', cls: sinResp ? 'an-st-warn' : '' }
+    ]));
+  }
+
+  /* --- actividad: últimos 6 meses (servicios e ideas por fecha) --- */
+  const meses = anUltimosMeses(6);
+  const serie = meses.map(m => ({ m, s: serv ? cuenta(serv, x => anMesDe(x.fecha) === m) : 0, i: ideas ? cuenta(ideas, x => anMesDe(x.fecha) === m) : 0 }));
+  const max = Math.max(1, ...serie.map(x => Math.max(x.s, x.i)));
+  const hayAct = serie.some(x => x.s || x.i);
+  const actividad = (serv || ideas) ? `
+    <section class="an-card an-act">
+      <div class="an-card-h"><b>Actividad de los últimos 6 meses</b><span class="an-act-key">${serv ? '<span><i class="an-act-s"></i>Servicios</span>' : ''}${ideas ? '<span><i class="an-act-i"></i>Ideas</span>' : ''}</span></div>
+      ${hayAct ? `<div class="an-act-b">${serie.map(x => `
+        <div class="an-act-col" title="${esc(AN_MESES[+x.m.slice(5) - 1])} ${x.m.slice(0, 4)}: ${x.s} servicio(s), ${x.i} idea(s)">
+          <div class="an-act-bars">${serv ? `<i class="an-act-s" style="height:${(x.s / max * 100).toFixed(1)}%"><em>${x.s || ''}</em></i>` : ''}${ideas ? `<i class="an-act-i" style="height:${(x.i / max * 100).toFixed(1)}%"><em>${x.i || ''}</em></i>` : ''}</div>
+          <span>${esc(AN_MESES[+x.m.slice(5) - 1])}</span>
+        </div>`).join('')}</div>` : `<p class="center muted small" style="padding:14px 0;">Sin movimiento en estos meses.</p>`}
+    </section>` : '';
+
+  /* --- puntos de atención (todo lo que pide una acción) --- */
+  const alertas = [];
+  if (serv) { const n = cuenta(serv, x => !x.responsable); if (n) alertas.push({ n, t: 'solicitud(es) de servicio sin profesional asignado', tab: 'servicios', fx: 'sinprof' }); }
+  if (serv) { const n = cuenta(serv, x => x.estado === 'PENDIENTE'); if (n) alertas.push({ n, t: 'servicio(s) en estado Pendiente', tab: 'servicios', fx: 'est:PENDIENTE' }); }
+  if (ideas) { const n = cuenta(ideas, x => x.estado === 'PENDIENTE'); if (n) alertas.push({ n, t: 'idea(s) sin leer', tab: 'ideas', fx: 'iest:PENDIENTE' }); }
+  if (g) { const n = Math.max(0, (g.resenas || 0) - (g.respondidas || 0)); if (n && com) alertas.push({ n, t: 'reseña(s) de comercios sin responder', tab: 'comercio', fx: '' }); }
+  if (AN.gest && AN.gest.dist && permOk('an.serv.ver')) { const n = (AN.gest.dist[0] || 0) + (AN.gest.dist[1] || 0); if (n) alertas.push({ n, t: 'reseña(s) de 1 o 2 estrellas en Solicitudes y Gestiones', tab: 'gestiones', fx: 'gbajas' }); }
+  const atencion = `<section class="an-card an-alertas">
+      <div class="an-card-h"><b>Puntos de atención</b></div>
+      ${alertas.length ? alertas.map(a => `<button type="button" class="an-alerta an-alerta-go" data-ir="${a.tab}" data-fx="${esc(a.fx)}"><span class="an-al-n">${a.n.toLocaleString('es-CO')}</span><div>${esc(a.t)}</div>${I.chevR || ''}</button>`).join('')
+        : `<p class="center muted small" style="padding:12px 0;">Todo al día: no hay nada pendiente.</p>`}
+    </section>`;
+
+  if (window.anGestArea && AN.gest && permOk('an.serv.ver')) { const ga = anGestArea(tarjeta); if (ga) areas.splice(1, 0, ga); }
+  $('#an-body').innerHTML = `
+    <div class="an-areas">${areas.join('') || `<p class="center muted" style="padding:20px 0;">No tienes acceso a ninguna pestaña de análisis.</p>`}</div>
+    <div class="an-res-cols">${actividad}${atencion}</div>`;
+
+  $$('#an-body [data-ir]').forEach(el => el.onclick = (ev) => {
+    ev.stopPropagation();
+    anAtajo(el.dataset.ir, el.dataset.fx || '');
+  });
+}
+
+/* Lleva a una pestaña con el filtro ya puesto */
+function anAtajo(tab, fx) {
+  if (tab === 'servicios') {
+    AN.sFiltro = { est: new Set(), medio: new Set(), servicio: '', prof: '', q: '', eje: AN.sFiltro.eje };
+    if (fx.indexOf('est:') === 0) AN.sFiltro.est.add(fx.slice(4));
+    else if (fx === 'proceso') AN_SERV_EST.forEach(e => { if (e.k !== 'ATENDIDA') AN.sFiltro.est.add(e.k); });
+    else if (fx === 'sinprof') AN.sFiltro.prof = '(Sin responsable)';
+  } else if (tab === 'ideas') {
+    AN.iFiltro = { est: new Set(), cat: new Set(), q: '' };
+    if (fx.indexOf('iest:') === 0) AN.iFiltro.est.add(fx.slice(5));
+  } else if (tab === 'gestiones') {
+    AN.gFiltro = { e: new Set(fx === 'gbajas' ? [1, 2] : []), q: '' };
+  } else if (tab === 'comercio') {
+    AN.cFiltro = { est: 'TODOS', cat: 'TODAS', q: '' };
+    if (fx.indexOf('cest:') === 0) AN.cFiltro.est = fx.slice(5);
+  }
+  if (AN.tab === tab) anPintarTab(); else anIrTab(tab);
+}
+
+/* Barras apiladas horizontales, hechas a mano (no hay librería de gráficos) */
+function anBarras(filas, total, onClickAttr) {
+  if (!filas.length) return `<p class="center muted" style="padding:18px 0;">Sin datos para estos filtros.</p>`;
+  const max = Math.max(...filas.map(f => f.total), 1);
+  return `<div class="an-bars">${filas.map(f => `
+    <div class="an-bar-row" ${onClickAttr ? `${onClickAttr}="${esc(f.label)}" role="button" tabindex="0"` : ''}>
+      <div class="an-bar-lbl" title="${esc(f.label)}">${esc(f.label)}</div>
+      <div class="an-bar-track">
+        <div class="an-bar-fill" style="width:${(f.total / max * 100).toFixed(1)}%;">
+          ${f.partes.filter(p => p.n > 0).map(p => `<span class="an-seg an-e-${p.c}" style="flex:${p.n};" title="${esc(p.label)}: ${p.n}"></span>`).join('')}
+        </div>
+      </div>
+      <div class="an-bar-num"><b>${f.total}</b>${total ? `<span>${(f.total / total * 100).toFixed(0)}%</span>` : ''}</div>
+    </div>`).join('')}</div>`;
+}
+
+/* ============================================================
+   PESTAÑA 1 · SERVICIOS  (solo lectura)
+   ============================================================ */
+function anServFiltradas() {
+  const f = AN.sFiltro;
+  const q = f.q.toLowerCase();
+  return (AN.serv.items || []).filter(it => {
+    if (f.est.size && !f.est.has(it.estado)) return false;
+    if (f.medio.size && !f.medio.has(it.medio)) return false;
+    if (f.servicio && (it.servicio || '(Sin servicio)') !== f.servicio) return false;
+    if (f.prof && (it.responsable || '(Sin responsable)') !== f.prof) return false;
+    if (q && !(`${it.nombre} ${it.solicitud} ${it.servicio} ${it.responsable} ${it.residencia} ${it.documento}`.toLowerCase().includes(q))) return false;
+    return true;
+  });
+}
+
+function anServAgrupar(items, campo) {
+  const map = new Map();
+  items.forEach(it => {
+    const k = (campo === 'servicio' ? it.servicio : it.responsable) || (campo === 'servicio' ? '(Sin servicio)' : '(Sin responsable)');
+    if (!map.has(k)) map.set(k, { label: k, total: 0, est: {} });
+    const g = map.get(k);
+    g.total++;
+    g.est[it.estado] = (g.est[it.estado] || 0) + 1;
+  });
+  return Array.from(map.values())
+    .map(g => Object.assign(g, { partes: AN_SERV_EST.map(e => ({ c: e.c, label: e.label, n: g.est[e.k] || 0 })) }))
+    .sort((a, b) => b.total - a.total || a.label.localeCompare(b.label, 'es'));
+}
+
+function anServPintar() {
+  const f = AN.sFiltro;
+  const todas = AN.serv.items || [];
+  const items = anServFiltradas();
+  const cuenta = (arr, k) => arr.filter(x => x.estado === k).length;
+  const atendidas = cuenta(items, 'ATENDIDA');
+  const proceso = items.length - atendidas;
+  const pct = items.length ? Math.round(atendidas / items.length * 100) : 0;
+
+  const servicios = Array.from(new Set(todas.map(i => i.servicio).filter(Boolean))).sort((a, b) => a.localeCompare(b, 'es'));
+  const profs = Array.from(new Set(todas.map(i => i.responsable || '(Sin responsable)'))).sort((a, b) => a.localeCompare(b, 'es'));
+  const medios = Array.from(new Set(todas.map(i => i.medio).filter(Boolean))).sort();
+
+  const filas = anServAgrupar(items, f.eje);
+
+  $('#an-body').innerHTML = `
+    <div class="an-kpis">
+      <div class="an-kpi an-k-tot"><b>${items.length}</b><span>Solicitudes</span></div>
+      <div class="an-kpi an-k-ate"><b>${atendidas}</b><span>Atendidas</span></div>
+      <div class="an-kpi an-k-pro"><b>${proceso}</b><span>En proceso</span></div>
+      <div class="an-kpi an-k-pct"><b>${pct}%</b><span>Resolución</span></div>
+    </div>
+
+    <div class="an-card">
+      <div class="an-card-h">
+        <b>Distribución</b>
+        <div class="seg an-eje">
+          <button class="seg-b ${f.eje === 'servicio' ? 'active' : ''}" data-eje="servicio">Por servicio</button>
+          <button class="seg-b ${f.eje === 'profesional' ? 'active' : ''}" data-eje="profesional">Por profesional</button>
+        </div>
+      </div>
+      ${anBarras(filas, items.length, 'data-eje-pick')}
+      <div class="an-key">${AN_SERV_EST.map(e => `<span><i class="an-e-${e.c}"></i>${esc(e.label)}</span>`).join('')}</div>
+      <p class="small muted an-hint">Toca una barra para filtrar por ella.</p>
+    </div>
+
+    <div class="an-card">
+      <div class="an-card-h"><b>Filtros</b><button class="link-quiet an-limpiar" id="an-s-limpiar" style="width:auto;margin:0;">Limpiar</button></div>
+      <div class="an-filtros">
+        <div class="chips an-chips">${AN_SERV_EST.map(e => {
+          const n = todas.filter(x => x.estado === e.k).length;
+          return `<button class="an-chip an-e-b-${e.c} ${f.est.has(e.k) ? 'on' : ''}" data-est="${e.k}">${esc(e.label)} <b>${n}</b></button>`;
+        }).join('')}</div>
+        <div class="chips an-chips">${medios.map(m => `<button class="an-chip an-chip-medio ${f.medio.has(m) ? 'on' : ''}" data-medio="${esc(m)}">${esc(m)} <b>${todas.filter(x => x.medio === m).length}</b></button>`).join('')}</div>
+        <div class="an-selects">
+          ${field('Servicio', `<select class="input" id="an-s-serv"><option value="">Todos</option>${servicios.map(s => `<option ${f.servicio === s ? 'selected' : ''}>${esc(s)}</option>`).join('')}</select>`)}
+          ${field('Profesional', `<select class="input" id="an-s-prof"><option value="">Todos</option>${profs.map(s => `<option ${f.prof === s ? 'selected' : ''}>${esc(s)}</option>`).join('')}</select>`)}
+        </div>
+        ${field('Buscar', inputEl('an-s-q', `placeholder="Nombre, solicitud, zona…" value="${esc(f.q)}"`))}
+      </div>
+    </div>
+
+    ${anServAlertas(todas)}
+
+    <div class="an-card">
+      <div class="an-card-h"><b>Solicitudes</b><span class="small muted">${items.length} de ${todas.length}</span></div>
+      <div class="an-list" id="an-s-list">${anServLista(items)}</div>
+    </div>`;
+
+  /* ---- eventos ---- */
+  $$('#an-body [data-eje]').forEach(b => b.onclick = () => { AN.sFiltro.eje = b.dataset.eje; anServPintar(); });
+  $$('#an-body [data-eje-pick]').forEach(el => {
+    const pick = () => {
+      const v = el.getAttribute('data-eje-pick');
+      if (AN.sFiltro.eje === 'servicio') AN.sFiltro.servicio = (AN.sFiltro.servicio === v ? '' : v);
+      else AN.sFiltro.prof = (AN.sFiltro.prof === v ? '' : v);
+      anServPintar();
+    };
+    el.onclick = pick;
+    el.onkeydown = (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); pick(); } };
+  });
+  $$('#an-body [data-est]').forEach(b => b.onclick = () => {
+    const k = b.dataset.est;
+    AN.sFiltro.est.has(k) ? AN.sFiltro.est.delete(k) : AN.sFiltro.est.add(k);
+    anServPintar();
+  });
+  $$('#an-body [data-medio]').forEach(b => b.onclick = () => {
+    const k = b.dataset.medio;
+    AN.sFiltro.medio.has(k) ? AN.sFiltro.medio.delete(k) : AN.sFiltro.medio.add(k);
+    anServPintar();
+  });
+  $('#an-s-serv').onchange = (e) => { AN.sFiltro.servicio = e.target.value; anServPintar(); };
+  $('#an-s-prof').onchange = (e) => { AN.sFiltro.prof = e.target.value; anServPintar(); };
+  $('#an-s-limpiar').onclick = () => {
+    AN.sFiltro = { est: new Set(), medio: new Set(), servicio: '', prof: '', q: '', eje: AN.sFiltro.eje };
+    anServPintar();
+  };
+  const q = $('#an-s-q');
+  q.oninput = () => {
+    AN.sFiltro.q = q.value.trim();
+    const l = $('#an-s-list');
+    if (l) l.innerHTML = anServLista(anServFiltradas());
+    anServBindList();
+  };
+  anServBindList();
+}
+
+function anServLista(items) {
+  if (!items.length) return `<p class="center muted" style="padding:22px 0;">Ninguna solicitud con estos filtros.</p>`;
+  return items.slice(0, 200).map((it, i) => `
+    <div class="an-row" data-ver="${i}">
+      <div class="an-row-main">
+        <div class="an-row-t"><b>${esc(it.nombre || '—')}</b><span class="an-pill an-e-b-${AN_SERV_CLS[it.estado] || 'ing'}">${esc(it.estado || '—')}</span></div>
+        <div class="an-row-s">${esc(it.servicio || '—')}${it.responsable ? ' · ' + esc(it.responsable) : ' · <i>sin responsable</i>'}</div>
+        <div class="an-row-x small muted">${esc((it.fecha || '').split(' ')[0] || 'sin fecha')}${it.residencia ? ' · ' + esc(it.residencia) : ''}${it.medio ? ' · ' + esc(it.medio) : ''}</div>
+      </div>
+      <span class="an-row-go">${I.chevR}</span>
+    </div>`).join('') + (items.length > 200 ? `<p class="center small muted" style="padding:10px 0;">Se muestran las primeras 200. Afina los filtros para ver el resto.</p>` : '');
+}
+
+function anServBindList() {
+  const items = anServFiltradas();
+  $$('#an-s-list [data-ver]').forEach(el => el.onclick = () => anServVer(items[+el.dataset.ver]));
+}
+
+function anServVer(it) {
+  if (!it) return;
+  openSheet(`<div class="grip"></div>
+    <h2 class="h2" style="margin-bottom:2px;">${esc(it.nombre || '—')}</h2>
+    <p class="muted small" style="margin-bottom:14px;">${esc(it.documento || '')}${it.residencia ? ' · ' + esc(it.residencia) : ''}</p>
+    <div class="confirm-list">
+      ${crow('Servicio', it.servicio)}
+      ${crow('Estado', it.estado)}
+      ${crow('Profesional', it.responsable || 'Sin responsable')}
+      ${crow('Medio', it.medio)}
+      ${crow('Fecha', it.fecha ? fmtFechaLarga(it.fecha) : 'Sin fecha')}
+      ${crow('Contacto', it.contacto)}
+    </div>
+    ${it.solicitud ? `<p class="eyebrow" style="margin-top:14px;">Solicitud</p><div class="an-texto">${esc(it.solicitud)}</div>` : ''}
+    ${it.respuesta ? `<p class="eyebrow" style="margin-top:12px;">Respuesta</p><div class="an-texto">${esc(it.respuesta)}</div>` : ''}
+    <button class="btn btn-quiet btn-block" data-close style="margin-top:16px;">Cerrar</button>`);
+}
+
+/* Cosas que saltan a la vista y sirven para decidir */
+function anServAlertas(todas) {
+  const sinResp = todas.filter(x => !x.responsable).length;
+  const conCarga = new Set(todas.map(x => x.responsable).filter(Boolean));
+  const norm = s => String(s || '').trim().toLowerCase();
+  const sinCarga = (AN.serv.profesionales || []).filter(p => !Array.from(conCarga).some(c => norm(c) === norm(p.nombre)));
+  const cat = new Set((AN.serv.profesionales || []).map(p => norm(p.servicio)));
+  const huerfanos = Array.from(new Set(todas.map(x => x.servicio).filter(Boolean))).filter(s => !cat.has(norm(s)));
+  if (!sinResp && !sinCarga.length && !huerfanos.length) return '';
+  return `<div class="an-card an-alertas">
+    <div class="an-card-h"><b>Puntos de atención</b></div>
+    ${sinResp ? `<div class="an-alerta"><span class="an-al-n">${sinResp}</span><div>solicitud(es) <b>sin profesional asignado</b>.<br><span class="small muted">Se asignan desde Configuración.</span></div></div>` : ''}
+    ${huerfanos.length ? `<div class="an-alerta"><span class="an-al-n">${huerfanos.length}</span><div>servicio(s) <b>sin profesional en el catálogo</b>: ${esc(huerfanos.join(', '))}.</div></div>` : ''}
+    ${sinCarga.length ? `<div class="an-alerta"><span class="an-al-n">${sinCarga.length}</span><div>profesional(es) <b>sin ninguna solicitud</b>: ${esc(sinCarga.map(p => p.nombre).join(', '))}.</div></div>` : ''}
+  </div>`;
+}
+
+/* ============================================================
+   PESTAÑA 2 · IDEAS
+   ============================================================ */
+function anIdeasFiltradas() {
+  const f = AN.iFiltro;
+  const q = f.q.toLowerCase();
+  return (AN.ideas.ideas || []).filter(it => {
+    if (f.est.size && !f.est.has(it.estado)) return false;
+    if (f.cat.size && !f.cat.has(it.cat)) return false;
+    if (q && !(`${it.nombre} ${it.texto} ${it.residencia} ${it.catLabel}`.toLowerCase().includes(q))) return false;
+    return true;
+  });
+}
+
+function anIdeasPintar() {
+  const f = AN.iFiltro;
+  const todas = AN.ideas.ideas || [];
+  const cortes = AN.ideas.cortes || [];
+  const items = anIdeasFiltradas();
+  const n = k => todas.filter(x => x.estado === k).length;
+
+  /* La selección solo puede tener ideas que sigan siendo seleccionables */
+  const validos = new Set(todas.filter(x => AN_SELECCIONABLES.has(x.estado)).map(x => x.id));
+  Array.from(AN.iSel).forEach(id => { if (!validos.has(id)) AN.iSel.delete(id); });
+
+  $('#an-body').innerHTML = `
+    <div class="an-kpis an-kpis-4">
+      ${AN_IDEA_EST.map(e => `<button class="an-kpi an-i-${e.c} ${f.est.has(e.k) ? 'on' : ''}" data-iest="${e.k}"><b>${n(e.k)}</b><span>${esc(e.label)}</span></button>`).join('')}
+    </div>
+
+    <div class="an-card">
+      <div class="an-card-h"><b>Filtros</b><button class="link-quiet" id="an-i-limpiar" style="width:auto;margin:0;">Limpiar</button></div>
+      <div class="an-filtros">
+        <div class="chips an-chips">${(AN.ideas.cats || []).map(c => {
+          const t = todas.filter(x => x.cat === c.key).length;
+          return `<button class="an-chip an-chip-cat ${f.cat.has(c.key) ? 'on' : ''}" data-icat="${c.key}" ${t ? '' : 'disabled'}>${esc(c.label)} <b>${t}</b></button>`;
+        }).join('')}</div>
+        ${field('Buscar', inputEl('an-i-q', `placeholder="Idea, persona, zona…" value="${esc(f.q)}"`))}
+      </div>
+    </div>
+
+    <div class="an-card">
+      <div class="an-card-h">
+        <b>Documentos generados</b>
+        <span class="small muted">${cortes.length} corte(s)</span>
+      </div>
+      ${cortes.length
+        ? `<div class="an-cortes">${cortes.slice(0, 6).map(c => `
+            <button class="an-corte" data-corte="${esc(c.id)}">
+              <span class="an-corte-id">${esc(c.id)}</span>
+              <span class="an-corte-m"><b>${c.total} idea(s)</b><span class="small muted">${esc((c.fecha || '').split(' ')[0])} · ${esc(c.autor || '')}</span></span>
+              <span class="an-corte-dl">${I.download}</span>
+            </button>`).join('')}
+           </div>
+           ${cortes.length > 6 ? `<button class="link-quiet" id="an-cortes-todos">Ver los ${cortes.length} cortes</button>` : ''}`
+        : `<p class="center muted small" style="padding:16px 0;">Todavía no has generado ningún documento.</p>`}
+    </div>
+
+    <div class="an-card">
+      <div class="an-card-h"><b>Ideas</b><span class="small muted">${items.length} de ${todas.length}</span></div>
+      <div class="an-ideas" id="an-i-list">${anIdeasCards(items)}</div>
+    </div>
+    <div id="an-selbar"></div>`;
+
+  $$('#an-body [data-iest]').forEach(b => b.onclick = () => {
+    const k = b.dataset.iest;
+    AN.iFiltro.est.has(k) ? AN.iFiltro.est.delete(k) : AN.iFiltro.est.add(k);
+    anIdeasPintar();
+  });
+  $$('#an-body [data-icat]').forEach(b => b.onclick = () => {
+    const k = b.dataset.icat;
+    AN.iFiltro.cat.has(k) ? AN.iFiltro.cat.delete(k) : AN.iFiltro.cat.add(k);
+    anIdeasPintar();
+  });
+  $('#an-i-limpiar').onclick = () => { AN.iFiltro = { est: new Set(), cat: new Set(), q: '' }; anIdeasPintar(); };
+  const q = $('#an-i-q');
+  q.oninput = () => {
+    AN.iFiltro.q = q.value.trim();
+    const l = $('#an-i-list');
+    if (l) l.innerHTML = anIdeasCards(anIdeasFiltradas());
+    anIdeasBind();
+  };
+  $$('#an-body [data-corte]').forEach(b => b.onclick = () => anCorteBajar(b.dataset.corte, b));
+  const todos = $('#an-cortes-todos');
+  if (todos) todos.onclick = anCortesTodos;
+  anIdeasBind();
+  anSelBar();
+}
+
+function anIdeasCards(items) {
+  if (!items.length) return `<p class="center muted" style="padding:22px 0;">Ninguna idea con estos filtros.</p>`;
+  return items.map(it => {
+    const cls = AN_IDEA_CLS[it.estado] || 'pend';
+    const sel = AN.iSel.has(it.id);
+    const puede = AN_SELECCIONABLES.has(it.estado);
+    const fija = it.estado === 'ANOTADA';
+    return `<article class="an-idea an-i-${cls} ${sel ? 'sel' : ''}">
+      <header class="an-idea-h">
+        <div class="an-idea-who">
+          <span class="an-av">${esc(iniciales(it.nombre))}</span>
+          <div><b>${esc(it.nombre || 'Anónimo')}</b><span class="small muted">${esc(it.residencia || '')}</span></div>
+        </div>
+        ${puede ? `<label class="an-check"><input type="checkbox" data-sel="${esc(it.id)}" ${sel ? 'checked' : ''}><span></span></label>` : ''}
+      </header>
+      <div class="an-idea-cat"><span class="an-cat-tag">${esc(it.catLabel)}</span><span class="an-pill an-i-b-${cls}">${esc(anLabelIdea(it.estado))}</span></div>
+      <div class="an-texto an-idea-txt">${esc(it.texto)}</div>
+      <footer class="an-idea-f">
+        <span class="small muted">${esc((it.fecha || '').split(' ')[0] || '')}</span>
+        <div class="an-idea-btns">
+          ${fija
+            ? `<span class="small muted an-fija">Ya quedó en un documento</span>`
+            : `<button class="an-mini an-i-b-leida ${it.estado === 'LEIDA' ? 'on' : ''}" data-est="LEIDA" data-id="${esc(it.id)}">Leída</button>
+               <button class="an-mini an-i-b-cuenta ${it.estado === 'A TENER EN CUENTA' ? 'on' : ''}" data-est="A TENER EN CUENTA" data-id="${esc(it.id)}">A tener en cuenta</button>`}
+        </div>
+      </footer>
+    </article>`;
+  }).join('');
+}
+
+function anIdeasBind() {
+  $$('#an-i-list [data-sel]').forEach(cb => cb.onchange = () => {
+    cb.checked ? AN.iSel.add(cb.dataset.sel) : AN.iSel.delete(cb.dataset.sel);
+    const card = cb.closest('.an-idea');
+    if (card) card.classList.toggle('sel', cb.checked);
+    anSelBar();
+  });
+  $$('#an-i-list [data-est][data-id]').forEach(b => b.onclick = () => anIdeaEstado(b.dataset.id, b.dataset.est, b));
+}
+
+async function anIdeaEstado(id, estado, btn) {
+  const idea = (AN.ideas.ideas || []).find(x => x.id === id);
+  if (idea && idea.estado === estado) return; // ya está así
+  saving(btn, true);
+  try {
+    await api('priv.anIdeaEstado', {}, 'POST', Object.assign(anAuth(), { id, estado }));
+    if (idea) idea.estado = estado;
+    anSync();
+    if (estado !== 'A TENER EN CUENTA') AN.iSel.delete(id);
+    toast(estado === 'LEIDA' ? 'Marcada como leída' : 'Marcada para tener en cuenta');
+    anIdeasPintar();
+  } catch (e) {
+    saving(btn, false);
+    toast(e.message || 'No se pudo cambiar el estado', 'err');
+  }
+}
+
+/* Barra flotante de selección */
+function anSelBar() {
+  const box = $('#an-selbar');
+  if (!box) return;
+  const n = AN.iSel.size;
+  if (!n) { box.innerHTML = ''; return; }
+  box.innerHTML = `<div class="an-selbar">
+      <div class="an-selbar-t"><b>${n}</b> idea(s) seleccionada(s)</div>
+      <div class="an-selbar-b">
+        <button class="btn btn-quiet" id="an-sel-none">Quitar</button>
+        <button class="btn btn-primary" id="an-sel-pdf">${I.pdf} Crear documento</button>
+      </div>
+    </div>`;
+  $('#an-sel-none').onclick = () => { AN.iSel.clear(); anIdeasPintar(); };
+  $('#an-sel-pdf').onclick = () => anIdeasPdf($('#an-sel-pdf'));
+}
+
+async function anIdeasPdf(btn) {
+  const ids = Array.from(AN.iSel);
+  if (!ids.length) return;
+  const todas = AN.ideas.ideas || [];
+  const sel = ids.map(id => todas.find(x => x.id === id)).filter(Boolean);
+  const nuevas = sel.filter(x => x.estado === 'A TENER EN CUENTA').length;
+  const yaAnot = sel.filter(x => x.estado === 'ANOTADA').length;
+
+  const ok = await confirmar('Crear documento', `
+    ${crow('Ideas', String(sel.length))}
+    ${crow('Pasan a Anotada', String(nuevas))}
+    ${yaAnot ? crow('Ya estaban anotadas', String(yaAnot)) : ''}
+    ${crow('Aspectos', String(new Set(sel.map(x => x.catLabel)).size))}
+    <p class="small muted" style="margin-top:10px;">Se guarda el corte para poder volver a descargarlo tal cual más adelante.</p>`);
+  if (!ok) return;
+
+  saving(btn, true);
+  try {
+    const body = Object.assign(anAuth(), { ids: ids.join(',') });
+    const r = await api('priv.anIdeasPdf', {}, 'POST', body);
+    if (!r || !r.base64) throw new Error('El documento llegó vacío');
+    downloadB64(r.base64, r.mime, r.filename);
+    AN.iSel.clear();
+    toast(`Corte ${(r.corte && r.corte.id) || ''} generado`);
+    await anRecargar();                    // estados + cortes nuevos (un viaje, en silencio)
+    anPintarTab();
+  } catch (e) {
+    saving(btn, false);
+    toast(e.message || 'No se pudo crear el documento', 'err');
+  }
+}
+
+async function anCorteBajar(id, btn) {
+  saving(btn, true);
+  try {
+    const r = await api('priv.anCortePdf', Object.assign(anAuth(), { corte: id }));
+    if (!r || !r.base64) throw new Error('El documento llegó vacío');
+    downloadB64(r.base64, r.mime, r.filename);
+    toast(`Corte ${id} descargado`);
+  } catch (e) {
+    toast(e.message || 'No se pudo regenerar el documento', 'err');
+  }
+  saving(btn, false);
+}
+
+function anCortesTodos() {
+  const cortes = AN.ideas.cortes || [];
+  openSheet(`<div class="grip"></div>
+    <h2 class="h2" style="margin-bottom:2px;">Documentos generados</h2>
+    <p class="muted small" style="margin-bottom:14px;">Cada corte se vuelve a armar con las ideas que llevaba.</p>
+    <div class="an-cortes an-cortes-all">${cortes.map(c => `
+      <button class="an-corte" data-corte-s="${esc(c.id)}">
+        <span class="an-corte-id">${esc(c.id)}</span>
+        <span class="an-corte-m"><b>${c.total} idea(s)</b><span class="small muted">${esc((c.fecha || '').split(' ')[0])} · ${esc(c.autor || '')}</span></span>
+        <span class="an-corte-dl">${I.download}</span>
+      </button>`).join('')}</div>
+    <button class="btn btn-quiet btn-block" data-close style="margin-top:16px;">Cerrar</button>`);
+  layer.querySelectorAll('[data-corte-s]').forEach(b => b.onclick = () => anCorteBajar(b.dataset.corteS, b));
+}
+
+/* ============================================================
+   PESTAÑA 3 · COMERCIO
+   ============================================================ */
+function anComFiltrados() {
+  const f = AN.cFiltro;
+  const q = f.q.toLowerCase();
+  return (AN.com.items || []).filter(it => {
+    if (f.est === 'ACTIVOS' && !it.visible) return false;
+    if (f.est === 'INACTIVOS' && it.visible) return false;
+    if (f.cat !== 'TODAS' && it.categoria !== f.cat) return false;
+    if (q && !(`${it.titulo} ${it.descripcion} ${it.categoria} ${it.premium} ${it.estandar} ${it.direccion}`.toLowerCase().includes(q))) return false;
+    return true;
+  });
+}
+
+function anComPintar() {
+  const f = AN.cFiltro;
+  const todos = AN.com.items || [];
+  const items = anComFiltrados();
+  const activos = todos.filter(x => x.visible).length;
+  const cats = Array.from(new Set(todos.map(x => x.categoria).filter(Boolean))).sort((a, b) => a.localeCompare(b, 'es'));
+
+  $('#an-body').innerHTML = `
+    <div class="an-kpis">
+      <div class="an-kpi an-k-tot"><b>${todos.length}</b><span>Comercios</span></div>
+      <div class="an-kpi an-k-ate"><b>${activos}</b><span>En la app</span></div>
+      <div class="an-kpi an-k-off"><b>${todos.length - activos}</b><span>Ocultos</span></div>
+      <div class="an-kpi an-k-pct"><b>${cats.length}</b><span>Categorías</span></div>
+    </div>
+
+    <div class="an-card">
+      <div class="an-filtros">
+        <div class="chips an-chips">
+          ${['TODOS', 'ACTIVOS', 'INACTIVOS'].map(k => `<button class="an-chip an-chip-com ${f.est === k ? 'on' : ''}" data-cest="${k}">${k === 'TODOS' ? 'Todos' : k === 'ACTIVOS' ? 'En la app' : 'Ocultos'}</button>`).join('')}
+        </div>
+        <div class="an-selects">
+          ${field('Categoría', `<select class="input" id="an-c-cat"><option value="TODAS">Todas</option>${cats.map(c => `<option ${f.cat === c ? 'selected' : ''}>${esc(c)}</option>`).join('')}</select>`)}
+          ${field('Buscar', inputEl('an-c-q', `placeholder="Comercio, oferta, dirección…" value="${esc(f.q)}"`))}
+        </div>
+      </div>
+    </div>
+
+    ${anResKpis()}
+    ${anResRanking()}
+
+    <div class="an-grid" id="an-c-list">${anComCards(items)}</div>`;
+
+  $$('#an-body [data-cest]').forEach(b => b.onclick = () => { AN.cFiltro.est = b.dataset.cest; anComPintar(); });
+  $('#an-c-cat').onchange = (e) => { AN.cFiltro.cat = e.target.value; anComPintar(); };
+  const q = $('#an-c-q');
+  q.oninput = () => {
+    AN.cFiltro.q = q.value.trim();
+    const l = $('#an-c-list');
+    if (l) l.innerHTML = anComCards(anComFiltrados());
+    anComBind();
+  };
+  anComBind();
+}
+
+/* AJUSTES 16/07: la imagen ya no ocupa la primera visual de la tarjeta
+   (se veían pocos comercios por pantalla). Ahora hay un botón "Ver imagen"
+   que la abre con el mismo visor con zoom de la pública. */
+function anComCards(items) {
+  if (!items.length) return `<p class="center muted" style="padding:26px 0;grid-column:1/-1;">Ningún comercio con estos filtros.</p>`;
+  return items.map(it => `
+    <article class="an-com an-com-slim ${it.visible ? '' : 'off'}">
+      <div class="an-com-body">
+        <div class="an-com-toprow">
+          <div class="an-com-cat">${esc(it.categoria || '—')}</div>
+          <span class="an-com-est ${it.visible ? 'on' : ''}">${it.visible ? 'En la app' : 'Oculto'}</span>
+        </div>
+        <h3 class="an-com-t">${esc(it.titulo)}</h3>
+        ${it.imagen ? `<button type="button" class="an-com-verimg" data-img="${esc(it.imagen)}">${I.eyeOn} Ver imagen</button>` : ''}
+        ${it.descripcion ? `<div class="an-texto an-com-d">${esc(it.descripcion)}</div>` : ''}
+        <div class="an-ofertas">
+          ${it.premium ? `<div class="an-of an-of-p"><span>Premium ⭐</span>${esc(it.premium)}</div>` : ''}
+          ${it.estandar ? `<div class="an-of an-of-e"><span>Estándar</span>${esc(it.estandar)}</div>` : ''}
+          ${!it.premium && !it.estandar ? `<div class="small muted">Sin ofertas registradas.</div>` : ''}
+        </div>
+        ${it.direccion ? `<div class="an-com-dir small muted">${I.pin} ${esc(it.direccion)}</div>` : ''}
+        <div class="an-com-links">
+          ${anComLink(it.ubicacion, 'Ubicación')}${anComLink(it.facebook, 'Facebook')}${anComLink(it.instagram, 'Instagram')}
+          ${anComLink(it.tiktok, 'TikTok')}${anComLink(it.reel, 'Video')}
+          ${it.whatsapp ? `<a class="an-com-link" href="https://wa.me/${esc(it.whatsapp)}" target="_blank" rel="noopener">WhatsApp</a>` : ''}
+        </div>
+      </div>
+      ${anResPie(it.nit)}
+      <div class="an-com-f">
+        <button class="btn ${it.visible ? 'btn-quiet' : 'btn-primary'} btn-block" data-com="${esc(it.nit)}" data-to="${it.visible ? 'INACTIVO' : 'ACTIVO'}">
+          ${it.visible ? 'Desactivar' : 'Activar'}
+        </button>
+      </div>
+    </article>`).join('');
+}
+
+/* ============================================================
+   ANÁLISIS → COMERCIOS · estrellas y reseñas (03/08/2026)
+   Lectura + moderación: desde aquí se OCULTA o se vuelve a mostrar
+   una reseña. Lo que oculta el administrador no lo puede destapar el
+   comerciante desde su app.
+   ============================================================ */
+function anResDe(nit) {
+  const r = (AN.res && AN.res.items) || [];
+  return r.find(x => String(x.nit) === String(nit)) ||
+    { estrellas: 0, promedio: 0, dist: [0, 0, 0, 0, 0], resenas: 0, ocultas: 0 };
+}
+
+function anResEstrellas(n) {
+  let s = '';
+  for (let i = 1; i <= 5; i++) s += `<span class="an-stf ${i <= n ? 'on' : ''}">${I.star}</span>`;
+  return `<span class="an-stfs">${s}</span>`;
+}
+
+/* Fila de valoración que se cuelga de cada tarjeta de comercio. */
+function anResPie(nit) {
+  const v = anResDe(nit);
+  return `<div class="an-res-pie">
+    <div class="an-res-nota">${anResEstrellas(Math.round(v.promedio))}
+      <b>${v.estrellas ? String(v.promedio).replace('.', ',') : '—'}</b>
+      <span class="small muted">${v.estrellas} calif.</span>
+    </div>
+    <button class="an-res-btn" data-res="${esc(nit)}">${v.resenas} reseña${v.resenas === 1 ? '' : 's'}${v.ocultas ? ` · ${v.ocultas} oculta${v.ocultas === 1 ? '' : 's'}` : ''}</button>
+  </div>`;
+}
+
+/* KPIs globales de la reputación, encima de la rejilla de comercios. */
+function anResKpis() {
+  const g = (AN.res && AN.res.global) || { estrellas: 0, promedio: 0, resenas: 0, ocultas: 0, respondidas: 0 };
+  const sinResp = Math.max(0, g.resenas - g.respondidas);
+  return `<div class="an-kpis an-kpis-res">
+    <div class="an-kpi an-k-tot"><b>${g.estrellas ? String(g.promedio).replace('.', ',') : '—'}</b><span>Promedio general</span></div>
+    <div class="an-kpi an-k-ate"><b>${g.estrellas}</b><span>Calificaciones</span></div>
+    <div class="an-kpi an-k-pct"><b>${g.resenas}</b><span>Reseñas visibles</span></div>
+    <div class="an-kpi an-k-off"><b>${g.ocultas}</b><span>Ocultas</span></div>
+    <div class="an-kpi ${sinResp ? 'an-k-pen' : ''}"><b>${sinResp}</b><span>Sin responder</span></div>
+  </div>`;
+}
+
+/* Ranking: los mejor calificados y los que piden atención. */
+function anResRanking() {
+  const items = ((AN.res && AN.res.items) || []).filter(x => x.estrellas > 0);
+  if (!items.length) return '';
+  const max = Math.max.apply(null, items.map(x => x.estrellas).concat([1]));
+  return `<div class="an-card an-res-rank">
+    <h3 class="an-t">Reputación por comercio</h3>
+    <div class="an-bars">${items.slice(0, 12).map(x => `
+      <div class="an-bar-row">
+        <div class="an-bar-lbl" title="${esc(x.titulo)}">${esc(x.titulo)}</div>
+        <div class="an-bar-track"><div class="an-bar-fill an-bar-oro" style="width:${Math.round((x.estrellas / max) * 100)}%;"></div></div>
+        <div class="an-bar-num"><b>${String(x.promedio).replace('.', ',')} ★</b><span>${x.estrellas}</span></div>
+      </div>`).join('')}</div>
+  </div>`;
+}
+
+function anResFechaCorta(f) {
+  const m = String(f || '').match(/^(\d{2})\/(\d{2})\/(\d{4})(?:\s+(\d{2}):(\d{2}))?/);
+  if (!m) return esc(f || '');
+  const meses = ['ene', 'feb', 'mar', 'abr', 'may', 'jun', 'jul', 'ago', 'sep', 'oct', 'nov', 'dic'];
+  return `${m[1]} ${meses[parseInt(m[2], 10) - 1]} ${m[3]}${m[4] ? ' · ' + m[4] + ':' + m[5] : ''}`;
+}
+
+let AN_RES_NIT = '';
+
+function anResVer(nit) {
+  AN_RES_NIT = String(nit);
+  openSheet(`<div class="grip"></div><h2 class="h2" id="an-res-t">Reseñas</h2><div id="an-res-body"></div>`, 'an-res-sheet');
+  anResPintarModal();
+}
+
+function anResPintarModal() {
+  const body = $('#an-res-body');
+  if (!body) return;
+  const com = ((AN.com && AN.com.items) || []).find(x => String(x.nit) === AN_RES_NIT);
+  const v = anResDe(AN_RES_NIT);
+  const lista = ((AN.res && AN.res.resenas) || []).filter(x => String(x.nit) === AN_RES_NIT);
+  const t = $('#an-res-t');
+  if (t) t.textContent = (com && com.titulo) || 'Reseñas';
+
+  body.innerHTML = `
+    <div class="an-res-head">
+      ${anResEstrellas(Math.round(v.promedio))}
+      <b>${v.estrellas ? String(v.promedio).replace('.', ',') : '—'}</b>
+      <span class="small muted">${v.estrellas} calificación${v.estrellas === 1 ? '' : 'es'} · ${v.resenas} visible${v.resenas === 1 ? '' : 's'}${v.ocultas ? ' · ' + v.ocultas + ' oculta(s)' : ''}</span>
+    </div>
+    <div class="an-res-list">${lista.length ? lista.map(it => `
+      <article class="an-res-item ${it.estado === 'OCULTA' ? 'off' : ''}">
+        <div class="an-res-top">
+          <div class="an-res-id">
+            <b>${esc(it.nombre)}</b>
+            <span class="small muted">CC ${esc(it.documento)} · ${anResFechaCorta(it.fecha)}${it.editado ? ' · editada' : ''}</span>
+          </div>
+          ${it.estrellas ? anResEstrellas(it.estrellas) : ''}
+        </div>
+        <p class="an-res-tx">${esc(it.texto)}</p>
+        ${it.respuesta ? `<div class="an-res-reply"><b>Respuesta del comercio</b><p>${esc(it.respuesta)}</p></div>` : `<div class="small muted" style="margin-top:6px;">El comercio no ha respondido.</div>`}
+        <div class="an-res-acts">
+          <span class="small muted">${it.likes} me gusta${it.estado === 'OCULTA' ? ` · oculta por ${esc((it.ocultaPor || '').toLowerCase() || 'el sistema')}` : ''}</span>
+          <button class="btn ${it.estado === 'OCULTA' ? 'btn-primary' : 'btn-quiet'}" data-ocultar="${esc(it.id)}" data-val="${it.estado === 'OCULTA' ? '0' : '1'}">
+            ${it.estado === 'OCULTA' ? 'Mostrar' : 'Ocultar'}
+          </button>
+        </div>
+      </article>`).join('') : `<p class="center muted" style="padding:18px 0;">Este comercio todavía no tiene reseñas.</p>`}
+    </div>`;
+
+  $$('#an-res-body [data-ocultar]').forEach(b => b.onclick = () => anResOcultar(b.dataset.ocultar, b.dataset.val, b));
+}
+
+async function anResOcultar(id, val, btn) {
+  saving(btn, true);
+  try {
+    await api('priv.anResenaOcultar', {}, 'POST', Object.assign({ id: id, ocultar: val }, anAuth()));
+    AN.res = await api('priv.anResenas', anAuth());
+    anSync();
+    anResPintarModal();
+    const l = $('#an-c-list');
+    if (l) { l.innerHTML = anComCards(anComFiltrados()); anComBind(); }
+    const k = $('.an-kpis-res');
+    if (k) k.outerHTML = anResKpis();
+    toast(val === '1' ? 'Reseña oculta en la app pública' : 'Reseña visible de nuevo');
+  } catch (e) {
+    saving(btn, false);
+    toast(e.message || 'No se pudo cambiar', 'err');
+  }
+}
+
+function anComLink(url, label) {
+  return url ? `<a class="an-com-link" href="${esc(url)}" target="_blank" rel="noopener">${esc(label)}</a>` : '';
+}
+
+function anComBind() {
+  $$('#an-c-list [data-img]').forEach(b => b.onclick = () => zoomImagen(b.dataset.img));
+  $$('#an-c-list [data-com]').forEach(b => b.onclick = () => anComEstado(b.dataset.com, b.dataset.to, b));
+  $$('#an-c-list [data-res]').forEach(b => b.onclick = () => anResVer(b.dataset.res));
+}
+
+async function anComEstado(nit, estado, btn) {
+  const it = (AN.com.items || []).find(x => x.nit === nit);
+  if (!it) return;
+  const apagar = estado === 'INACTIVO';
+  const ok = await confirmar(apagar ? 'Desactivar comercio' : 'Activar comercio', `
+    ${crow('Comercio', it.titulo)}
+    ${crow('Categoría', it.categoria)}
+    <p class="small muted" style="margin-top:10px;">${apagar
+      ? 'Dejará de verse en la app pública de inmediato. Puedes volver a activarlo cuando quieras.'
+      : 'Volverá a verse en la app pública de inmediato.'}</p>`);
+  if (!ok) return;
+  saving(btn, true);
+  try {
+    const body = Object.assign(anAuth(), { nit, estado });
+    const r = await api('priv.anComercioEstado', {}, 'POST', body);
+    it.estado = r.estado; it.visible = !!r.visible;
+    anSync();
+    toast(apagar ? 'Comercio oculto de la app pública' : 'Comercio visible en la app pública');
+    anComPintar();
+  } catch (e) {
+    saving(btn, false);
+    toast(e.message || 'No se pudo cambiar el estado', 'err');
+  }
+}
+
+
+/* ============================================================
+   CONFIGURACIÓN  (Módulo 9 · entran DEV y ADMIN)
+   Las pestañas Usuarios y Avanzado son solo del DEV. El backend
+   también lo verifica: aquí solo se esconde el botón.
+   ============================================================ */
+let CF_ME = '', CF = null;
+
+/* Cada módulo lleva su propio caller (auth()/BD_ME es solo de Base de Datos) */
+function cfAuth() { return { caller: CF_ME }; }
+/* 11/11/2026 · Agenda: el CORE solo ANOTA en la cola quién debe entrar o
+   salir del Google Calendar (un INVITADO nunca). Aquí se dispara de fondo,
+   sin esperar ni avisar: si falla, lo termina el reloj horario del CORE. */
+function cfAgAcceso(r) {
+  if (!r || !r.agAcceso) return;
+  try { api('priv.agAcceso', {}, 'POST', cfAuth()).catch(() => {}); } catch (e) {}
+}
+
+/* Normaliza para comparar/buscar: sin acentos y en mayúsculas.
+   (norm() no es global en esta app: es una const local de otro módulo.) */
+const cfNorm = s => String(s == null ? '' : s).normalize('NFD').replace(/[\u0300-\u036f]/g, '').toUpperCase().trim();
+
+const CF_TABS = [
+  { k: 'general', label: 'General', dev: false },
+  { k: 'casa', label: 'Casa social', dev: false },
+  { k: 'emergencia', label: 'Emergencia', dev: false },
+  { k: 'servicios', label: 'Servicios', dev: false },
+  { k: 'profesionales', label: 'Profesionales', dev: false },
+  { k: 'zonas', label: 'Zonas', dev: false },
+  { k: 'plantillas', label: 'Plantillas', dev: false },
+  /* 17/07/2026: Usuarios y Call Center también los ve el ADMIN (el backend
+     los abrió a CF_ROLES). Avanzado sigue siendo SOLO del DESARROLLADOR. */
+  { k: 'usuarios', label: 'Usuarios', dev: false },
+  { k: 'call', label: 'Call Center', dev: false },
+  { k: 'avanzado', label: 'Avanzado', dev: true }
+];
+/* 07/11/2026 · INVITADO con acceso a Configuración: solo los apartados que
+   le dieron (pastillas cf.casa / cf.emergencia / cf.inicio). El CORE además le manda solo
+   esos datos (cfTodoInvitado_) y filtra lo que guarda. */
+const CF_TABS_INV = [
+  { k: 'casa', label: 'Casa social', perm: 'casa' },
+  { k: 'emergencia', label: 'Emergencia', perm: 'emergencia' },
+  { k: 'inicio', label: 'Inicio de la app', perm: 'inicio' }
+];
+function cfTabsVisibles() {
+  if (CF.d && CF.d.esInvitado) { const pc = CF.d.permCf || {}; return CF_TABS_INV.filter(t => pc[t.perm]); }
+  return CF_TABS.filter(t => !t.dev || (CF.d && CF.d.esDev));
+}
+function cfTabInicial() { const t = cfTabsVisibles(); return t.length ? t[0].k : 'general'; }
+
+/* Claves de CONFIG agrupadas para la pestaña General. Lo que no esté aquí
+   (y no sea plantilla ni de Avanzado) cae en "Otros ajustes": así una clave
+   nueva en la hoja nunca queda invisible. */
+/* AJUSTE 17/07/2026 · LAS APPS EN UN SOLO BLOQUE (6 desde el call center).
+   Cada fila es [clave, etiqueta, ayuda, NOMBRE]. El NOMBRE es el que entra en
+   {nombreApp} del mensaje de "Compartir App" — son fijos, los cerró el
+   usuario. APP_PRIVADA_URL se MUDÓ aquí desde "Avisos del bot": es la misma
+   clave (el correo de aviso del bot la sigue leyendo igual), solo cambia
+   dónde se edita. */
+const CF_APPS = [
+  ['APP_PUBLICA_URL', 'App pública', 'La de los líderes y la gente. Destino del push de "Ponte al día".', 'PÚBLICA'],
+  ['APP_PRIVADA_URL', 'App privada', 'Esta misma. También es el destino del botón del correo de aviso del bot.', 'PRIVADA'],
+  ['COMERCIO_URL', 'App de comerciantes', '', 'COMERCIANTES'],
+  ['APP_ASISTENCIA_URL', 'App de asistencias', 'El escáner de kiosco de los eventos.', 'ASISTENCIA'],
+  ['APP_VOTACION_URL', 'App de votación', 'El escáner de kiosco del día de elecciones.', 'VOTACIÓN'],
+  /* 6ª app (17/07/2026): el call center. */
+  ['APP_CENTER_URL', 'App del call center', 'La de los usuarios CALL. Su acceso se configura en la pestaña Call Center.', 'CALL CENTER']
+  /* 12/11/2026 · se quitó POSTCONSULTA_URL: la validación vive en SUAREZ → Mis referidos */
+];
+
+/* AJUSTE 23/07/2026 · "Otros enlaces" e "Imágenes y marca" salieron de la
+   pestaña General y viven ahora DENTRO de Avanzado → Infraestructura (solo
+   DESARROLLADOR). Las claves son las mismas y se guardan igual: solo cambia
+   dónde se editan. "Otros ajustes" (las claves de CONFIG sin sitio propio) se
+   mudó al mismo lugar, se arma en cfPintaAvanzado. */
+const CF_DEV_GRUPOS = [
+  { titulo: 'Otros enlaces', sub: 'A dónde llevan otros botones de la app pública.', keys: [
+    ['REGISTRADURIA_URL', 'Consultar puesto de votación', '']
+  ] },
+  { titulo: 'Imágenes y marca', sub: 'Pega la URL de la imagen.', keys: [
+    ['APP_BANNER', 'Banner de la marca', 'Login y correos.'],
+    ['APP_ICON', 'Ícono de la app', ''],
+    ['FOTO_DEFAULT', 'Foto de perfil por defecto', 'Cuando la persona no ha subido la suya.']
+  ] }
+];
+
+const CF_GENERAL = [
+  { titulo: 'Correos', sub: '', keys: [
+    ['CORREO_REMITENTE', 'Nombre del remitente', 'Lo que ve quien recibe el correo.'],
+    ['CORREO_BANNER', 'Banner de los correos', '']
+  ] },
+  /* Módulo 10: a quién se le avisa si el bot de WhatsApp se cae. El aviso va
+     por CORREO a propósito — si el bot está caído, avisar POR el bot no
+     serviría de nada. Los textos se editan en la pestaña Plantillas. */
+  { titulo: '🔔 Avisos del bot', sub: 'Quién recibe el correo si el bot de WhatsApp se desconecta. Se revisa cada hora y solo avisa tras dos chequeos caídos seguidos.', keys: [
+    ['ALERTA_BOT_EMAIL_1', 'Correo 1', 'El principal.'],
+    ['ALERTA_BOT_EMAIL_2', 'Correo 2', 'Opcional.'],
+    ['ALERTA_BOT_EMAIL_3', 'Correo 3', 'Opcional.']
+    /* 17/07: APP_PRIVADA_URL se mudó al bloque "Enlaces de las apps" (CF_APPS).
+       La clave y su uso en el correo de aviso NO cambian. */
+  ] },
+  /* 08/11/2026 · VOTACIÓN y ASISTENCIAS sin conexión: la clave con la que el
+     coordinador baja al teléfono la copia de la base («Prepararme para salir
+     sin señal»). La revisa el CORE (Escaneo_SinRed.gs · esc.copia). */
+  { titulo: '📷 Escáner sin señal', sub: 'La clave que piden las apps de Votación y Asistencias para bajar al teléfono la copia de la base. Entrégala solo a los coordinadores. Si la cambias, los teléfonos que ya la tenían la vuelven a pedir al actualizar la copia.', keys: [
+    ['ESCANER_CLAVE', 'Clave del escáner', 'Números o letras. Hoy: 6 dígitos.']
+  ] }
+];
+const CF_CASA_KEYS = ['CASA_TITULO', 'CASA_INTRO', 'CASA_CIERRE', 'CASA_HASHTAGS', 'CASA_DIRECCION',
+  'CASA_LAT', 'CASA_LNG', 'CASA_REDES_TITULO', 'CASA_REDES_SUB'];
+const CF_EM_KEYS = ['EMERGENCIA_TITULO', 'EMERGENCIA_SUB'];
+const CF_AV_KEYS = ['BB_API_URL', 'BB_API_KEY', 'BB_ENDPOINT_BASE', 'BB_BOT_ID',
+  'BB_PROJECT_ID', 'BB_MANAGER_API',
+  'DRIVE_QR_FOLDER', 'DRIVE_CASA_FOLDER', 'DRIVE_INICIO_FOLDER',
+  'CAL_EVENTOS', 'CAL_AGENDA',
+  'ELECCION_FECHA', 'ELECCION_HORA_INICIO', 'ELECCION_HORA_FIN',
+  /* 23/07/2026: faltaba. Tiene tarjeta propia en Avanzado, así que no debe
+     salir además como clave suelta en "Otros ajustes" (antes se duplicaba en
+     General; ahora las dos estarían en la misma pestaña). */
+  'CLAVE_ELIMINACION',
+  /* 31/07/2026 · interruptor de la Agenda estricta (tarjeta propia). */
+  'AGENDA_ESTRICTA'];
+/* La plantilla de "Compartir App" se edita en el bloque de Enlaces (es de ahí
+   de donde se usa), NO en la pestaña Plantillas: por eso no está en
+   CF_PLANTILLAS del backend y se declara aparte para que no caiga en "Otros
+   ajustes". */
+const CF_COMPARTIR_KEY = 'PLANTILLA_COMPARTIR';
+/* AJUSTE 20/07: claves del candidato (sección Agenda del acordeón General). */
+/* 27/07/2026 · Fase 2 (marca blanca): el nombre del candidato se mudo a
+   MARCA_CANDIDATO_NOMBRE. Sigue editandose AQUI, en General → Agenda, para
+   que el ADMIN lo pueda corregir (Avanzado es solo del DEV). La llave vieja
+   AGENDA_CANDIDATO_NOMBRE se oculta: el CORE ya no la lee salvo como
+   respaldo, y dejarla visible haria que alguien la editara sin efecto. */
+const CF_AGENDA_KEYS = ['MARCA_CANDIDATO_NOMBRE', 'AGENDA_CANDIDATO_WA', 'AGENDA_MANEJO'];
+/* Claves del inicio: tienen tarjeta propia en General (imagen + video). */
+const CF_INICIO_KEYS = ['INICIO_IMAGEN_DRIVE', 'INICIO_REEL_URL'];
+/* Claves que la app maneja sola: nunca se escriben a mano, no se muestran.
+   INICIO_IMAGEN_ID lo pone la subida de la imagen y sirve para purgar la
+   anterior de Drive. Si se mostrara, alguien la borraría sin querer y la
+   imagen vieja quedaría de basura en Drive para siempre. */
+/* Claves que la app maneja sola: no se muestran como campo editable.
+   Las tres del bot las escribe el monitoreo (Módulo 10); editarlas a mano solo
+   confundiría al contador de fallos. */
+/* REFIERE_URL: 'Refiere por WhatsApp' se retiró el 20/07; se oculta para que
+   no reaparezca en "Otros ajustes". La fila puede seguir en la hoja CONFIG. */
+/* AGENDA_CANDIDATO_NOMBRE (27/07/2026): la reemplazo MARCA_CANDIDATO_NOMBRE.
+   La fila puede seguir en la hoja CONFIG como respaldo; aqui se oculta para
+   que no reaparezca en "Otros ajustes" y nadie la edite creyendo que sirve. */
+const CF_OCULTAS = ['INICIO_IMAGEN_ID', 'ALERTA_BOT_FALLOS', 'ALERTA_BOT_ULTIMA_ALERTA', 'BOT_SILENCIADO', 'REFIERE_URL',
+  'AGENDA_CANDIDATO_NOMBRE',
+  /* 08/11/2026 · tienen su sección propia (Vistas de la app pública) */
+  'PUB_VISTAS_APAGADAS', 'PUB_VISTAS_POR', 'PUB_VISTAS_FECHA',
+  /* 11/11/2026 · tienen su tarjeta propia (Avanzado → Motivos de POR CONFIRMAR) */
+  'PC_MOTIVOS_CFG', 'PC_MOTIVOS_POR', 'PC_MOTIVOS_FECHA'];
+
+/* ---------- MARCA DE CAMPANA (27/07/2026 · Fase 2) ----------
+   Las llaves que hacen replicable el ecosistema. Tienen tarjeta propia en
+   Avanzado, asi que NO deben salir ademas sueltas en "Otros ajustes".
+   MARCA_CANDIDATO_NOMBRE no esta en esta lista: se edita en General → Agenda
+   (esta en CF_AGENDA_KEYS) y aqui solo se muestra de lectura. */
+const CF_MARCA_CAMPOS = [
+  ['MARCA_LEMA', 'Lema de la campaña', 'Pie de los PDF y mensaje a los comercios.'],
+  ['MARCA_EQUIPO', 'Nombre del equipo', 'Firma de correos y plantillas. Hoy: "Equipo del Hacer".'],
+  ['MARCA_DEPARTAMENTO', 'Departamento', 'Solo para el pie de los reportes: "Municipio, Departamento".'],
+  ['MARCA_COLOR', 'Color principal', 'HEX, con #. Encabezado de los PDF, tablas y botones de los correos.'],
+  ['MARCA_COLOR_700', 'Color principal oscuro', 'HEX, con #. Títulos de sección y cifras de los PDF.'],
+  ['MARCA_EXPORT_PREFIJO', 'Prefijo de los archivos', 'Con lo que empiezan los Excel y PDF que se descargan.'],
+  ['MARCA_PUSH_TITULO', 'Título de las notificaciones', 'Déjalo vacío y se arma solo: "<candidato> publicó una noticia".'],
+  ['MARCA_CRED_BASE', 'Base de la credencial', 'La URL que llevan impresa los QR. Termina en /.'],
+  ['MARCA_IMG_BASE', 'Carpeta de las imágenes', 'Dónde viven el logo, el banner y la foto por defecto. Termina en /. Con esto puesto, esas llaves pueden guardar solo el nombre del archivo.'],
+  ['MARCA_FB_PROJECT', 'Firebase · proyecto', 'CADA CAMPAÑA NECESITA EL SUYO. Compartirlo cruza los push de las dos.'],
+  ['MARCA_FB_RTDB', 'Firebase · base en tiempo real', 'Del MISMO proyecto de arriba. Mueve los push y el refresco en vivo.']
+];
+const CF_MARCA_KEYS = CF_MARCA_CAMPOS.map(c => c[0]).concat(['MARCA_MUNICIPIO', 'MARCA_CANDIDATO_NOMBRE']);
+
+async function viewConfig(user) {
+  CF_ME = user.documento;
+  CF = { tab: 'general', user, d: null };
+  CF_ACC = {}; CF_HOJA = null; CF_EDIT = null;   /* 02/08: estado del acordeón y de la hoja */
+  appWide(true);
+  app.innerHTML = `${backbar('Configuración')}<div class="pad stack" id="cf-root">${loadingBox('Cargando la configuración…')}</div>`;
+  app.hidden = false; hideSplash();
+  /* 17/07/2026 · El "atrás" de Configuración solo sale al inicio desde General.
+     Estando en cualquier otro apartado (Casa social, Usuarios, Call Center…)
+     devuelve a Configuración — que es esta misma vista en su pestaña de
+     entrada, General. Antes se salía al inicio desde donde fuera y había que
+     volver a entrar y a buscar la pestaña. */
+  $('#backbtn').onclick = () => {
+    if (CF.d && CF.tab !== cfTabInicial()) { CF.tab = cfTabInicial(); cfRender(); window.scrollTo(0, 0); return; }
+    go('home');
+  };
+  await cfCargar();
+
+  vivoBind('config', CF_ME, vivoConfig);   // EN VIVO
+}
+
+/* ---- EN VIVO · Configuración ----
+   Se queda en la misma pestaña (CF.tab no se toca). Si el DEV está con una
+   hoja abierta (usuario, servicio, zona…) y entra un cambio, se cierra: es la
+   regla que pidió el usuario. */
+async function vivoConfig() {
+  const d = await api('priv.cfgTodo', {}, 'POST', cfAuth(), SILENCIO);
+  if (!vivoCambio(JSON.stringify(d))) return;
+  /* 02/08/2026: ya no se cierra la hoja ni se borra lo que estás escribiendo.
+     Se guarda lo tuyo, se repinta con lo nuevo, se devuelve lo tuyo y solo se
+     marca lo que el otro dispositivo cambió de verdad. */
+  const antes = CF.d;
+  cfEdicionTomar(antes);
+  CF.d = d;
+  cfRender();
+  cfHojaRevisar(antes, d);
+  CF_EDIT = null;
+}
+
+async function cfCargar() {
+  try {
+    CF.d = await api('priv.cfgTodo', {}, 'POST', cfAuth());
+    if (CF.d && CF.d.esInvitado) CF.tab = cfTabInicial();
+    cfRender();
+  } catch (e) {
+    $('#cf-root').innerHTML = `<div class="card pad center"><p class="muted">${esc(String(e.message || e))}</p></div>`;
+  }
+}
+
+function cfRender() {
+  const tabs = cfTabsVisibles();
+  if (!tabs.length) { $('#cf-root').innerHTML = `<div class="card pad center"><p class="muted">No tienes apartados de Configuración asignados.</p></div>`; return; }
+  if (!tabs.some(t => t.k === CF.tab)) CF.tab = tabs[0].k;
+  $('#cf-root').innerHTML = `
+    <div class="cfg-tabs">${tabs.map(t => `<button class="cfg-tab${t.k === CF.tab ? ' active' : ''}" data-t="${t.k}">${esc(t.label)}</button>`).join('')}</div>
+    <div id="cf-body"></div>`;
+  $$('#cf-root .cfg-tab').forEach(b => b.onclick = () => { CF.tab = b.dataset.t; cfRender(); });
+  ({
+    general: cfPintaGeneral, casa: cfPintaCasa, inicio: cfPintaInicio, emergencia: cfPintaEmergencia,
+    servicios: cfPintaServicios, profesionales: cfPintaProfesionales, zonas: cfPintaZonas,
+    plantillas: cfPintaPlantillas, usuarios: cfPintaUsuarios, call: cfPintaCall, avanzado: cfPintaAvanzado
+  })[CF.tab]();
+  cfAccBind();   // AJUSTE 20/07: acordeón en TODAS las vistas (una abierta a la vez)
+}
+
+/* ---------- Piezas ---------- */
+/* AJUSTE 20/07: cada sección de Configuración es un acordeón (colapsable).
+   Inicia CERRADA; el binding global (cfAccBind) deja solo UNA abierta a la vez
+   dentro de su contenedor. Mismo markup que cfAcc para compartir estilo. */
+function cfCard(titulo, sub, inner) {
+  return `<section class="cfg-acc-sec">
+    <button type="button" class="cfg-acc-h" aria-expanded="false">
+      <span class="cfg-acc-t">${esc(titulo)}</span><span class="cfg-acc-ch">${I.chevR}</span>
+    </button>
+    <div class="cfg-acc-b">${sub ? `<p class="cfg-card__sub">${esc(sub)}</p>` : ''}${inner}</div>
+  </section>`;
+}
+function cfField(id, label, val, hint, full) {
+  return `<div class="cfg-field${full ? ' full' : ''}"><label>${esc(label)}</label>
+    <input class="input" id="${id}" value="${esc(val == null ? '' : val)}" autocomplete="off" />
+    ${hint ? `<div class="cfg-hint">${esc(hint)}</div>` : ''}</div>`;
+}
+function cfArea(id, label, val, hint, rows) {
+  return `<div class="cfg-field full"><label>${esc(label)}</label>
+    <textarea class="input area" id="${id}" rows="${rows || 3}">${esc(val == null ? '' : val)}</textarea>
+    ${hint ? `<div class="cfg-hint">${esc(hint)}</div>` : ''}</div>`;
+}
+function cfSwitch(id, label, on) {
+  return `<button class="cfg-sw${on ? ' on' : ''}" id="${id}" role="switch" aria-checked="${on ? 'true' : 'false'}"><span class="cfg-sw-k"></span><span>${esc(label)}</span></button>`;
+}
+function cfVacio(txt) { return `<p class="cfg-empty">${esc(txt)}</p>`; }
+
+/* Guarda un lote de claves de CONFIG leyendo los inputs por id */
+async function cfGuardarClaves(btn, keys) {
+  const cambios = {};
+  keys.forEach(k => { const el = $('#cf-k-' + k); if (el) cambios[k] = el.value; });
+  saving(btn, true);
+  try {
+    const r = await api('priv.cfgGuardar', {}, 'POST', Object.assign(cfAuth(), { cambios }));
+    saving(btn, false);
+    if (!r.ok) return toast(r.msg || 'No se pudo guardar', 'err');
+    Object.assign(CF.d.cfg, cambios);
+    toast('Guardado', 'ok');
+  } catch (e) { saving(btn, false); fallaRed(e); }
+}
+
+/* ============================================================
+   GENERAL
+   ============================================================ */
+function cfPintaGeneral() {
+  const cfg = CF.d.cfg;
+
+  /* Grupos de CF_GENERAL como secciones (mismo contenido, sin tarjeta). */
+  const gruposSec = CF_GENERAL.map(g => ({
+    titulo: g.titulo, sub: g.sub,
+    inner: `<div class="cfg-grid">${g.keys.map(k => cfField('cf-k-' + k[0], k[1], cfg[k[0]], k[2], true)).join('')}</div>`
+  }));
+
+  /* AJUSTE 23/07: "Otros ajustes" ya no se pinta aquí — se mudó a
+     Avanzado → Infraestructura (solo DESARROLLADOR). */
+  const extraSec = [];
+
+  /* Orden pedido (20/07): Enlaces · Inicio · Agenda · (resto) · Compartir App. */
+  const secciones = [
+    { titulo: 'Enlaces de las apps', sub: 'Las 6 apps del proyecto. El botón Enviar abre WhatsApp con el mensaje para compartir esa app.', inner: cfAppsInner() },
+    { titulo: 'Inicio de la app pública', sub: 'La imagen y el video que ve la gente al abrir la app.', inner: cfInicioInner() },
+    /* 08/11/2026 · vistas encendibles de la app pública (js/vistas-pub.js) */
+    ...(window.VISTAS_PUB ? [{ titulo: 'Vistas de la app pública', sub: 'Apaga lo que tu municipio no usa: no sale en el Inicio de la app pública y por enlace directo no abre. Apagar no borra datos. Queda registrado quién y cuándo.', inner: VISTAS_PUB.inner(cfg) }] : []),
+    { titulo: 'Agenda', sub: 'Datos del candidato para las notificaciones de la Agenda.', inner: cfAgendaInner() }
+  ].concat(gruposSec, extraSec, [
+    { titulo: 'Plantilla rápida · Compartir App', sub: '', inner: cfCompartirInner() }
+  ]);
+
+  const keys = CF_APPS.map(a => a[0])
+    .concat([CF_COMPARTIR_KEY], CF_AGENDA_KEYS)
+    .concat(CF_GENERAL.reduce((a, g) => a.concat(g.keys.map(k => k[0])), []))
+    .concat(['INICIO_REEL_URL']);
+
+  $('#cf-body').innerHTML = cfAcc(secciones) +
+    `<div class="cfg-actions"><button class="btn btn-primary" id="cf-gen-save">Guardar cambios</button></div>`;
+  $('#cf-gen-save').onclick = e => cfGuardarClaves(e.currentTarget, keys);
+  cfAccBind();
+  cfAppsBind();
+  cfInicioBind();
+  if (window.VISTAS_PUB) VISTAS_PUB.bind();   /* 08/11/2026 */
+  const wa = $('#cf-k-AGENDA_CANDIDATO_WA'); if (wa) onlyDigits(wa);
+  cfPintado();   /* 02/08: reabre el bloque y devuelve lo que estabas escribiendo */
+}
+
+/* ---------- Enlaces de las apps + plantilla "Compartir App" (17/07 · Enviar 18/07) ----------
+   Un botón Enviar por app: abre WhatsApp DIRECTO (no el bot) con el MENSAJE ya
+   armado, sin número fijo, para que elijas a quién mandarlo. Lee lo que hay EN
+   EL CAMPO, no lo guardado: si corriges un enlace y envías sin guardar, va lo
+   que ves. Móvil: whatsapp://send?text= · Escritorio: api.whatsapp.com/send?text=. */
+function cfAppsInner() {
+  const cfg = CF.d.cfg;
+  const filas = CF_APPS.map(a => `<div class="cfg-field full">
+      <label>${esc(a[1])} <span class="cfg-appname">${esc(a[3])}</span></label>
+      <div class="cfg-copyrow">
+        <input class="input" id="cf-k-${a[0]}" value="${esc(cfg[a[0]] == null ? '' : cfg[a[0]])}" autocomplete="off" inputmode="url" />
+        <button type="button" class="btn btn-quiet cfg-copy" id="cf-cp-${a[0]}" data-k="${a[0]}" data-n="${esc(a[3])}" title="Enviar por WhatsApp el mensaje para compartir esta app">Enviar</button>
+      </div>
+      ${a[2] ? `<div class="cfg-hint">${esc(a[2])}</div>` : ''}
+    </div>`).join('');
+  return `<div class="cfg-grid">${filas}</div>`;
+}
+
+/* Plantilla rápida · Compartir App (sección propia del acordeón). El campo
+   sigue con el mismo id, así que los botones Enviar de Enlaces lo leen aunque
+   su sección esté colapsada. */
+function cfCompartirInner() {
+  const cfg = CF.d.cfg;
+  return `<div class="cfg-grid">
+     ${cfArea('cf-k-' + CF_COMPARTIR_KEY, 'Mensaje para compartir', cfg[CF_COMPARTIR_KEY],
+        'Variables: {nombreApp} y {enlaceApp}. Es lo que se envía con cada botón Enviar de Enlaces.', 4)}
+   </div>`;
+}
+
+/* AJUSTE 20/07: datos del candidato para las notificaciones de Agenda. */
+function cfAgendaInner() {
+  const cfg = CF.d.cfg;
+  return `<div class="cfg-grid">
+     ${cfField('cf-k-MARCA_CANDIDATO_NOMBRE', 'Nombre Candidato(a)', cfg.MARCA_CANDIDATO_NOMBRE, 'De aquí sale el primer nombre que va en los mensajes, y el nombre que firma correos y PDF.', true)}
+     <div class="cfg-field full">
+       <label>WhatsApp Candidato(a)</label>
+       <input class="input" id="cf-k-AGENDA_CANDIDATO_WA" value="${esc(cfg.AGENDA_CANDIDATO_WA == null ? '' : cfg.AGENDA_CANDIDATO_WA)}" inputmode="numeric" maxlength="10" autocomplete="off" placeholder="10 dígitos, sin el 57" />
+       <div class="cfg-hint">10 dígitos, sin el 57. Destino del resumen del día y de los avisos.</div>
+     </div>
+     ${cfField('cf-k-AGENDA_MANEJO', 'Manejo de agenda', cfg.AGENDA_MANEJO, 'Nombre de quien maneja la agenda: es la firma de los mensajes.', true)}
+   </div>`;
+}
+
+/* Acordeón: solo una sección abierta a la vez (la primera abierta por defecto). */
+function cfAcc(secciones) {
+  return `<div class="cfg-acc" id="cf-acc">${secciones.map(s => `
+    <section class="cfg-acc-sec">
+      <button type="button" class="cfg-acc-h" aria-expanded="false">
+        <span class="cfg-acc-t">${esc(s.titulo)}</span><span class="cfg-acc-ch">${I.chevR}</span>
+      </button>
+      <div class="cfg-acc-b">${s.sub ? `<p class="cfg-card__sub">${esc(s.sub)}</p>` : ''}${s.inner}</div>
+    </section>`).join('')}</div>`;
+}
+
+/* ============================================================
+   CONFIGURACIÓN · ESTADO VIVO   (02/08/2026)
+   ------------------------------------------------------------
+   Tres cosas, todas de la vista Configuración:
+
+   1) El acordeón se engancha UNA sola vez, por delegación. Antes se
+      enganchaba cabecera por cabecera y CUALQUIER repintado de #cf-body
+      (guardar, borrar, refresco en vivo) se llevaba los clics: los
+      bloques quedaban vivos en pantalla pero sordos hasta cambiar de
+      pestaña. Con delegación eso ya no puede pasar.
+
+   2) Se recuerda qué bloque estaba abierto en cada pestaña y se vuelve a
+      abrir después de pintar, con su scroll y su cursor. Guardar ya no
+      cierra el bloque.
+
+   3) Si entra un cambio de otro dispositivo NO se borra lo que estás
+      escribiendo ni se cierra la hoja abierta: solo se marca el campo
+      que el otro tocó, con su valor y un botón para adoptarlo. Tú
+      decides. (Si BORRARON el registro que editas, la hoja sí se cierra:
+      ya no hay dónde guardar.)
+   ============================================================ */
+let CF_ACC = {};         /* { pestaña: título del bloque abierto } */
+let CF_ACC_ON = false;   /* el listener delegado ya está puesto */
+let CF_EDIT = null;      /* lo escrito y sin guardar, mientras se repinta */
+let CF_HOJA = null;      /* { tipo, id, campos } de la hoja de edición abierta */
+
+function cfAccTitulo(sec) {
+  const t = sec.querySelector('.cfg-acc-t');
+  return t ? (t.textContent || '').trim() : '';
+}
+
+/* Deja abierto el bloque que estaba abierto en esta pestaña. */
+function cfAccAplicar() {
+  const t = CF_ACC[CF && CF.tab] || '';
+  $$('#cf-body .cfg-acc-sec').forEach(sec => {
+    const abrir = !!t && cfAccTitulo(sec) === t;
+    sec.classList[abrir ? 'add' : 'remove']('open');
+    const b = sec.querySelector('.cfg-acc-h');
+    if (b) b.setAttribute('aria-expanded', abrir ? 'true' : 'false');
+  });
+}
+
+/* Cierre de CADA pintado de #cf-body. Lo llaman los 10 pintores. */
+function cfPintado() { cfAccAplicar(); cfEdicionDevolver(); }
+
+/* ---------- Lo que estás escribiendo ---------- */
+/* Antes de repintar: guarda los campos con llave que tienen algo escrito y
+   sin guardar (los que difieren de lo que trajo el servidor), más el foco y
+   el scroll. */
+function cfEdicionTomar(antes) {
+  const cfg = (antes && antes.cfg) || {}, tpl = (antes && antes.plantillas) || [];
+  const campos = [];
+  $$('#cf-body [id^="cf-k-"]').forEach(el => {
+    const k = el.id.slice(5), base = cfg[k] == null ? '' : String(cfg[k]);
+    if (String(el.value) !== base) campos.push({ id: el.id, tipo: 'cfg', k, base, valor: el.value });
+  });
+  $$('#cf-body textarea.cfg-tpl').forEach(el => {
+    const i = +String(el.id).replace('cf-tpl-', ''), p = tpl[i];
+    const base = p ? String(p.cuerpo == null ? '' : p.cuerpo) : '';
+    if (String(el.value) !== base) campos.push({ id: el.id, tipo: 'tpl', k: i, base, valor: el.value });
+  });
+  let foco = null;
+  try {
+    const a = document.activeElement;
+    if (a && a.id && a.closest && a.closest('#cf-body')) foco = { id: a.id, ini: a.selectionStart, fin: a.selectionEnd };
+  } catch (e) {}
+  CF_EDIT = { campos, foco, scroll: window.scrollY || 0 };
+}
+
+/* Después de pintar: devuelve lo tuyo. Si el otro dispositivo cambió ESE
+   mismo campo, se deja marcado con su valor para que decidas. */
+function cfEdicionDevolver() {
+  const e = CF_EDIT; if (!e) return;
+  const cfg = (CF.d && CF.d.cfg) || {}, tpl = (CF.d && CF.d.plantillas) || [];
+  e.campos.forEach(c => {
+    const el = document.getElementById(c.id); if (!el) return;
+    const ahora = c.tipo === 'cfg'
+      ? (cfg[c.k] == null ? '' : String(cfg[c.k]))
+      : (tpl[c.k] ? String(tpl[c.k].cuerpo == null ? '' : tpl[c.k].cuerpo) : '');
+    el.value = c.valor;                                  /* manda lo tuyo */
+    if (ahora !== c.base) cfMarcarCampo(el, ahora);      /* el otro tocó este mismo campo */
+  });
+  if (e.foco) {
+    const f = document.getElementById(e.foco.id);
+    if (f) { try { f.focus(); if (e.foco.ini != null) f.setSelectionRange(e.foco.ini, e.foco.fin); } catch (x) {} }
+  }
+  if (e.scroll) { try { window.scrollTo(0, e.scroll); } catch (x) {} }
+}
+
+/* ---------- Marca de "otro dispositivo cambió esto" ---------- */
+function cfValorTxt(v) {
+  const t = v === '' || v == null ? '(vacío)' : String(v);
+  return t.length > 90 ? t.slice(0, 90) + '…' : t;
+}
+function cfMarcarCampo(el, valorOtro) {
+  if (!el || !el.parentElement) return;
+  const clase = el.className || '';
+  const esCheck = el.type === 'checkbox';
+  const esSw = String(clase).indexOf('cfg-sw') >= 0;
+  const legible = esCheck ? (valorOtro ? 'Sí' : 'No')
+    : esSw ? (String(valorOtro).toUpperCase() === 'ACTIVO' || valorOtro === true ? 'Activo' : 'Inactivo')
+      : cfValorTxt(valorOtro);
+  const ancla = esCheck ? (el.closest('.check-row') || el) : el;
+  const padre = ancla.parentElement; if (!padre) return;
+  const previo = padre.querySelector('.cfg-otro[data-de="' + el.id + '"]'); if (previo) previo.remove();
+  el.classList.add('cfg-tocado');
+  const box = h(`<div class="cfg-otro" data-de="${esc(el.id)}">
+      <span>Otro dispositivo lo cambió a <b>${esc(legible)}</b></span>
+      <button type="button" class="btn btn-quiet cfg-mini">Usar ese</button>
+    </div>`);
+  box.querySelector('button').onclick = () => {
+    if (esCheck) el.checked = !!valorOtro;
+    else if (esSw) el.classList[(String(valorOtro).toUpperCase() === 'ACTIVO' || valorOtro === true) ? 'add' : 'remove']('on');
+    else el.value = valorOtro == null ? '' : valorOtro;
+    el.classList.remove('cfg-tocado');
+    box.remove();
+  };
+  padre.insertBefore(box, ancla.nextSibling);
+}
+
+/* ---------- Hoja de edición abierta ----------
+   Solo las hojas que EDITAN un registro se registran aquí. Las demás
+   (detalles, confirmaciones, foto, bienvenida, probar el bot, los turnos
+   del call center) no se registran, y por eso ya no se cierran solas. */
+function cfHoja(tipo, id, campos) {
+  CF_HOJA = id ? { tipo: tipo, id: String(id), campos: campos } : null;
+}
+function cfHojaBuscar(tipo, id, d) {
+  if (!d || !id) return null;
+  const uno = (arr, campo) => (arr || []).filter(x => String(x[campo]) === String(id))[0] || null;
+  if (tipo === 'casa-item') {
+    let out = null;
+    (((d.casa || {}).dias) || []).forEach(dia => (dia.items || []).forEach(i => { if (String(i.id) === String(id)) out = i; }));
+    return out;
+  }
+  if (tipo === 'casa-red') return uno(((d.casa || {}).redes), 'id');
+  if (tipo === 'emergencia') return uno(d.emergencia, 'id');
+  if (tipo === 'servicio') return uno(d.servicios, 'id');
+  if (tipo === 'profesional') return uno(d.profesionales, 'documento');
+  if (tipo === 'zona') return uno(d.zonas, 'id');
+  if (tipo === 'usuario') return uno(d.usuarios, 'documento');
+  if (tipo === 'call-usuario') return uno(((d.call || {}).usuarios), 'id');
+  return null;
+}
+/* ¿La hoja registrada sigue en pantalla? (si la cerraste, se olvida) */
+function cfHojaViva() {
+  if (!CF_HOJA) return false;
+  const ids = Object.keys(CF_HOJA.campos || {});
+  if (!ids.length || !document.getElementById(ids[0])) { CF_HOJA = null; return false; }
+  return true;
+}
+/* Entró un cambio de otro dispositivo con una hoja abierta. */
+function cfHojaRevisar(antes, ahora) {
+  if (!cfHojaViva()) return;
+  const viejo = cfHojaBuscar(CF_HOJA.tipo, CF_HOJA.id, antes);
+  const nuevo = cfHojaBuscar(CF_HOJA.tipo, CF_HOJA.id, ahora);
+  if (!nuevo) { closeLayer(); CF_HOJA = null; toast('Otro dispositivo eliminó este registro'); return; }
+  if (!viejo) return;
+  let n = 0;
+  Object.keys(CF_HOJA.campos).forEach(id => {
+    const campo = CF_HOJA.campos[id];
+    const a = viejo[campo] == null ? '' : String(viejo[campo]);
+    const b = nuevo[campo] == null ? '' : String(nuevo[campo]);
+    if (a === b) return;
+    const el = document.getElementById(id); if (!el) return;
+    cfMarcarCampo(el, nuevo[campo]);
+    n++;
+  });
+  if (n) toast('Otro dispositivo cambió este registro');
+}
+
+/* AJUSTE 20/07: genérico para TODA la Configuración. Enlaza cada cabecera del
+   cuerpo (#cf-body), sea de cfAcc (General) o de cfCard (demás vistas). Al abrir
+   una, cierra sus HERMANAS (mismo contenedor) → solo una abierta a la vez.
+   Todas inician cerradas (incluida "Enlaces de las apps"). */
+function cfAccBind() {
+  if (!CF_ACC_ON) {
+    CF_ACC_ON = true;
+    document.addEventListener('click', ev => {
+      const t = ev.target;
+      const cab = (t && t.closest) ? t.closest('#cf-body .cfg-acc-h') : null;
+      if (!cab) return;
+      const sec = cab.closest('.cfg-acc-sec'); if (!sec || !sec.parentElement) return;
+      const abierta = sec.classList.contains('open');
+      Array.from(sec.parentElement.children).forEach(s => {
+        if (!s.classList || !s.classList.contains('cfg-acc-sec')) return;
+        s.classList.remove('open');
+        const b = s.querySelector('.cfg-acc-h'); if (b) b.setAttribute('aria-expanded', 'false');
+      });
+      if (!abierta) { sec.classList.add('open'); cab.setAttribute('aria-expanded', 'true'); }
+      CF_ACC[CF.tab] = abierta ? '' : cfAccTitulo(sec);
+    });
+  }
+  cfAccAplicar();
+}
+
+/* Reemplaza {nombreApp} y {enlaceApp} en la plantilla (todas las veces que salgan) */
+function cfCompartirTexto(nombre, enlace) {
+  const tpl = String((($('#cf-k-' + CF_COMPARTIR_KEY) || {}).value) || '');
+  return tpl.split('{nombreApp}').join(nombre).split('{enlaceApp}').join(enlace);
+}
+
+function cfAppsBind() {
+  CF_APPS.forEach(a => {
+    const b = $('#cf-cp-' + a[0]);
+    if (!b) return;
+    b.onclick = () => {
+      const enlace = String((($('#cf-k-' + a[0]) || {}).value) || '').trim();
+      if (!enlace) return toast('Esa app todavía no tiene enlace', 'err');
+      const tpl = String((($('#cf-k-' + CF_COMPARTIR_KEY) || {}).value) || '').trim();
+      if (!tpl) return toast('Escribe primero la plantilla "Compartir App"', 'err');
+      /* WhatsApp DIRECTO sin número fijo: el usuario elige a quién enviarlo.
+         Mismo reparto móvil/escritorio que ldWaOpen; NO pasa por el bot. */
+      const msg = cfCompartirTexto(a[3], enlace);
+      const url = esMovilPriv()
+        ? ('whatsapp://send?text=' + encodeURIComponent(msg))
+        : ('https://api.whatsapp.com/send?text=' + encodeURIComponent(msg));
+      window.open(url, '_blank');
+    };
+  });
+}
+
+/* ============================================================
+   INICIO de la app pública: imagen (archivo) + video (enlace)
+   ------------------------------------------------------------
+   La imagen se SUBE: al reemplazarla, la anterior se borra de Drive de
+   forma definitiva. El video NO se sube: se pega el enlace de Google
+   Drive o de YouTube, y la app pública sabe reproducir los dos.
+   ============================================================ */
+function cfInicioInner() {
+  const cfg = CF.d.cfg;
+  const img = cfg.INICIO_IMAGEN_DRIVE || '';
+  return `<div class="cfg-grid">
+       <div class="cfg-field full">
+         <label>Imagen de inicio</label>
+         <div class="cfg-img cfg-img-hero">
+           ${img
+             ? `<img src="${esc(img)}" alt="" class="cfg-img-prev" id="cf-ini-prev" onerror="this.style.display='none'" />`
+             : '<div class="cfg-img-no" id="cf-ini-prev">Sin imagen</div>'}
+           <div class="cfg-img-a">
+             <button class="btn btn-quiet cfg-mini" id="cf-ini-img">${img ? 'Cambiar' : 'Subir'} imagen</button>
+             ${img ? '<button class="btn btn-quiet cfg-mini cfg-danger" id="cf-ini-del">Quitar</button>' : ''}
+           </div>
+         </div>
+         <div class="cfg-hint">JPG, PNG o WEBP, hasta 6 MB. Al cambiarla, la anterior se borra de Drive para siempre.</div>
+       </div>
+       ${cfField('cf-k-INICIO_REEL_URL', 'Video de inicio (enlace)', cfg.INICIO_REEL_URL,
+         'Pega el enlace de Google Drive o de YouTube. Déjalo vacío para no mostrar video.', true)}
+     </div>`;
+}
+/* 07/11/2026 · pestaña propia del INVITADO (para los demás, Inicio vive en General) */
+function cfPintaInicio() {
+  /* Sin acordeón: es lo único de la pestaña, va abierto */
+  $('#cf-body').innerHTML = `<div class="card pad stack"><b>Inicio de la app pública</b><p class="cfg-card__sub">La imagen y el video que ve la gente al abrir la app.</p>${cfInicioInner()}
+    <div class="cfg-actions"><button class="btn btn-primary" id="cf-ini-save">Guardar video</button></div></div>`;
+  cfInicioBind();
+  $('#cf-ini-save').onclick = () => cfGuardarClaves($('#cf-ini-save'), ['INICIO_REEL_URL']);
+}
+function cfRepintarInicio() { if (CF.tab === 'inicio') cfPintaInicio(); else cfPintaGeneral(); }
+function cfInicioCard() {
+  return cfCard('Inicio de la app pública', 'La imagen y el video que ve la gente al abrir la app.', cfInicioInner());
+}
+
+function cfInicioBind() {
+  const btn = $('#cf-ini-img');
+  if (btn) btn.onclick = () => cfSubirInicio();
+  const del = $('#cf-ini-del');
+  if (del) del.onclick = () => cfQuitarInicio(del);
+}
+
+function cfSubirInicio() {
+  const inp = h('<input type="file" accept="image/jpeg,image/png,image/webp" hidden />');
+  document.body.appendChild(inp);
+  inp.onchange = () => {
+    const f = inp.files && inp.files[0];
+    inp.remove();
+    if (!f) return;
+    const rd = new FileReader();
+    rd.onload = async () => {
+      toast('Subiendo la imagen…');
+      try {
+        const r = await api('priv.cfgInicioImagen', {}, 'POST', Object.assign(cfAuth(), { dataUrl: rd.result }));
+        if (!r.ok) return toast(r.msg || 'No se pudo subir', 'err');
+        CF.d.cfg.INICIO_IMAGEN_DRIVE = r.imagen;
+        toast(r.purgada ? 'Imagen cambiada. La anterior se borró de Drive.' : 'Imagen subida', 'ok');
+        cfRepintarInicio();
+      } catch (e) { fallaRed(e); }
+    };
+    rd.onerror = () => toast('No pude leer el archivo', 'err');
+    rd.readAsDataURL(f);
+  };
+  inp.click();
+}
+
+async function cfQuitarInicio(btn) {
+  if (!await confirmar('¿Quitar la imagen de inicio?',
+    crow('El archivo', 'se borra de Drive') + crow('Se puede deshacer', 'No'))) return;
+  saving(btn, true);
+  try {
+    const r = await api('priv.cfgInicioImagenQuitar', {}, 'POST', cfAuth());
+    saving(btn, false);
+    if (!r.ok) return toast(r.msg || 'No se pudo quitar', 'err');
+    CF.d.cfg.INICIO_IMAGEN_DRIVE = '';
+    toast('Imagen quitada', 'ok');
+    cfRepintarInicio();
+  } catch (e) { saving(btn, false); fallaRed(e); }
+}
+
+/* ============================================================
+   UBICACIÓN · mapa con pin                            (Módulo 9.1)
+   ------------------------------------------------------------
+   Nadie escribe coordenadas a mano: se mueve el pin y se le da OK.
+   El mapa del picker es Leaflet + OpenStreetMap, servido DESDE EL REPO
+   (./vendor/): sin API key y sin depender de un CDN, que rompería la app
+   cuando el service worker la sirva sin red. Se carga solo cuando abres
+   el mapa, para no pesarle al arranque.
+   La miniatura de la tarjeta es un embed de Google Maps: se ve igual que
+   en la app pública, así compruebas de un vistazo a dónde apunta.
+   ============================================================ */
+const CF_MAPA_DEF = [5.206900, -74.739900];   // Casa Social: solo para centrar la 1ª vez
+let CF_LEAFLET = null;
+
+function cfCoordOk(lat, lng) {
+  const a = Number(lat), b = Number(lng);
+  if (!isFinite(a) || !isFinite(b)) return false;
+  if (Math.abs(a) > 90 || Math.abs(b) > 180) return false;
+  return !(a === 0 && b === 0);
+}
+const cfCoord6 = n => Number(Number(n).toFixed(6));
+
+/* Campo de la tarjeta: miniatura + botón. Los valores viven en dos inputs
+   ocultos con los ids de siempre (cf-k-CASA_LAT / cf-k-CASA_LNG), así
+   "Guardar textos" los recoge sin saber que hay un mapa de por medio. */
+function cfMapaField(lat, lng) {
+  return `<div class="cfg-field full">
+    <label>Ubicación de la casa social</label>
+    <input type="hidden" id="cf-k-CASA_LAT" value="${esc(lat == null ? '' : lat)}" />
+    <input type="hidden" id="cf-k-CASA_LNG" value="${esc(lng == null ? '' : lng)}" />
+    <div class="cfg-mapa" id="cf-mapa-box">${cfMapaPrev(lat, lng)}</div>
+    <div class="cfg-hint">Es el destino del botón “Iniciar recorrido” de la app pública.</div>
+  </div>`;
+}
+
+function cfMapaPrev(lat, lng) {
+  const ok = cfCoordOk(lat, lng);
+  const q = ok ? encodeURIComponent(cfCoord6(lat) + ',' + cfCoord6(lng)) : '';
+  return `${ok
+      ? `<iframe class="cfg-mapa-prev" src="https://www.google.com/maps?q=${q}&z=17&hl=es&output=embed" loading="lazy" referrerpolicy="no-referrer-when-downgrade" title="Ubicación de la casa social"></iframe>`
+      : '<div class="cfg-mapa-no">Todavía no has marcado la ubicación.</div>'}
+    <div class="cfg-mapa-a">
+      <button class="btn btn-quiet cfg-mini" id="cf-mapa-btn">${I.pin} ${ok ? 'Cambiar ubicación' : 'Marcar en el mapa'}</button>
+      ${ok ? `<span class="cfg-mapa-txt">${esc(cfCoord6(lat) + ', ' + cfCoord6(lng))}</span>` : ''}
+    </div>`;
+}
+
+function cfMapaBind() {
+  const b = $('#cf-mapa-btn');
+  if (b) b.onclick = () => cfMapaAbrir();
+}
+
+/* Carga Leaflet del repo, una sola vez */
+function cfLeaflet() {
+  if (CF_LEAFLET) return CF_LEAFLET;
+  CF_LEAFLET = new Promise((res, rej) => {
+    if (window.L) return res(window.L);
+    const css = document.createElement('link');
+    css.rel = 'stylesheet'; css.href = './css/vendor/leaflet.css';
+    document.head.appendChild(css);
+    const sc = document.createElement('script');
+    sc.src = './js/vendor/leaflet.js';
+    sc.onload = () => window.L ? res(window.L) : rej(new Error('leaflet'));
+    sc.onerror = () => { CF_LEAFLET = null; rej(new Error('leaflet')); };
+    document.head.appendChild(sc);
+  });
+  return CF_LEAFLET;
+}
+
+async function cfMapaAbrir() {
+  let lat = Number($('#cf-k-CASA_LAT').value), lng = Number($('#cf-k-CASA_LNG').value);
+  if (!cfCoordOk(lat, lng)) { lat = CF_MAPA_DEF[0]; lng = CF_MAPA_DEF[1]; }
+
+  openSheet(`<div class="grip"></div>
+    <h2 class="h2" style="margin-bottom:4px;">Ubicación de la casa social</h2>
+    <p class="muted small" style="margin-bottom:10px;">Arrastra el pin —o toca el mapa— hasta la puerta. Después dale Listo.</p>
+    <div class="cfg-map-search">
+      <input class="input" id="cf-map-q" placeholder="Buscar una dirección o un lugar" autocomplete="off" />
+      <button class="btn btn-quiet" id="cf-map-go">Buscar</button>
+    </div>
+    <div id="cf-map-res" class="cfg-map-res" hidden></div>
+    <div id="cf-map" class="cfg-map">${loadingBox('Abriendo el mapa…')}</div>
+    <div class="cfg-map-foot">
+      <button class="btn btn-quiet btn-block" id="cf-map-yo">${I.pin} Usar mi ubicación</button>
+      <span class="cfg-map-co" id="cf-map-co"></span>
+    </div>
+    <div class="stack" style="margin-top:12px;">
+      <button class="btn btn-primary btn-block" id="cf-map-ok">Listo</button>
+      <button class="btn btn-quiet btn-block" data-close>Cancelar</button>
+    </div>`);
+
+  let L;
+  try { L = await cfLeaflet(); }
+  catch (e) { $('#cf-map').innerHTML = '<p class="muted center small">No pude cargar el mapa. Revisa que la carpeta <b>vendor</b> esté subida al repo.</p>'; return; }
+  if (!$('#cf-map')) return;   // cerró la hoja mientras cargaba
+
+  $('#cf-map').innerHTML = '';
+  const map = L.map($('#cf-map'), { zoomControl: true, attributionControl: true }).setView([lat, lng], 17);
+  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19, attribution: '© OpenStreetMap'
+  }).addTo(map);
+
+  /* Pin dibujado con CSS: así no hace falta subir los PNG de Leaflet
+     y además queda del azul de la marca. */
+  const pin = L.divIcon({ className: 'cfg-pin', html: '<span></span>', iconSize: [26, 34], iconAnchor: [13, 34] });
+  const mk = L.marker([lat, lng], { draggable: true, icon: pin, autoPan: true }).addTo(map);
+
+  const co = $('#cf-map-co');
+  const pinta = () => { const p = mk.getLatLng(); co.textContent = cfCoord6(p.lat) + ', ' + cfCoord6(p.lng); };
+  pinta();
+  mk.on('drag', pinta);
+  map.on('click', e => { mk.setLatLng(e.latlng); pinta(); });
+  setTimeout(() => map.invalidateSize(), 180);   // la hoja entra animada
+
+  $('#cf-map-yo').onclick = (e) => {
+    if (!navigator.geolocation) return toast('Tu dispositivo no comparte la ubicación', 'err');
+    const btn = e.currentTarget; saving(btn, true);
+    navigator.geolocation.getCurrentPosition(
+      pos => {
+        saving(btn, false);
+        const c = [pos.coords.latitude, pos.coords.longitude];
+        mk.setLatLng(c); map.setView(c, 18); pinta();
+      },
+      err => { saving(btn, false); toast(err.code === 1 ? 'No diste permiso de ubicación' : 'No pude ubicarte', 'err'); },
+      { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
+    );
+  };
+
+  const buscar = async () => {
+    const q = val('cf-map-q');
+    if (!q) return;
+    const res = $('#cf-map-res');
+    res.hidden = false; res.innerHTML = '<p class="muted small">Buscando…</p>';
+    try {
+      const u = 'https://nominatim.openstreetmap.org/search?format=json&limit=5&countrycodes=co&q=' + encodeURIComponent(q);
+      const r = await fetch(u, { headers: { 'Accept': 'application/json' } });
+      const lista = await r.json();
+      if (!lista.length) { res.innerHTML = '<p class="muted small">Sin resultados. Mueve el pin a mano.</p>'; return; }
+      res.innerHTML = lista.map((x, i) => `<button class="cfg-map-hit" data-i="${i}">${esc(x.display_name)}</button>`).join('');
+      res.querySelectorAll('.cfg-map-hit').forEach(b => b.onclick = () => {
+        const x = lista[Number(b.dataset.i)];
+        const c = [Number(x.lat), Number(x.lon)];
+        mk.setLatLng(c); map.setView(c, 18); pinta();
+        res.hidden = true;
+      });
+    } catch (e) { res.innerHTML = '<p class="muted small">No pude buscar. Mueve el pin a mano.</p>'; }
+  };
+  $('#cf-map-go').onclick = buscar;
+  $('#cf-map-q').onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); buscar(); } };
+
+  $('#cf-map-ok').onclick = async (e) => {
+    const p = mk.getLatLng();
+    const lat2 = String(cfCoord6(p.lat)), lng2 = String(cfCoord6(p.lng));
+    saving(e.currentTarget, true);
+    try {
+      const r = await api('priv.cfgGuardar', {}, 'POST',
+        Object.assign(cfAuth(), { cambios: { CASA_LAT: lat2, CASA_LNG: lng2 } }));
+      if (!r.ok) { saving(e.currentTarget, false); return toast(r.msg || 'No se pudo guardar', 'err'); }
+      CF.d.cfg.CASA_LAT = lat2; CF.d.cfg.CASA_LNG = lng2;
+      closeLayer();
+      const box = $('#cf-mapa-box');
+      if (box) { box.innerHTML = cfMapaPrev(lat2, lng2); cfMapaBind(); }
+      const li = $('#cf-k-CASA_LAT'), lo = $('#cf-k-CASA_LNG');
+      if (li) li.value = lat2; if (lo) lo.value = lng2;
+      toast('Ubicación guardada', 'ok');
+    } catch (err) { saving(e.currentTarget, false); fallaRed(err); }
+  };
+}
+
+/* ============================================================
+   CASA SOCIAL
+   ============================================================ */
+function cfPintaCasa() {
+  const cfg = CF.d.cfg, dias = CF.d.casa.dias, redes = CF.d.casa.redes;
+
+  const textos = cfCard('Textos de la vista', 'Lo que lee la gente en la app pública.',
+    `<div class="cfg-grid">
+      ${cfField('cf-k-CASA_TITULO', 'Título', cfg.CASA_TITULO, '', true)}
+      ${cfArea('cf-k-CASA_INTRO', 'Bienvenida', cfg.CASA_INTRO, '', 2)}
+      ${cfArea('cf-k-CASA_CIERRE', 'Cierre', cfg.CASA_CIERRE, 'Va después de la programación.', 2)}
+      ${cfField('cf-k-CASA_HASHTAGS', 'Hashtags', cfg.CASA_HASHTAGS, '', true)}
+      ${cfField('cf-k-CASA_DIRECCION', 'Dirección visible', cfg.CASA_DIRECCION, '', true)}
+      ${cfMapaField(cfg.CASA_LAT, cfg.CASA_LNG)}
+      ${cfField('cf-k-CASA_REDES_TITULO', 'Título del bloque de redes', cfg.CASA_REDES_TITULO, '', true)}
+      ${cfField('cf-k-CASA_REDES_SUB', 'Subtítulo del bloque de redes', cfg.CASA_REDES_SUB, '', true)}
+     </div>
+     <div class="cfg-actions"><button class="btn btn-primary" id="cf-casa-save">Guardar textos</button></div>`);
+
+  const prog = cfCard('Programación', 'Enciende el día, ponle sus ítems y, si quieres, una imagen. Un día sin ítems no se muestra.',
+    dias.map(d => `
+      <div class="cfg-day${d.activo ? ' on' : ''}">
+        <div class="cfg-day-h">
+          ${cfSwitch('cf-dia-' + d.dia, d.label, d.activo)}
+          <button class="btn btn-quiet cfg-mini" data-add="${d.dia}">${I.plus} Ítem</button>
+        </div>
+        <div class="cfg-day-b">
+          ${d.items.length ? `<ul class="cfg-items">${d.items.map(i => `
+            <li class="cfg-item">
+              <div class="cfg-item-t"><b>${esc(i.item)}</b>${i.horario ? `<span class="cfg-item-h">${I.clock} ${esc(i.horario)}</span>` : ''}${i.descripcion ? `<span class="cfg-item-d">${esc(i.descripcion)}</span>` : ''}</div>
+              <div class="cfg-item-a">
+                <button class="bd-btn" data-edit="${esc(i.id)}" data-dia="${d.dia}" title="Editar">${I.pencil}</button>
+                <button class="bd-btn bd-btn-danger" data-del="${esc(i.id)}" title="Eliminar">${I.trash}</button>
+              </div>
+            </li>`).join('')}</ul>` : cfVacio('Sin ítems todavía.')}
+          <div class="cfg-img">
+            ${d.imagen ? `<img src="${esc(d.imagen)}" alt="" class="cfg-img-prev" onerror="this.style.display='none'" />` : '<div class="cfg-img-no">Sin imagen</div>'}
+            <div class="cfg-img-a">
+              <button class="btn btn-quiet cfg-mini" data-img="${d.dia}">${d.imagen ? 'Cambiar' : 'Subir'} imagen</button>
+              ${d.imagen ? `<button class="btn btn-quiet cfg-mini cfg-danger" data-imgdel="${d.dia}">Quitar</button>` : ''}
+            </div>
+          </div>
+        </div>
+      </div>`).join(''));
+
+  const redesHtml = cfCard('Redes sociales', 'Se muestran dentro de la casa social.',
+    (redes.length ? `<ul class="cfg-list">${redes.map(r => `
+      <li class="cfg-row cfg-row-red${r.activo ? '' : ' off'}">
+        ${window.redLogo ? redLogo(redTipo(r.enlace)) : ''}
+        <div class="cfg-row-t"><b>${esc(r.nombre)}</b><span class="cfg-row-s">${esc(r.enlace)}</span></div>
+        <div class="cfg-row-a">
+          ${r.activo ? '' : '<span class="cfg-pill">Oculta</span>'}
+          <button class="bd-btn" data-red="${esc(r.id)}" title="Editar">${I.pencil}</button>
+          <button class="bd-btn bd-btn-danger" data-reddel="${esc(r.id)}" title="Eliminar">${I.trash}</button>
+        </div>
+      </li>`).join('')}</ul>` : cfVacio('Sin redes.')) +
+    `<div class="cfg-actions"><button class="btn btn-quiet" id="cf-red-add">${I.plus} Agregar red</button></div>`);
+
+  $('#cf-body').innerHTML = textos + prog + redesHtml;
+
+  $('#cf-casa-save').onclick = e => cfGuardarClaves(e.currentTarget, CF_CASA_KEYS);
+  cfMapaBind();
+  dias.forEach(d => { const s = $('#cf-dia-' + d.dia); if (s) s.onclick = () => cfDiaToggle(d); });
+  $$('#cf-body [data-add]').forEach(b => b.onclick = () => cfItemSheet(b.dataset.add, null));
+  $$('#cf-body [data-edit]').forEach(b => b.onclick = () => {
+    const dia = CF.d.casa.dias.filter(x => x.dia === b.dataset.dia)[0];
+    cfItemSheet(b.dataset.dia, dia.items.filter(i => i.id === b.dataset.edit)[0]);
+  });
+  $$('#cf-body [data-del]').forEach(b => b.onclick = () => cfItemBorrar(b.dataset.del));
+  $$('#cf-body [data-img]').forEach(b => b.onclick = () => cfImgSubir(b.dataset.img));
+  $$('#cf-body [data-imgdel]').forEach(b => b.onclick = () => cfImgQuitar(b.dataset.imgdel));
+  $('#cf-red-add').onclick = () => cfRedSheet(null);
+  $$('#cf-body [data-red]').forEach(b => b.onclick = () => cfRedSheet(redes.filter(r => r.id === b.dataset.red)[0]));
+  $$('#cf-body [data-reddel]').forEach(b => b.onclick = () => cfRedBorrar(redes.filter(r => r.id === b.dataset.reddel)[0]));
+  cfPintado();   /* 02/08: reabre el bloque y devuelve lo que estabas escribiendo */
+}
+
+async function cfDiaToggle(d) {
+  try {
+    const r = await api('priv.cfgCasaDia', {}, 'POST', Object.assign(cfAuth(), { dia: d.dia, activo: !d.activo }));
+    if (!r.ok) return toast(r.msg || 'No se pudo', 'err');
+    CF.d.casa.dias = r.dias; cfPintaCasa();
+  } catch (e) { fallaRed(e); }
+}
+
+function cfItemSheet(dia, item) {
+  const d = CF.d.casa.dias.filter(x => x.dia === dia)[0];
+  openSheet(`<div class="grip"></div>
+    <h2 class="h2">${item ? 'Editar ítem' : 'Nuevo ítem'} · ${esc(d.label)}</h2>
+    <div class="stack" style="margin-top:14px;">
+      ${field('Ítem', inputEl('cf-it-txt', `value="${esc(item ? item.item : '')}" placeholder="Ej. Clases de Inglés"`))}
+      ${field('Horario', inputEl('cf-it-hor', `value="${esc(item ? item.horario : '')}" placeholder="Ej. 3:00 PM - 5:00 PM"`))}
+      ${field('Descripción del ítem', `<textarea class="input ta" id="cf-it-desc" rows="3" placeholder="De qué se trata. Esto lo lee la gente en la app pública.">${esc(item ? (item.descripcion || '') : '')}</textarea>`)}
+      <p class="small muted">Horario y descripción son texto libre y pueden quedar vacíos. La descripción también se ve en <b>Nuestra casa social</b> de la app pública.</p>
+      <button class="btn btn-primary btn-block" id="cf-it-save">Guardar</button>
+      <button class="btn btn-quiet btn-block" data-close>Cancelar</button>
+    </div>`);
+  cfHoja('casa-item', item && item.id, { 'cf-it-txt': 'item', 'cf-it-hor': 'horario', 'cf-it-desc': 'descripcion' });
+  $('#cf-it-save').onclick = async e => {
+    const item2 = val('cf-it-txt');
+    if (!item2) return toast('Escribe el ítem', 'err');
+    saving(e.currentTarget, true);
+    try {
+      const r = await api('priv.cfgCasaItem', {}, 'POST', Object.assign(cfAuth(), {
+        id: item ? item.id : '', dia, item: item2, horario: val('cf-it-hor'), descripcion: val('cf-it-desc')
+      }));
+      saving(e.currentTarget, false);
+      if (!r.ok) return toast(r.msg || 'No se pudo', 'err');
+      CF.d.casa.dias = r.dias; closeLayer(); cfPintaCasa(); toast('Guardado', 'ok');
+    } catch (err) { saving(e.currentTarget, false); fallaRed(err); }
+  };
+}
+
+async function cfItemBorrar(id) {
+  if (!await confirmar('¿Eliminar el ítem?', crow('Acción', 'No se puede deshacer'))) return;
+  try {
+    const r = await api('priv.cfgCasaItemEliminar', {}, 'POST', Object.assign(cfAuth(), { id }));
+    if (!r.ok) return toast(r.msg || 'No se pudo', 'err');
+    CF.d.casa.dias = r.dias; cfPintaCasa(); toast('Eliminado', 'ok');
+  } catch (e) { fallaRed(e); }
+}
+
+/* La imagen anterior se BORRA DE VERDAD de Drive: se avisa antes. */
+function cfImgSubir(dia) {
+  const d = CF.d.casa.dias.filter(x => x.dia === dia)[0];
+  const inp = h('<input type="file" accept="image/jpeg,image/png,image/webp" hidden />');
+  document.body.appendChild(inp);
+  inp.onchange = async () => {
+    const f = inp.files[0]; inp.remove();
+    if (!f) return;
+    if (f.size > 6 * 1024 * 1024) return toast('La imagen supera 6 MB', 'err');
+    if (d.imagen && !await confirmar('¿Reemplazar la imagen de ' + d.label + '?',
+      crow('La imagen actual', 'se borra de Drive') + crow('Se puede deshacer', 'No'))) return;
+    const rd = new FileReader();
+    rd.onload = async () => {
+      try {
+        const r = await api('priv.cfgCasaImagen', {}, 'POST', Object.assign(cfAuth(), { dia, dataUrl: rd.result }));
+        if (!r.ok) return toast(r.msg || 'No se pudo subir', 'err');
+        CF.d.casa.dias = r.dias; cfPintaCasa(); toast('Imagen actualizada', 'ok');
+      } catch (e) { fallaRed(e); }
+    };
+    rd.readAsDataURL(f);
+  };
+  inp.click();
+}
+
+async function cfImgQuitar(dia) {
+  const d = CF.d.casa.dias.filter(x => x.dia === dia)[0];
+  if (!await confirmar('¿Quitar la imagen de ' + d.label + '?',
+    crow('El archivo', 'se borra de Drive') + crow('Se puede deshacer', 'No'))) return;
+  try {
+    const r = await api('priv.cfgCasaImagenQuitar', {}, 'POST', Object.assign(cfAuth(), { dia }));
+    if (!r.ok) return toast(r.msg || 'No se pudo', 'err');
+    CF.d.casa.dias = r.dias; cfPintaCasa(); toast('Imagen quitada', 'ok');
+  } catch (e) { fallaRed(e); }
+}
+
+/* "www.youtube.com/@canal" → "https://www.youtube.com/@canal" (el CORE exige http/https) */
+function cfEnlaceCompleto(e) { e = String(e || '').trim(); return e && !/^https?:\/\//i.test(e) && /^[\w-]+(\.[\w-]+)+(\/|$)/.test(e) ? 'https://' + e : e; }
+function cfRedSheet(red) {
+  openSheet(`<div class="grip"></div>
+    <h2 class="h2">${red ? 'Editar red' : 'Nueva red'}</h2>
+    <div class="stack" style="margin-top:14px;">
+      ${window.REDES_CAT ? `<div class="field"><span>Red social</span><div class="cf-redsel" id="cf-rd-k">${REDES_CAT.map(c => `<button type="button" class="cf-redop" data-k="${c.k}">${redLogo(c.k)}<span>${c.n}</span></button>`).join('')}</div></div>` : ''}
+      ${field('Nombre', inputEl('cf-rd-n', `value="${esc(red ? red.nombre : '')}" placeholder="Ej. Facebook"`))}
+      ${field('Enlace', inputEl('cf-rd-e', `value="${esc(red ? red.enlace : '')}" placeholder="https://…"`))}
+      <p class="small muted" id="cf-rd-av" style="margin:-4px 0 0;"></p>
+      <label class="check-row"><input type="checkbox" id="cf-rd-a" ${!red || red.activo ? 'checked' : ''} /><span>Visible en la app pública</span></label>
+      <button class="btn btn-primary btn-block" id="cf-rd-save">Guardar</button>
+      <button class="btn btn-quiet btn-block" data-close>Cancelar</button>
+    </div>`);
+  cfHoja('casa-red', red && red.id, { 'cf-rd-n': 'nombre', 'cf-rd-e': 'enlace', 'cf-rd-a': 'activo' });
+  /* Selector de red: marca el logo, pone el nombre si está vacío o era otra
+     red, y avisa si el enlace no es de esa red (el icono en la app pública
+     sale del enlace, no del nombre). */
+  let elegida = '';
+  const nombreDe = k => (REDES_CAT.filter(c => c.k === k)[0] || {}).n || '';
+  const revisar = () => {
+    const av = $('#cf-rd-av'); if (!av || !window.redTipo) return;
+    const e = val('cf-rd-e').trim(), t = e ? redTipo(e) : '';
+    if (!elegida && t) marcar(t, false);
+    av.textContent = e && elegida && elegida !== 'web' && t !== elegida ? `Ese enlace no parece de ${nombreDe(elegida)}: en la app pública se verá con el ícono de ${t === 'web' ? 'enlace' : nombreDe(t)}.` : '';
+  };
+  const marcar = (k, tocado) => {
+    const antes = elegida; elegida = k;
+    $$('#cf-rd-k .cf-redop').forEach(b => b.classList.toggle('on', b.dataset.k === k));
+    if (tocado) {
+      const n = $('#cf-rd-n'), v = n.value.trim();
+      if (k !== 'web' && (!v || v === nombreDe(antes))) n.value = nombreDe(k);
+      const ej = (REDES_CAT.filter(c => c.k === k)[0] || {}).ej; if (ej) $('#cf-rd-e').placeholder = ej;
+      (val('cf-rd-e') ? n : $('#cf-rd-e')).focus();
+    }
+    revisar();
+  };
+  if (window.REDES_CAT) {
+    $$('#cf-rd-k .cf-redop').forEach(b => b.onclick = () => marcar(b.dataset.k, true));
+    $('#cf-rd-e').addEventListener('input', revisar);
+    if (red && red.enlace) marcar(redTipo(red.enlace), false);
+  }
+  $('#cf-rd-save').onclick = async e => {
+    saving(e.currentTarget, true);
+    try {
+      const r = await api('priv.cfgRed', {}, 'POST', Object.assign(cfAuth(), {
+        id: red ? red.id : '', nombre: val('cf-rd-n'), enlace: cfEnlaceCompleto(val('cf-rd-e')), activo: $('#cf-rd-a').checked
+      }));
+      saving(e.currentTarget, false);
+      if (!r.ok) return toast(r.msg || 'No se pudo', 'err');
+      CF.d.casa.redes = r.redes; closeLayer(); cfPintaCasa(); toast('Guardado', 'ok');
+    } catch (err) { saving(e.currentTarget, false); fallaRed(err); }
+  };
+}
+
+async function cfRedBorrar(red) {
+  if (!await confirmar('¿Eliminar ' + red.nombre + '?', crow('Enlace', red.enlace))) return;
+  try {
+    const r = await api('priv.cfgRedEliminar', {}, 'POST', Object.assign(cfAuth(), { id: red.id }));
+    if (!r.ok) return toast(r.msg || 'No se pudo', 'err');
+    CF.d.casa.redes = r.redes; cfPintaCasa(); toast('Eliminada', 'ok');
+  } catch (e) { fallaRed(e); }
+}
+
+/* ============================================================
+   NÚMEROS DE EMERGENCIA
+   ============================================================ */
+const CF_TEL_TIPOS = [['POLICIA', 'Policía'], ['BOMBEROS', 'Bomberos'], ['SALUD', 'Salud'], ['OTRO', 'Otro']];
+function cfTipoLabel(t) { const x = CF_TEL_TIPOS.filter(a => a[0] === t)[0]; return x ? x[1] : 'Otro'; }
+
+function cfPintaEmergencia() {
+  const cfg = CF.d.cfg, items = CF.d.emergencia;
+  const textos = cfCard('Textos de la vista', '',
+    `<div class="cfg-grid">
+      ${cfField('cf-k-EMERGENCIA_TITULO', 'Título', cfg.EMERGENCIA_TITULO, '', true)}
+      ${cfArea('cf-k-EMERGENCIA_SUB', 'Subtítulo', cfg.EMERGENCIA_SUB, '', 2)}
+     </div>
+     <div class="cfg-actions"><button class="btn btn-primary" id="cf-em-save">Guardar textos</button></div>`);
+
+  const lista = cfCard('Contactos', 'Salen en este orden. Un contacto sin número no se muestra.',
+    (items.length ? `<ul class="cfg-list">${items.map(i => `
+      <li class="cfg-row">
+        <div class="cfg-row-t">
+          <b>${esc(i.nombre)}</b>
+          <span class="cfg-row-s">${esc(cfTipoLabel(i.tipo))} · ${i.whatsapp ? 'WhatsApp ' + esc(i.whatsapp) : 'sin WhatsApp'}${i.fijo ? ' · Fijo ' + esc(i.fijo) : ''}</span>
+        </div>
+        <div class="cfg-row-a">
+          <button class="bd-btn" data-tel="${esc(i.id)}" title="Editar">${I.pencil}</button>
+          <button class="bd-btn bd-btn-danger" data-teldel="${esc(i.id)}" title="Eliminar">${I.trash}</button>
+        </div>
+      </li>`).join('')}</ul>` : cfVacio('Sin contactos.')) +
+    `<div class="cfg-actions"><button class="btn btn-quiet" id="cf-tel-add">${I.plus} Agregar contacto</button></div>`);
+
+  $('#cf-body').innerHTML = textos + lista;
+  $('#cf-em-save').onclick = e => cfGuardarClaves(e.currentTarget, CF_EM_KEYS);
+  $('#cf-tel-add').onclick = () => cfTelSheet(null);
+  $$('#cf-body [data-tel]').forEach(b => b.onclick = () => cfTelSheet(items.filter(i => i.id === b.dataset.tel)[0]));
+  $$('#cf-body [data-teldel]').forEach(b => b.onclick = () => cfTelBorrar(items.filter(i => i.id === b.dataset.teldel)[0]));
+  cfPintado();   /* 02/08: reabre el bloque y devuelve lo que estabas escribiendo */
+}
+
+function cfTelSheet(tel) {
+  openSheet(`<div class="grip"></div>
+    <h2 class="h2">${tel ? 'Editar contacto' : 'Nuevo contacto'}</h2>
+    <div class="stack" style="margin-top:14px;">
+      ${field('Nombre', inputEl('cf-tl-n', `value="${esc(tel ? tel.nombre : '')}" placeholder="Ej. Bomberos ${esc(MV.municipio)}"`))}
+      ${field('Tipo', `<select class="input" id="cf-tl-t">${CF_TEL_TIPOS.map(t => `<option value="${t[0]}"${tel && tel.tipo === t[0] ? ' selected' : ''}>${esc(t[1])}</option>`).join('')}</select>`)}
+      ${field('WhatsApp', inputEl('cf-tl-w', `value="${esc(tel ? tel.whatsapp : '')}" inputmode="numeric" placeholder="10 dígitos"`))}
+      ${field('Fijo', inputEl('cf-tl-f', `value="${esc(tel ? tel.fijo : '')}" inputmode="numeric" placeholder="Opcional"`))}
+      <p class="small muted">Con al menos uno de los dos basta.</p>
+      <button class="btn btn-primary btn-block" id="cf-tl-save">Guardar</button>
+      <button class="btn btn-quiet btn-block" data-close>Cancelar</button>
+    </div>`);
+  onlyDigits($('#cf-tl-w')); onlyDigits($('#cf-tl-f'));
+  cfHoja('emergencia', tel && tel.id, { 'cf-tl-n': 'nombre', 'cf-tl-t': 'tipo', 'cf-tl-w': 'whatsapp', 'cf-tl-f': 'fijo' });
+  $('#cf-tl-save').onclick = async e => {
+    saving(e.currentTarget, true);
+    try {
+      const r = await api('priv.cfgTel', {}, 'POST', Object.assign(cfAuth(), {
+        id: tel ? tel.id : '', nombre: val('cf-tl-n'), tipo: val('cf-tl-t'),
+        whatsapp: val('cf-tl-w'), fijo: val('cf-tl-f')
+      }));
+      saving(e.currentTarget, false);
+      if (!r.ok) return toast(r.msg || 'No se pudo', 'err');
+      CF.d.emergencia = r.emergencia; closeLayer(); cfPintaEmergencia(); toast('Guardado', 'ok');
+    } catch (err) { saving(e.currentTarget, false); fallaRed(err); }
+  };
+}
+
+async function cfTelBorrar(tel) {
+  if (!await confirmar('¿Eliminar ' + tel.nombre + '?', crow('Se quita de', 'Números de emergencia'))) return;
+  try {
+    const r = await api('priv.cfgTelEliminar', {}, 'POST', Object.assign(cfAuth(), { id: tel.id }));
+    if (!r.ok) return toast(r.msg || 'No se pudo', 'err');
+    CF.d.emergencia = r.emergencia; cfPintaEmergencia(); toast('Eliminado', 'ok');
+  } catch (e) { fallaRed(e); }
+}
+
+/* ============================================================
+   SERVICIOS  (catálogo + solicitudes sin responsable)
+   ============================================================ */
+function cfPintaServicios() {
+  const s = CF.d.servicios, hu = CF.d.huerfanas;
+
+  const lista = cfCard('Catálogo de servicios',
+    'INTERNO = no se ofrece en "Realiza tu solicitud" de la app pública, pero el profesional sí lo puede registrar.',
+    (s.length ? `<ul class="cfg-list">${s.map(x => `
+      <li class="cfg-row${x.activo ? '' : ' off'}">
+        <div class="cfg-row-t">
+          <b>${esc(x.servicio)}</b>
+          <span class="cfg-row-s">${x.solicitudes} solicitud${x.solicitudes === 1 ? '' : 'es'} · ${x.profesionales} profesional${x.profesionales === 1 ? '' : 'es'}</span>
+        </div>
+        <div class="cfg-row-a">
+          ${x.interno ? '<span class="cfg-pill cfg-pill-int">Interno</span>' : ''}
+          ${x.activo ? '' : '<span class="cfg-pill">Inactivo</span>'}
+          <button class="bd-btn" data-sv="${esc(x.id)}" title="Editar">${I.pencil}</button>
+          <button class="bd-btn bd-btn-danger" data-svdel="${esc(x.id)}" title="Eliminar">${I.trash}</button>
+        </div>
+      </li>`).join('')}</ul>` : cfVacio('Sin servicios. ¿Corriste setupModulo9()?')) +
+    `<div class="cfg-actions"><button class="btn btn-quiet" id="cf-sv-add">${I.plus} Agregar servicio</button></div>`);
+
+  const huer = cfCard('Solicitudes sin responsable',
+    hu.length ? 'Estas solicitudes no tienen profesional asignado. Asígnalo aquí.' : 'Todas las solicitudes tienen responsable.',
+    hu.length ? `<ul class="cfg-list">${hu.map(x => `
+      <li class="cfg-row">
+        <div class="cfg-row-t">
+          <b>${esc(x.nombre || x.documento)}</b>
+          <span class="cfg-row-s">${esc(x.servicio || 'sin servicio')} · ${esc(x.fecha || '—')}</span>
+          <span class="cfg-row-x">${esc(x.solicitud || '')}</span>
+        </div>
+        <div class="cfg-row-a"><button class="btn btn-quiet cfg-mini" data-hu="${x.fila}">Asignar</button></div>
+      </li>`).join('')}</ul>` : cfVacio('Nada pendiente.'));
+
+  $('#cf-body').innerHTML = lista + huer;
+  $('#cf-sv-add').onclick = () => cfServSheet(null);
+  $$('#cf-body [data-sv]').forEach(b => b.onclick = () => cfServSheet(s.filter(x => x.id === b.dataset.sv)[0]));
+  $$('#cf-body [data-svdel]').forEach(b => b.onclick = () => cfServBorrar(s.filter(x => x.id === b.dataset.svdel)[0]));
+  $$('#cf-body [data-hu]').forEach(b => b.onclick = () => cfAsignarSheet(hu.filter(x => String(x.fila) === b.dataset.hu)[0]));
+  cfPintado();   /* 02/08: reabre el bloque y devuelve lo que estabas escribiendo */
+}
+
+function cfServSheet(sv) {
+  openSheet(`<div class="grip"></div>
+    <h2 class="h2">${sv ? 'Editar servicio' : 'Nuevo servicio'}</h2>
+    <div class="stack" style="margin-top:14px;">
+      ${field('Nombre', inputEl('cf-sv-n', `value="${esc(sv ? sv.servicio : '')}" placeholder="Ej. Asesoría Jurídica"`))}
+      <label class="check-row"><input type="checkbox" id="cf-sv-a" ${!sv || sv.activo ? 'checked' : ''} /><span>Activo</span></label>
+      <label class="check-row"><input type="checkbox" id="cf-sv-i" ${sv && sv.interno ? 'checked' : ''} /><span>Interno (no se ofrece en la app pública)</span></label>
+      ${sv && (sv.solicitudes || sv.profesionales) ? `<p class="small muted">Si le cambias el nombre, se actualizan ${sv.solicitudes} solicitud(es) y ${sv.profesionales} profesional(es).</p>` : ''}
+      <button class="btn btn-primary btn-block" id="cf-sv-save">Guardar</button>
+      <button class="btn btn-quiet btn-block" data-close>Cancelar</button>
+    </div>`);
+  cfHoja('servicio', sv && sv.id, { 'cf-sv-n': 'servicio', 'cf-sv-a': 'activo', 'cf-sv-i': 'interno' });
+  $('#cf-sv-save').onclick = async e => {
+    saving(e.currentTarget, true);
+    try {
+      const r = await api('priv.cfgServ', {}, 'POST', Object.assign(cfAuth(), {
+        id: sv ? sv.id : '', servicio: val('cf-sv-n'), activo: $('#cf-sv-a').checked, interno: $('#cf-sv-i').checked
+      }));
+      saving(e.currentTarget, false);
+      if (!r.ok) return toast(r.msg || 'No se pudo', 'err');
+      CF.d.servicios = r.servicios;
+      if (r.profesionales) CF.d.profesionales = r.profesionales;
+      if (r.huerfanas) CF.d.huerfanas = r.huerfanas;
+      closeLayer(); cfPintaServicios();
+      toast(r.filas ? 'Guardado · ' + r.filas + ' registro(s) actualizados' : 'Guardado', 'ok');
+    } catch (err) { saving(e.currentTarget, false); fallaRed(err); }
+  };
+}
+
+async function cfServBorrar(sv) {
+  if (!await confirmar('¿Eliminar ' + sv.servicio + '?', crow('Solicitudes', String(sv.solicitudes)) + crow('Profesionales', String(sv.profesionales)))) return;
+  try {
+    const r = await api('priv.cfgServEliminar', {}, 'POST', Object.assign(cfAuth(), { id: sv.id }));
+    if (!r.ok) return toast(r.msg || 'No se pudo', 'err');
+    CF.d.servicios = r.servicios; cfPintaServicios(); toast('Eliminado', 'ok');
+  } catch (e) { fallaRed(e); }
+}
+
+function cfAsignarSheet(h2) {
+  const profs = CF.d.profesionales;
+  const delServicio = profs.filter(p => cfNorm(p.servicio) === cfNorm(h2.servicio));
+  const lista = (delServicio.length ? delServicio : profs);
+  openSheet(`<div class="grip"></div>
+    <h2 class="h2">Asignar responsable</h2>
+    <div class="confirm-list" style="margin-top:10px;">
+      ${crow('Persona', h2.nombre || h2.documento)}${crow('Servicio', h2.servicio)}
+    </div>
+    ${h2.solicitud ? `<p class="cfg-quote">${esc(h2.solicitud)}</p>` : ''}
+    <div class="stack" style="margin-top:14px;">
+      ${field('Profesional', `<select class="input" id="cf-hu-p"><option value="">Selecciona</option>${lista.map(p => `<option value="${esc(p.nombre)}">${esc(p.nombre)} — ${esc(p.servicio)}</option>`).join('')}</select>`)}
+      ${delServicio.length ? '' : '<p class="small muted">Ningún profesional tiene ese servicio: se muestran todos.</p>'}
+      <button class="btn btn-primary btn-block" id="cf-hu-save">Asignar</button>
+      <button class="btn btn-quiet btn-block" data-close>Cancelar</button>
+    </div>`);
+  $('#cf-hu-save').onclick = async e => {
+    if (!val('cf-hu-p')) return toast('Elige el profesional', 'err');
+    saving(e.currentTarget, true);
+    try {
+      const r = await api('priv.cfgServAsignar', {}, 'POST', Object.assign(cfAuth(), { fila: h2.fila, responsable: val('cf-hu-p') }));
+      saving(e.currentTarget, false);
+      if (!r.ok) return toast(r.msg || 'No se pudo', 'err');
+      CF.d.huerfanas = r.huerfanas; closeLayer(); cfPintaServicios(); toast('Responsable asignado', 'ok');
+    } catch (err) { saving(e.currentTarget, false); fallaRed(err); }
+  };
+}
+
+/* ============================================================
+   PROFESIONALES
+   ============================================================ */
+function cfPintaProfesionales() {
+  const p = CF.d.profesionales;
+  $('#cf-body').innerHTML = cfCard('Profesionales', 'Quién atiende cada servicio.',
+    (p.length ? `<ul class="cfg-list">${p.map(x => `
+      <li class="cfg-row">
+        <div class="cfg-row-t">
+          <b>${esc(x.nombre)}</b>
+          <span class="cfg-row-s">${esc(x.servicio)} · doc. ${esc(x.documento)} · ${x.atendidas} atendida${x.atendidas === 1 ? '' : 's'}</span>
+        </div>
+        <div class="cfg-row-a">
+          <button class="bd-btn" data-pf="${esc(x.documento)}" title="Editar">${I.pencil}</button>
+          <button class="bd-btn bd-btn-danger" data-pfdel="${esc(x.documento)}" title="Eliminar">${I.trash}</button>
+        </div>
+      </li>`).join('')}</ul>` : cfVacio('Sin profesionales.')) +
+    `<div class="cfg-actions"><button class="btn btn-quiet" id="cf-pf-add">${I.plus} Agregar profesional</button></div>`);
+  $('#cf-pf-add').onclick = () => cfProfSheet(null);
+  $$('#cf-body [data-pf]').forEach(b => b.onclick = () => cfProfSheet(p.filter(x => x.documento === b.dataset.pf)[0]));
+  $$('#cf-body [data-pfdel]').forEach(b => b.onclick = () => cfProfBorrar(p.filter(x => x.documento === b.dataset.pfdel)[0]));
+  cfPintado();   /* 02/08: reabre el bloque y devuelve lo que estabas escribiendo */
+}
+
+function cfProfSheet(pf) {
+  const servicios = CF.d.servicios.filter(s => s.activo).map(s => s.servicio);
+  if (pf && servicios.indexOf(pf.servicio) === -1 && pf.servicio) servicios.unshift(pf.servicio);
+  openSheet(`<div class="grip"></div>
+    <h2 class="h2">${pf ? 'Editar profesional' : 'Nuevo profesional'}</h2>
+    <div class="stack" style="margin-top:14px;">
+      ${field('Documento', inputEl('cf-pf-d', `value="${esc(pf ? pf.documento : '')}" inputmode="numeric"`))}
+      ${field('Nombre', inputEl('cf-pf-n', `value="${esc(pf ? pf.nombre : '')}"`))}
+      ${field('WhatsApp', inputEl('cf-pf-c', `value="${esc(pf ? pf.contacto : '')}" inputmode="numeric" placeholder="10 dígitos"`))}
+      ${field('Servicio', `<select class="input" id="cf-pf-s"><option value="">Selecciona</option>${servicios.map(s => `<option value="${esc(s)}"${pf && pf.servicio === s ? ' selected' : ''}>${esc(s)}</option>`).join('')}</select>`)}
+      ${pf && pf.atendidas ? `<p class="small muted">Si le cambias el nombre, se actualiza en sus ${pf.atendidas} solicitud(es).</p>` : ''}
+      <button class="btn btn-primary btn-block" id="cf-pf-save">Guardar</button>
+      <button class="btn btn-quiet btn-block" data-close>Cancelar</button>
+    </div>`);
+  onlyDigits($('#cf-pf-d')); onlyDigits($('#cf-pf-c'));
+  cfHoja('profesional', pf && pf.documento, { 'cf-pf-d': 'documento', 'cf-pf-n': 'nombre', 'cf-pf-c': 'contacto', 'cf-pf-s': 'servicio' });
+  $('#cf-pf-save').onclick = async e => {
+    saving(e.currentTarget, true);
+    try {
+      const r = await api('priv.cfgProf', {}, 'POST', Object.assign(cfAuth(), {
+        docOriginal: pf ? pf.documento : '', documento: val('cf-pf-d'), nombre: val('cf-pf-n'),
+        contacto: val('cf-pf-c'), servicio: val('cf-pf-s')
+      }));
+      saving(e.currentTarget, false);
+      if (!r.ok) return toast(r.msg || 'No se pudo', 'err');
+      CF.d.profesionales = r.profesionales; CF.d.servicios = r.servicios;
+      closeLayer(); cfPintaProfesionales(); toast('Guardado', 'ok');
+    } catch (err) { saving(e.currentTarget, false); fallaRed(err); }
+  };
+}
+
+async function cfProfBorrar(pf) {
+  if (!await confirmar('¿Eliminar a ' + pf.nombre + '?',
+    crow('Servicio', pf.servicio) + crow('Solicitudes atendidas', String(pf.atendidas)) +
+    (pf.atendidas ? crow('Ojo', 'su nombre queda en el historial') : ''))) return;
+  try {
+    const r = await api('priv.cfgProfEliminar', {}, 'POST', Object.assign(cfAuth(), { documento: pf.documento }));
+    if (!r.ok) return toast(r.msg || 'No se pudo', 'err');
+    CF.d.profesionales = r.profesionales; CF.d.servicios = r.servicios;
+    cfPintaProfesionales(); toast('Eliminado', 'ok');
+  } catch (e) { fallaRed(e); }
+}
+
+/* ============================================================
+   ZONAS  (agregar y renombrar · no se borran)
+   ============================================================ */
+let CF_ZQ = '';
+function cfPintaZonas() {
+  const q = cfNorm(CF_ZQ);
+  const z = CF.d.zonas.filter(x => !q || cfNorm(x.residencia).indexOf(q) >= 0);
+  $('#cf-body').innerHTML = cfCard('Zonas', 'Se guardan sin acento y en mayúsculas. Renombrar una zona la cambia en todos los registros para no dejar datos mixtos.',
+    `<div class="bd-search"><input class="input" id="cf-z-q" placeholder="Buscar zona…" value="${esc(CF_ZQ)}" autocomplete="off" /></div>
+     <p class="cfg-count">${z.length} de ${CF.d.zonas.length} zonas</p>
+     ${z.length ? `<ul class="cfg-list">${z.map(x => `
+      <li class="cfg-row">
+        <div class="cfg-row-t"><b>${esc(x.residencia)}</b><span class="cfg-row-s">${esc(x.id)}</span></div>
+        <div class="cfg-row-a"><button class="bd-btn" data-z="${esc(x.id)}" title="Renombrar">${I.pencil}</button></div>
+      </li>`).join('')}</ul>` : cfVacio('Ninguna zona con ese nombre.')}
+     <div class="cfg-actions"><button class="btn btn-quiet" id="cf-z-add">${I.plus} Agregar zona</button></div>`);
+  const inp = $('#cf-z-q');
+  inp.oninput = () => { CF_ZQ = inp.value; const s = inp.selectionStart; cfPintaZonas(); const i2 = $('#cf-z-q'); i2.focus(); i2.setSelectionRange(s, s); };
+  $('#cf-z-add').onclick = () => cfZonaSheet(null);
+  $$('#cf-body [data-z]').forEach(b => b.onclick = () => cfZonaSheet(CF.d.zonas.filter(x => x.id === b.dataset.z)[0]));
+  cfPintado();   /* 02/08: reabre el bloque y devuelve lo que estabas escribiendo */
+}
+
+function cfZonaSheet(z) {
+  openSheet(`<div class="grip"></div>
+    <h2 class="h2">${z ? 'Renombrar zona' : 'Nueva zona'}</h2>
+    <div class="stack" style="margin-top:14px;">
+      ${field('Nombre', inputEl('cf-z-n', `value="${esc(z ? z.residencia : '')}" placeholder="Ej. VILLA CAFE"`))}
+      <p class="small muted">Se guarda sin acento y en mayúsculas. La Ñ sí se respeta.</p>
+      <div id="cf-z-imp"></div>
+      <button class="btn btn-primary btn-block" id="cf-z-save">${z ? 'Renombrar' : 'Agregar'}</button>
+      <button class="btn btn-quiet btn-block" data-close>Cancelar</button>
+    </div>`);
+  cfHoja('zona', z && z.id, { 'cf-z-n': 'residencia' });
+  if (z) api('priv.cfgZonaImpacto', Object.assign(cfAuth(), { id: z.id })).then(r => {
+    const box = $('#cf-z-imp'); if (!box || !r.ok) return;
+    box.innerHTML = r.total
+      ? `<div class="cfg-warn">Renombrarla cambia <b>${r.total}</b> registro(s): ${r.detalle.map(d => esc(d.hoja) + ' (' + d.filas + ')').join(', ')}.</div>`
+      : `<div class="cfg-hint">Ningún registro usa esta zona todavía.</div>`;
+  }).catch(() => {});
+  $('#cf-z-save').onclick = async e => {
+    const nombre = val('cf-z-n');
+    if (!nombre) return toast('Escribe el nombre', 'err');
+    saving(e.currentTarget, true);
+    try {
+      const r = await api('priv.cfgZona', {}, 'POST', Object.assign(cfAuth(), { id: z ? z.id : '', residencia: nombre }));
+      saving(e.currentTarget, false);
+      if (!r.ok) return toast(r.msg || 'No se pudo', 'err');
+      CF.d.zonas = r.zonas; closeLayer(); cfPintaZonas();
+      toast(r.filas ? r.nombre + ' · ' + r.filas + ' registro(s) actualizados' : 'Guardada como ' + r.nombre, 'ok');
+    } catch (err) { saving(e.currentTarget, false); fallaRed(err); }
+  };
+}
+
+/* ============================================================
+   PLANTILLAS
+   ============================================================ */
+function cfPintaPlantillas() {
+  $('#cf-body').innerHTML = CF.d.plantillas.map((p, i) => cfCard(p.titulo,
+    p.modulo + ' · toca una variable para insertarla donde tengas el cursor.',
+    `<div class="cfg-chips">${p.vars.map(v => `<button class="cfg-chip" data-v="${esc(v)}" data-i="${i}">${esc(v)}</button>`).join('')}</div>
+     <textarea class="input area cfg-tpl" id="cf-tpl-${i}" rows="7">${esc(p.cuerpo)}</textarea>
+     <div class="cfg-hint">${p.sintaxis === 'corchetes'
+        ? 'Las variables van entre corchetes. Para bajar de línea, dale Enter: se manda tal cual lo escribes.'
+        : 'Las variables van entre llaves. Para bajar de línea, dale Enter: se manda tal cual lo escribes.'}</div>
+     <div id="cf-tpl-prev-${i}" class="cfg-prev"></div>
+     <div class="cfg-actions">
+       <button class="btn btn-quiet cfg-mini" data-prev="${i}">Vista previa</button>
+       <button class="btn btn-primary" data-save="${i}">Guardar</button>
+     </div>`)).join('');
+
+  $$('#cf-body .cfg-chip').forEach(b => b.onclick = () => {
+    const ta = $('#cf-tpl-' + b.dataset.i);
+    const s = ta.selectionStart, e = ta.selectionEnd;
+    ta.value = ta.value.slice(0, s) + b.dataset.v + ta.value.slice(e);
+    ta.focus(); ta.setSelectionRange(s + b.dataset.v.length, s + b.dataset.v.length);
+  });
+  $$('#cf-body [data-prev]').forEach(b => b.onclick = () => cfTplPrev(+b.dataset.prev));
+  $$('#cf-body [data-save]').forEach(b => b.onclick = e => cfTplGuardar(e.currentTarget, +b.dataset.save));
+  cfPintado();   /* 02/08: reabre el bloque y devuelve lo que estabas escribiendo */
+}
+
+/* Muestra el mensaje como le llega a la persona. Desde el Módulo 9.1 lo que
+   se escribe es lo que se manda: los saltos de línea ya son de verdad, así
+   que aquí no hay nada que traducir. */
+function cfTplPrev(i) {
+  const p = CF.d.plantillas[i], txt = $('#cf-tpl-' + i).value;
+  const ejemplo = { '[NOMBRE]': 'MARÍA GÓMEZ', '[CODIGO]': 'LD-014', '[REFERIDOS]': '12',
+    '[ASIGNADO]': 'CARLOS RUIZ', '[COMPROMISO]': 'Arreglo del parque', '[CONTACTO]': '3001234567',
+    '[USUARIO]': 'Oscar Polania', '[SOLICITUD]': 'Informe de la sede',
+    '{nombre}': 'MARÍA GÓMEZ', '{clave}': '4821', '{codigo}': 'LD-014',
+    '{servicio}': 'Asesoría Jurídica', '{respuesta}': 'Tu caso quedó radicado.',
+    '{p_nombre}': 'Carlos', '{compromiso}': 'Arreglo del parque',
+    '{tiempo}': 'buenos días', '{jornada}': 'la mañana', '{pn_candidato}': MV.pnCandidato, '{n_candidato}': MV.candidato,
+    '{u_agenda}': 'Oscar Polania', '{contacto}': 'Oscar Polania',
+    '{lista_reuniones}': '1. 8:30 AM – 10:00 AM · Visita a líderes — TRIANA\n2. 11:00 AM – 12:00 M · Reunión JAC — LA CAPILLA',
+    '{bloque_aviso}': 'Visita a líderes\n🗓️ 21 de julio de 2026 · 8:30 AM – 10:00 AM\n📍 TRIANA\nDetalles: Calle 27 # 8 - 26',
+    '{fecha_larga}': '21 de julio de 2026', '{hora_inicio}': '8:30 AM', '{hora_fin}': '10:00 AM',
+    '{lugar}': 'TRIANA', '{detalles}': 'Detalles: Calle 27 # 8 - 26 cerca tingo pollo',
+    '{mensaje}': 'Trae el listado de asistentes impreso, por favor.',
+    /* 31/07 — seguridad de la zona de líderes (app pública) */
+    '{codigo_activacion}': '480915', '{vigencia}': '3', '{bloqueo}': '5', '{intentos}': '3',
+    '{pn_nombre}': 'MARÍA', '{correo}': 'ma***@gmail.com', '{equipo}': 'Equipo ' + MV.candidato,
+    /* 16/11/2026 · Formularios → Detalles → WhatsApp (PLANTILLA_FORM_WHATSAPP) */
+    '{nombre_corto}': 'María', '{nombre_candidato}': MV.candidato, '{nombre_formulario}': 'Curso de velas y jabones 2026',
+    '{url_imagen}': 'https://lh3.googleusercontent.com/d/…', '{Usuario_app}': ((typeof getActive === 'function' && getActive()) || {}).nombre || 'Oscar Polania' };
+  let out = txt;
+  p.vars.forEach(v => { out = out.split(v).join(ejemplo[v] || v); });
+  $('#cf-tpl-prev-' + i).innerHTML = `<div class="cfg-prev-b">${esc(out)}</div>`;
+}
+
+async function cfTplGuardar(btn, i) {
+  const p = CF.d.plantillas[i], txt = $('#cf-tpl-' + i).value;
+  if (!txt.trim() && !await confirmar('¿Dejar la plantilla vacía?',
+    crow('Si la dejas vacía', 'se usa el texto original de fábrica'))) return;
+  const faltan = p.vars.filter(v => txt.indexOf(v) === -1);
+  if (faltan.length && !await confirmar('Faltan variables',
+    crow('Sin usar', faltan.join(' ')) + crow('¿Guardar igual?', 'Sí, si es a propósito'))) return;
+  saving(btn, true);
+  try {
+    const cambios = {}; cambios[p.clave] = txt;
+    const r = await api('priv.cfgGuardar', {}, 'POST', Object.assign(cfAuth(), { cambios }));
+    saving(btn, false);
+    if (!r.ok) return toast(r.msg || 'No se pudo guardar', 'err');
+    p.cuerpo = txt; CF.d.cfg[p.clave] = txt;
+    toast('Plantilla guardada', 'ok');
+  } catch (e) { saving(btn, false); fallaRed(e); }
+}
+
+/* ============================================================
+   USUARIOS  (DEV + ADMIN · el DESARROLLADOR lleva candado)
+   ------------------------------------------------------------
+   17/07/2026: el ADMIN entra aquí, se edita a sí mismo, agrega usuarios y
+   edita a los ADMIN/SEDE. Lo que NO puede es ELIMINAR: ese botón es del
+   DESARROLLADOR y el backend lo vuelve a exigir (que el botón no se pinte
+   es comodidad, no seguridad).
+   ============================================================ */
+function cfPintaUsuarios() {
+  const u = CF.d.usuarios;
+  const puedeBorrar = !!CF.d.esDev;
+  $('#cf-body').innerHTML = cfCard('Usuarios de la app privada', 'Quién entra al panel y con qué rol. El PIN es la única llave: no puede repetirse entre usuarios.',
+    `<ul class="cfg-list">${u.map(x => `
+      <li class="cfg-row">
+        <img class="cfg-av" src="${esc(x.foto)}" alt="" onerror="this.style.visibility='hidden'" />
+        <div class="cfg-row-t">
+          <b>${esc(x.nombre)} ${x.esDev ? I.lock : ''}</b>
+          <span class="cfg-row-s">${esc(x.rol)} · doc. ${esc(x.documento)} · ${esc(x.correo || 'sin correo')}</span>
+          ${x.esDev ? '' : `<span class="cfg-row-s">${x.whatsapp ? '📱 ' + esc(x.whatsapp) : '📱 sin WhatsApp'}${x.bienvenida ? ' · ✅ Bienvenida enviada el ' + esc(x.bienvenida) : ''}</span>`}
+        </div>
+        <div class="cfg-row-a">
+          ${x.estado === 'ACTIVO' ? '' : '<span class="cfg-pill">Inactivo</span>'}
+          ${x.esDev ? '<span class="cfg-pill cfg-pill-dev">Protegido</span>' : `
+            <button class="bd-btn" data-usbien="${esc(x.documento)}" title="${x.bienvenida ? 'Reenviar la bienvenida' : 'Enviar la bienvenida'}">${I.wa}</button>
+            <button class="bd-btn" data-us="${esc(x.documento)}" title="Editar">${I.pencil}</button>
+            ${puedeBorrar ? `<button class="bd-btn bd-btn-danger" data-usdel="${esc(x.documento)}" title="Eliminar">${I.trash}</button>` : ''}`}
+        </div>
+      </li>`).join('')}</ul>
+     <div class="cfg-actions"><button class="btn btn-quiet" id="cf-us-add">${I.plus} Agregar usuario</button></div>`)
+    /* 17/07: los usuarios de la app CENTER viven aquí mismo, debajo. */
+    + cfCallUsuariosCard();
+  $('#cf-us-add').onclick = () => cfUserSheet(null);
+  cfCallUsuariosBind();
+  $$('#cf-body [data-us]').forEach(b => b.onclick = () => cfUserSheet(u.filter(x => x.documento === b.dataset.us)[0]));
+  $$('#cf-body [data-usdel]').forEach(b => b.onclick = () => cfUserBorrar(u.filter(x => x.documento === b.dataset.usdel)[0]));
+  $$('#cf-body [data-usbien]').forEach(b => b.onclick = () => cfUserBienvenida(u.filter(x => x.documento === b.dataset.usbien)[0]));
+  cfZoomFotos();
+  cfPintado();   /* 02/08: reabre el bloque y devuelve lo que estabas escribiendo */
+}
+
+/* ============================================================
+   BIENVENIDA por WhatsApp (17/07/2026)
+   ------------------------------------------------------------
+   Botón en la tarjeta (NO se envía solo al crear el usuario: así lo pidió).
+   Dos vías, mismo texto, el del CORE (Configuración → Plantillas es la única
+   fuente de verdad; aquí NO se escribe el mensaje):
+     · WhatsApp directo → abre el chat con el texto listo. No necesita llaves.
+     · Por el bot       → lo manda BuilderBot solo.
+   ============================================================ */
+function cfUserBienvenida(us) {
+  if (!us) return;
+  if (!us.whatsapp) return toast('Ese usuario no tiene WhatsApp. Edítalo y agrégale el número.', 'err');
+  openSheet(`<div class="grip"></div>
+    <h2 class="h2">${us.bienvenida ? 'Reenviar bienvenida' : 'Enviar bienvenida'}</h2>
+    <p class="muted small">A <b>${esc(us.nombre)}</b> · ${esc(us.whatsapp)}${us.bienvenida ? `<br>Ya se le envió el ${esc(us.bienvenida)}.` : ''}</p>
+    <div class="stack" style="margin-top:14px;">
+      <button class="btn btn-primary btn-block" id="cf-bien-wa">Abrir WhatsApp con el mensaje</button>
+      <button class="btn btn-quiet btn-block" id="cf-bien-bot">Enviarlo por el bot</button>
+      <button class="btn btn-quiet btn-block" data-close>Cancelar</button>
+    </div>`);
+
+  $('#cf-bien-wa').onclick = async e => {
+    saving(e.currentTarget, true);
+    try {
+      const r = await api('priv.cfgUsuarioBienvenida', {}, 'POST', Object.assign(cfAuth(), { documento: us.documento, medio: 'wa' }));
+      saving(e.currentTarget, false);
+      if (!r.ok) return toast(r.msg || 'No se pudo', 'err');
+      CF.d.usuarios = r.usuarios || CF.d.usuarios;
+      closeLayer(); cfPintaUsuarios();
+      ldWaOpen(r.numero, r.texto);   // mismo abridor que usa Líderes (móvil vs PC)
+    } catch (err) { saving(e.currentTarget, false); fallaRed(err); }
+  };
+
+  $('#cf-bien-bot').onclick = async e => {
+    saving(e.currentTarget, true);
+    try {
+      const r = await api('priv.cfgUsuarioBienvenida', {}, 'POST', Object.assign(cfAuth(), { documento: us.documento, medio: 'bot' }));
+      saving(e.currentTarget, false);
+      if (!r.ok) return toast(r.msg || 'No se pudo enviar', 'err');
+      CF.d.usuarios = r.usuarios || CF.d.usuarios;
+      closeLayer(); cfPintaUsuarios(); toast(r.msg || 'Bienvenida enviada', 'ok');
+    } catch (err) { saving(e.currentTarget, false); fallaRed(err); }
+  };
+}
+
+function cfUserSheet(us) {
+  /* 27/08/2026 · SEDE fuera: en su lugar queda INVITADO, que se arma abajo
+     vista por vista. El DESARROLLADOR no se crea desde aquí. */
+  const roles = [['ADMIN', 'ADMIN — ve todo el panel'],
+                 ['INVITADO', 'INVITADO — solo las vistas que le marques abajo']];
+  openSheet(`<div class="grip"></div>
+    <h2 class="h2">${us ? 'Editar usuario' : 'Nuevo usuario'}</h2>
+    <div class="stack" style="margin-top:14px;">
+      ${us ? `<div class="cfg-foto">
+        <img class="cfg-foto-img" id="cf-us-prev" src="${esc(us.foto)}" alt="" onerror="this.style.visibility='hidden'" />
+        <div class="stack">
+          <button class="btn btn-quiet cfg-mini" id="cf-us-foto">Cambiar foto</button>
+          <button class="btn btn-quiet cfg-mini cfg-danger" id="cf-us-fotodel">Quitar foto</button>
+        </div></div>` : ''}
+      ${field('Documento', inputEl('cf-us-d', `value="${esc(us ? us.documento : '')}" inputmode="numeric"`))}
+      ${field('Nombre', inputEl('cf-us-n', `value="${esc(us ? us.nombre : '')}"`))}
+      ${field('Correo', inputEl('cf-us-c', `value="${esc(us ? us.correo : '')}" inputmode="email"`))}
+      ${field('WhatsApp (obligatorio)', inputEl('cf-us-w', `value="${esc(us ? us.whatsapp : '')}" inputmode="numeric" maxlength="12" placeholder="3001234567"`))}
+      ${field('Rol', `<select class="input" id="cf-us-r">${roles.map(r => `<option value="${r[0]}"${us && us.rol === r[0] ? ' selected' : ''}>${esc(r[1])}</option>`).join('')}</select>`)}
+      ${field('PIN (4 dígitos)', inputEl('cf-us-p', `inputmode="numeric" maxlength="4" placeholder="${us ? 'Déjalo vacío para no cambiarlo' : '0000'}"`))}
+      ${field('Estado', `<select class="input" id="cf-us-e"><option value="ACTIVO"${!us || us.estado === 'ACTIVO' ? ' selected' : ''}>Activo</option><option value="INACTIVO"${us && us.estado === 'INACTIVO' ? ' selected' : ''}>Inactivo</option></select>`)}
+      <div id="cf-us-perm" class="perm-box" hidden></div>
+      <button class="btn btn-primary btn-block" id="cf-us-save">Guardar</button>
+      <button class="btn btn-quiet btn-block" data-close>Cancelar</button>
+    </div>`);
+  onlyDigits($('#cf-us-d')); onlyDigits($('#cf-us-p')); onlyDigits($('#cf-us-w'));
+  cfHoja('usuario', us && us.documento, { 'cf-us-d': 'documento', 'cf-us-n': 'nombre', 'cf-us-c': 'correo', 'cf-us-w': 'whatsapp', 'cf-us-r': 'rol', 'cf-us-e': 'estado' });
+  /* 06/08/2026 · pastillas del rol INVITADO */
+  CF_PERM_EDIT = (us && us.permisos) ? { c: (us.permisos.c || []).slice(), x: (us.permisos.x || []).slice() } : { c: [], x: [] };
+  CF_PERM_OPEN = '';
+  const selRol = $('#cf-us-r');
+  selRol.onchange = () => cfPermCaja(selRol.value);
+  cfPermCaja(selRol.value);
+  if (us) {
+    $('#cf-us-foto').onclick = () => cfUserFoto(us);
+    $('#cf-us-fotodel').onclick = () => cfUserFotoQuitar(us);
+    /* Fase 9.2: mismo visor con zoom que en el Inicio y en Detalles */
+    cfZoomFotos();
+  }
+  $('#cf-us-save').onclick = async e => {
+    saving(e.currentTarget, true);
+    try {
+      const r = await api('priv.cfgUsuario', {}, 'POST', Object.assign(cfAuth(), {
+        docOriginal: us ? us.documento : '', documento: val('cf-us-d'), nombre: val('cf-us-n'),
+        correo: val('cf-us-c'), whatsapp: val('cf-us-w'), rol: val('cf-us-r'), pin: val('cf-us-p'), estado: val('cf-us-e'),
+        permisos: JSON.stringify(val('cf-us-r') === 'INVITADO' ? cfPermLeer() : { c: [], x: [] })
+      }));
+      saving(e.currentTarget, false);
+      if (!r.ok) return toast(r.msg || 'No se pudo', 'err');
+      CF.d.usuarios = r.usuarios; closeLayer(); cfPintaUsuarios(); toast('Guardado', 'ok');
+      cfAgAcceso(r);
+    } catch (err) { saving(e.currentTarget, false); fallaRed(err); }
+  };
+}
+
+/* ============================================================
+   EDITOR DE PERMISOS DEL ROL INVITADO — DOS NIVELES  (27/08/2026)
+   ------------------------------------------------------------
+   Sustituye al tablero de pastillas del 06/08. Cambia solo la CARA: el
+   catálogo lo sigue mandando el CORE (priv.permCatalogo · Permisos.gs) y
+   aquí NO hay ninguna lista escrita a mano, así que una vista nueva de allá
+   aparece sola aquí.
+
+   NIVEL 1 · VISTAS. Una fila por vista con su casilla. Marcarla enciende su
+   pastilla "Ver" (la madre) y abre el nivel 2. Desmarcarla apaga TODO lo de
+   esa vista: no tiene sentido dejarle "Excel de Base de Datos" a quien no
+   entra a Base de Datos (y desde hoy el CORE también limpia esos huérfanos
+   al leer y al guardar · permNormalizar_).
+
+   NIVEL 2 · ACCIONES. Las acciones de esa vista y, debajo, sus secciones
+   (Referidos, Memoria mensual, Asistentes, Servicios · Ideas · Comercio),
+   cada una con su propia "Ver". Selección múltiple, con Todo / Nada.
+
+   QUÉ CUENTA COMO VISTA. Sale del catálogo: cada bloque lo es, y también
+   los grupos que traen `ruta` (Dashboard, Simulador, Votación), porque son
+   pantallas propias con su propio hash. Los grupos sin ruta son secciones y
+   viven dentro del nivel 2 de su vista.
+
+   Los 4 CANDADOS de arriba no cambian: apagan una familia entera
+   (exportar, eliminar, WhatsApp, IA) y ganan siempre. La pastilla se sigue
+   viendo marcada pero en gris y no cuenta, así que quitar el candado
+   devuelve lo que ya estaba elegido sin volver a marcarlo.
+   ============================================================ */
+let CF_PERM_CAT = null;      // { catalogo, candados } — se pide una vez
+let CF_PERM_EDIT = { c: [], x: [] };
+let CF_PERM_OPEN = '';       // id de la vista abierta en el nivel 2
+
+function cfPermCaja(rol) {
+  const box = $('#cf-us-perm'); if (!box) return;
+  if (String(rol).toUpperCase() !== 'INVITADO') { box.hidden = true; box.innerHTML = ''; return; }
+  box.hidden = false;
+  if (CF_PERM_CAT) return cfPermPintar();
+  box.innerHTML = loadingBox('Cargando permisos…');
+  api('priv.permCatalogo', cfAuth())
+    .then(r => {
+      if (!r || !r.ok) { box.innerHTML = '<p class="muted small">No se pudo cargar el catálogo de permisos.</p>'; return; }
+      CF_PERM_CAT = r; cfPermPintar();
+    })
+    .catch((e) => { box.innerHTML = fallaHtml(e, 'priv.permCatalogo'); });
+}
+
+/* ---------- el catálogo del CORE, leído como lista de VISTAS ---------- */
+function cfPermVistas() {
+  const out = [];
+  ((CF_PERM_CAT && CF_PERM_CAT.catalogo) || []).forEach(v => {
+    if (v.suelto) return;                       // el robot de IA va aparte
+    out.push({ id: v.id, label: v.label, items: v.items || [], secciones: (v.grupos || []).filter(g => !g.ruta) });
+    (v.grupos || []).filter(g => g.ruta).forEach(g =>
+      out.push({ id: v.id + '.' + g.id, label: g.label, items: g.items || [], secciones: [], hija: true }));
+  });
+  return out;
+}
+function cfPermSueltos() { return ((CF_PERM_CAT && CF_PERM_CAT.catalogo) || []).filter(v => v.suelto); }
+function cfPermVistaPorId(id) { return cfPermVistas().filter(v => v.id === id)[0] || null; }
+function cfPermMadre(v) { const it = (v.items || []).filter(x => x.madre)[0]; return it ? it.k : ''; }
+function cfPermClaves(v) {
+  const k = (v.items || []).map(i => i.k);
+  (v.secciones || []).forEach(g => (g.items || []).forEach(i => k.push(i.k)));
+  return k;
+}
+function cfPermIndex() {
+  const idx = {};
+  ((CF_PERM_CAT && CF_PERM_CAT.catalogo) || []).forEach(v => {
+    (v.items || []).forEach(it => idx[it.k] = it);
+    (v.grupos || []).forEach(g => (g.items || []).forEach(it => idx[it.k] = it));
+  });
+  return idx;
+}
+function cfPermOn(k) { return CF_PERM_EDIT.c.indexOf(k) !== -1; }
+function cfPermVistaOn(v) { const m = cfPermMadre(v); return !!m && cfPermOn(m); }
+function cfPermPoner(ks) { ks.forEach(k => { if (!cfPermOn(k)) CF_PERM_EDIT.c.push(k); }); }
+function cfPermQuitar(ks) { ks.forEach(k => { const i = CF_PERM_EDIT.c.indexOf(k); if (i !== -1) CF_PERM_EDIT.c.splice(i, 1); }); }
+
+/* Cuántas acciones (sin contar la madre) van marcadas y cuántas hay */
+function cfPermCuentaVista(v) {
+  const m = cfPermMadre(v), idx = cfPermIndex();
+  const todas = cfPermClaves(v).filter(k => k !== m);
+  return { n: todas.filter(k => cfPermOn(k) && !cfPermTapada(idx[k] || {})).length, t: todas.length };
+}
+
+/* ---------- acciones del editor ---------- */
+function cfPermVistaToggle(id) {
+  const v = cfPermVistaPorId(id); if (!v) return;
+  if (cfPermVistaOn(v)) {
+    cfPermQuitar(cfPermClaves(v));              // apagar la vista se lleva sus acciones
+    if (CF_PERM_OPEN === id) CF_PERM_OPEN = '';
+  } else {
+    const m = cfPermMadre(v); if (m) cfPermPoner([m]);
+    /* 03/11/2026 · pastillas con defecto: se encienden junto con la vista (se pueden apagar) */
+    cfPermPoner((v.items || []).filter(x => x.defecto).map(x => x.k));
+    CF_PERM_OPEN = id;                          // y se abre el nivel 2
+  }
+  cfPermPintar();
+}
+/* Tocar el nombre: si está apagada, la enciende y la abre; si no, abre o cierra */
+function cfPermAbrir(id) {
+  const v = cfPermVistaPorId(id); if (!v) return;
+  if (!cfPermVistaOn(v)) return cfPermVistaToggle(id);
+  CF_PERM_OPEN = (CF_PERM_OPEN === id) ? '' : id;
+  cfPermPintar();
+}
+function cfPermTodoNada(id, on) {
+  const v = cfPermVistaPorId(id); if (!v) return;
+  const ks = cfPermClaves(v);
+  if (on) cfPermPoner(ks);
+  else cfPermQuitar(ks.filter(k => k !== cfPermMadre(v)));   // "Nada" deja la vista, quita las acciones
+  cfPermPintar();
+}
+
+/* ¿Esta pastilla está apagada por un candado? */
+function cfPermTapada(it) { return !!(it && it.fam && CF_PERM_EDIT.x.indexOf(it.fam) !== -1); }
+
+function cfPermChip(it) {
+  const on = cfPermOn(it.k);
+  return `<button type="button" class="perm-chip${on ? ' on' : ''}${cfPermTapada(it) ? ' tapada' : ''}" data-k="${esc(it.k)}"${it.fam ? ` title="La apaga el candado «${esc(cfPermCandLabel(it.fam))}»"` : ''}>${esc(it.t)}</button>`;
+}
+function cfPermCandLabel(fam) {
+  const c = ((CF_PERM_CAT && CF_PERM_CAT.candados) || []).filter(x => x.k === fam)[0];
+  return c ? c.label : fam;
+}
+
+/* ---------- pintado ---------- */
+function cfPermPanel(v) {
+  const m = cfPermMadre(v);
+  const chips = (v.items || []).filter(it => it.k !== m).map(cfPermChip).join('');
+  const secc = (v.secciones || []).map(g => `<div class="perm-grupo">
+      <span class="perm-glabel">${esc(g.label)}</span>
+      <div class="perm-chips">${(g.items || []).map(cfPermChip).join('')}</div>
+    </div>`).join('');
+  return `<div class="perm-panel">
+    <div class="perm-pacts">
+      <span class="perm-plabel">Acciones de ${esc(v.label)}</span>
+      <span class="perm-vacts">
+        <button type="button" class="perm-mini" data-todo="${esc(v.id)}">Todo</button>
+        <button type="button" class="perm-mini" data-nada="${esc(v.id)}">Nada</button>
+      </span>
+    </div>
+    ${chips ? `<div class="perm-chips">${chips}</div>` : ''}
+    ${secc}
+    ${(!chips && !secc) ? '<p class="muted small">Esta vista no tiene más acciones que verla.</p>' : ''}
+  </div>`;
+}
+
+function cfPermFila(v) {
+  const on = cfPermVistaOn(v), abierta = on && CF_PERM_OPEN === v.id, c = cfPermCuentaVista(v);
+  return `<div class="perm-v${on ? ' on' : ''}${v.hija ? ' hija' : ''}${abierta ? ' abierta' : ''}">
+    <div class="perm-vrow">
+      <button type="button" class="perm-vchk${on ? ' on' : ''}" data-v="${esc(v.id)}" role="switch" aria-checked="${on ? 'true' : 'false'}" aria-label="${esc(v.label)}">${on ? I.check : ''}</button>
+      <button type="button" class="perm-vname" data-abrir="${esc(v.id)}">
+        <b>${esc(v.label)}</b>
+        <span class="perm-vn">${on ? (c.n ? `${c.n} de ${c.t} acciones` : 'Solo ver') : 'Sin acceso'}</span>
+      </button>
+      <span class="perm-vchev">${I.chevR}</span>
+    </div>
+    ${abierta ? cfPermPanel(v) : ''}
+  </div>`;
+}
+
+function cfPermPintar() {
+  const box = $('#cf-us-perm'); if (!box || !CF_PERM_CAT) return;
+  const cand = (CF_PERM_CAT.candados || []).map(c =>
+    `<button type="button" class="perm-cand${CF_PERM_EDIT.x.indexOf(c.k) !== -1 ? ' on' : ''}" data-x="${esc(c.k)}" title="${esc(c.desc)}">${esc(c.label)}</button>`).join('');
+  const sueltos = cfPermSueltos().map(v => `<div class="perm-grupo">
+      <span class="perm-glabel">${esc(v.label)}</span>
+      <div class="perm-chips">${(v.items || []).map(cfPermChip).join('')}</div>
+    </div>`).join('');
+
+  box.innerHTML = `<div class="perm-head">
+      <b>Permisos del invitado</b>
+      <span class="perm-cuenta" id="cf-perm-n"></span>
+    </div>
+    <p class="muted small">Marca las vistas a las que entra. Al marcar una se abren sus acciones y eliges las que quieras. Los candados apagan una familia entera de una vez.</p>
+    <div class="perm-cands">${cand}</div>
+    <div class="perm-lista">${cfPermVistas().map(cfPermFila).join('')}</div>
+    ${sueltos ? `<div class="perm-extra">${sueltos}</div>` : ''}`;
+
+  box.querySelectorAll('[data-v]').forEach(b => b.onclick = () => cfPermVistaToggle(b.dataset.v));
+  box.querySelectorAll('[data-abrir]').forEach(b => b.onclick = () => cfPermAbrir(b.dataset.abrir));
+  box.querySelectorAll('[data-todo]').forEach(b => b.onclick = () => cfPermTodoNada(b.dataset.todo, true));
+  box.querySelectorAll('[data-nada]').forEach(b => b.onclick = () => cfPermTodoNada(b.dataset.nada, false));
+  box.querySelectorAll('[data-k]').forEach(b => b.onclick = () => {
+    const k = b.dataset.k, i = CF_PERM_EDIT.c.indexOf(k);
+    if (i === -1) CF_PERM_EDIT.c.push(k); else CF_PERM_EDIT.c.splice(i, 1);
+    cfPermPintar();
+  });
+  box.querySelectorAll('[data-x]').forEach(b => b.onclick = () => {
+    const k = b.dataset.x, i = CF_PERM_EDIT.x.indexOf(k);
+    if (i === -1) CF_PERM_EDIT.x.push(k); else CF_PERM_EDIT.x.splice(i, 1);
+    cfPermPintar();
+  });
+  cfPermCuenta();
+}
+
+/* Cuántas pastillas quedan DE VERDAD (las tapadas por un candado no cuentan,
+   y las acciones sin su "Ver" tampoco: eso lo limpia el CORE al guardar) */
+function cfPermEfectivas() {
+  const idx = cfPermIndex();
+  return CF_PERM_EDIT.c.filter(k => { const it = idx[k]; return it && !cfPermTapada(it); });
+}
+function cfPermCuenta() {
+  const el = $('#cf-perm-n'); if (!el) return;
+  const vistas = cfPermVistas().filter(cfPermVistaOn).length;
+  const n = cfPermEfectivas().length;
+  el.textContent = n ? `${vistas} vista${vistas === 1 ? '' : 's'} · ${n} permiso${n === 1 ? '' : 's'}` : 'Sin permisos: no se puede guardar';
+  el.classList.toggle('vacia', !n);
+}
+function cfPermLeer() { return { c: CF_PERM_EDIT.c.slice(), x: CF_PERM_EDIT.x.slice() }; }
+
+function cfUserFoto(us) {
+  const inp = h('<input type="file" accept="image/jpeg,image/png,image/webp" hidden />');
+  document.body.appendChild(inp);
+  inp.onchange = () => {
+    const f = inp.files[0]; inp.remove();
+    if (!f) return;
+    if (f.size > 6 * 1024 * 1024) return toast('La imagen supera 6 MB', 'err');
+    const rd = new FileReader();
+    rd.onload = async () => {
+      try {
+        const r = await api('priv.cfgUsuarioFoto', {}, 'POST', Object.assign(cfAuth(), { documento: us.documento, dataUrl: rd.result }));
+        if (!r.ok) return toast(r.msg || 'No se pudo subir', 'err');
+        CF.d.usuarios = r.usuarios; us.foto = r.foto;
+        const p = $('#cf-us-prev'); if (p) { p.src = r.foto; p.style.visibility = 'visible'; }
+        toast('Foto actualizada', 'ok');
+      } catch (e) { fallaRed(e); }
+    };
+    rd.readAsDataURL(f);
+  };
+  inp.click();
+}
+
+/* Engancha el zoom a TODA foto pintada en Configuración → Usuarios: la lista
+   (.cfg-av) y el detalle (.cfg-foto-img). Se llama tras cada repintado. Se
+   salta las que no cargaron (visibility oculta) y la imagen por defecto. */
+function cfZoomFotos() {
+  $$('#cf-body .cfg-av, #cf-body .cfg-foto-img').forEach(img => {
+    const src = img.getAttribute('src') || '';
+    if (esFotoDefault(src)) return;
+    img.classList.add('zoomable');
+    img.onclick = e => { e.stopPropagation(); zoomImagen(src); };
+  });
+}
+
+async function cfUserFotoQuitar(us) {
+  if (!await confirmar('¿Quitar la foto?', crow('El archivo', 'se borra de Drive'))) return;
+  try {
+    const r = await api('priv.cfgUsuarioFotoQuitar', {}, 'POST', Object.assign(cfAuth(), { documento: us.documento }));
+    if (!r.ok) return toast(r.msg || 'No se pudo', 'err');
+    CF.d.usuarios = r.usuarios; us.foto = r.foto;
+    const p = $('#cf-us-prev'); if (p) p.src = r.foto;
+    toast('Foto quitada', 'ok');
+  } catch (e) { fallaRed(e); }
+}
+
+async function cfUserBorrar(us) {
+  if (!await confirmar('¿Eliminar a ' + us.nombre + '?', crow('Rol', us.rol) + crow('Pierde el acceso', 'Sí'))) return;
+  try {
+    const r = await api('priv.cfgUsuarioEliminar', {}, 'POST', Object.assign(cfAuth(), { documento: us.documento }));
+    if (!r.ok) return toast(r.msg || 'No se pudo', 'err');
+    CF.d.usuarios = r.usuarios; cfPintaUsuarios(); toast('Eliminado', 'ok');
+    cfAgAcceso(r);
+  } catch (e) { fallaRed(e); }
+}
+
+/* ============================================================
+   AVANZADO  (solo DEV)
+   ============================================================ */
+/* ============================================================
+   CALL CENTER (17/07/2026) — configuración de la app RONALD CENTER
+   ------------------------------------------------------------
+   Dos piezas, las dos solo del DEV:
+     · Usuarios → tarjeta "Usuarios de la App Call Center" (Nombre + PIN).
+       Se guarda de a uno, al instante (igual que los del panel).
+     · Call Center → días de activación, horario y quién entra cada día a
+       qué líderes. Esto se edita en LOTE y se guarda con un botón: son
+       datos que se cambian juntos y a medias no significan nada.
+   El estado editable vive en CFCALL; CF.d.call es lo último confirmado por
+   el servidor. Al guardar, el servidor devuelve el estado real y se repinta
+   con eso (no con lo que uno cree que mandó).
+   ============================================================ */
+const CFCALL_DIAS = [
+  ['LUNES', 'Lunes'], ['MARTES', 'Martes'], ['MIERCOLES', 'Miércoles'], ['JUEVES', 'Jueves'],
+  ['VIERNES', 'Viernes'], ['SABADO', 'Sábado'], ['DOMINGO', 'Domingo']
+];
+const CFCALL_TODOS = 'TODOS', CFCALL_SIN = 'SIN';
+let CFCALL = null;
+
+function cfCallD() { return (CF.d && CF.d.call) || { usuarios: [], dias: [], lideres: [] }; }
+function cfCallLabel(k) { const h = CFCALL_DIAS.filter(d => d[0] === k)[0]; return h ? h[1] : k; }
+function cfCallNombre(id) { const u = cfCallD().usuarios.filter(x => x.id === id)[0]; return u ? u.nombre : '(usuario borrado)'; }
+
+/* Copia profunda para editar sin tocar lo confirmado */
+function cfCallCargar() {
+  CFCALL = { dias: cfCallD().dias.map(d => ({ dia: d.dia, inicio: d.inicio, fin: d.fin, usuarios: (d.usuarios || []).map(u => ({ id: u.id, lideres: (u.lideres || []).slice() })) })) };
+}
+
+/* ---------- Tarjeta dentro de la pestaña Usuarios ---------- */
+function cfCallUsuariosCard() {
+  const us = cfCallD().usuarios;
+  const filas = us.length ? `<ul class="cfg-list">${us.map(x => `
+    <li class="cfg-row">
+      <div class="cfg-av cfg-av-txt">${esc(String(x.nombre || '?').trim().charAt(0).toUpperCase())}</div>
+      <div class="cfg-row-t">
+        <b>${esc(x.nombre)}</b>
+        <span class="cfg-row-s">PIN ${esc(x.pin || '····')}${x.creado ? ' · desde el ' + esc(String(x.creado).slice(0, 10)) : ''}</span>
+      </div>
+      <div class="cfg-row-a">
+        ${x.estado === 'ACTIVO' ? '' : '<span class="cfg-pill">Inactivo</span>'}
+        <button class="cc-ico" data-cu="${esc(x.id)}" title="Editar" aria-label="Editar">${I.pencil}</button>
+        <button class="cc-ico cc-ico-danger" data-cudel="${esc(x.id)}" title="Eliminar" aria-label="Eliminar">${I.trash}</button>
+      </div>
+    </li>`).join('')}</ul>` : cfVacio('Todavía no hay usuarios del call center.');
+
+  return cfCard('Usuarios de la App Call Center',
+    'Entran a la app CENTER solo con el PIN. Qué día y a qué líderes trabajan se define en la pestaña Call Center.',
+    filas + `<div class="cfg-actions"><button class="btn btn-quiet" id="cf-cu-add">${I.plus} Agregar usuario CENTER</button></div>`);
+}
+
+function cfCallUsuariosBind() {
+  const b = $('#cf-cu-add'); if (b) b.onclick = () => cfCallUserSheet(null);
+  $$('#cf-body [data-cu]').forEach(x => x.onclick = () => cfCallUserSheet(cfCallD().usuarios.filter(u => u.id === x.dataset.cu)[0]));
+  $$('#cf-body [data-cudel]').forEach(x => x.onclick = () => cfCallUserBorrar(cfCallD().usuarios.filter(u => u.id === x.dataset.cudel)[0]));
+}
+
+function cfCallUserSheet(u) {
+  openSheet(`<div class="grip"></div>
+    <h2 class="h2">${u ? 'Editar usuario CENTER' : 'Nuevo usuario CENTER'}</h2>
+    <p class="muted small">El PIN es su única credencial: no se puede repetir.</p>
+    <div class="stack" style="margin-top:12px;">
+      <div class="cfg-field full"><label>Nombre</label><input class="input" id="cu-nombre" value="${esc(u ? u.nombre : '')}" autocomplete="off" /></div>
+      <div class="cfg-field full"><label>PIN (4 dígitos)</label>
+        <input class="input" id="cu-pin" inputmode="numeric" maxlength="4" value="${esc(u ? u.pin : '')}" autocomplete="off" placeholder="${u ? 'Déjalo igual o escribe uno nuevo' : '4 dígitos'}" /></div>
+      ${u ? cfSwitch('cu-activo', 'Usuario activo', u.estado === 'ACTIVO') : ''}
+      <button class="btn btn-primary btn-block" id="cu-save">Guardar</button>
+      <button class="btn btn-quiet btn-block" data-close>Cancelar</button>
+    </div>`);
+
+  cfHoja('call-usuario', u && u.id, { 'cu-nombre': 'nombre', 'cu-pin': 'pin', 'cu-activo': 'estado' });
+  const pin = $('#cu-pin');
+  pin.addEventListener('input', () => { pin.value = pin.value.replace(/\D/g, '').slice(0, 4); });
+  if (u) { const sw = $('#cu-activo'); sw.onclick = () => sw.classList.toggle('on'); }
+
+  $('#cu-save').onclick = async e => {
+    const nombre = ($('#cu-nombre').value || '').trim();
+    const p = ($('#cu-pin').value || '').trim();
+    if (!nombre) return toast('Falta el nombre', 'err');
+    if (!u && p.length !== 4) return toast('El PIN es de 4 dígitos', 'err');
+    if (p && p.length !== 4) return toast('El PIN es de 4 dígitos', 'err');
+    const body = Object.assign(cfAuth(), { id: u ? u.id : '', nombre, pin: p, estado: (u && !$('#cu-activo').classList.contains('on')) ? 'INACTIVO' : 'ACTIVO' });
+    saving(e.currentTarget, true);
+    try {
+      const r = await api('priv.cfgCallUsuario', {}, 'POST', body);
+      saving(e.currentTarget, false);
+      if (!r.ok) return toast(r.msg || 'No se pudo guardar', 'err');
+      CF.d.call = r.call; CFCALL = null;
+      closeLayer(); cfPintaUsuarios(); toast('Guardado', 'ok');
+    } catch (err) { saving(e.currentTarget, false); fallaRed(err); }
+  };
+}
+
+async function cfCallUserBorrar(u) {
+  if (!u) return;
+  const enDias = cfCallD().dias.filter(d => (d.usuarios || []).some(x => x.id === u.id)).map(d => d.label);
+  const ok = await confirmar('Eliminar a ' + u.nombre,
+    `<div class="crow"><span>Usuario</span><b>${esc(u.nombre)}</b></div>
+     <div class="crow"><span>PIN</span><b>${esc(u.pin)}</b></div>
+     ${enDias.length ? `<div class="crow"><span>Turnos</span><b>Pierde el acceso de ${esc(enDias.join(', '))}</b></div>` : ''}
+     <p class="muted small" style="margin-top:8px;">Lo ya marcado por esta persona en la base de datos NO se borra.</p>`);
+  if (!ok) return;
+  try {
+    const r = await api('priv.cfgCallUsuarioEliminar', {}, 'POST', Object.assign(cfAuth(), { id: u.id }));
+    if (!r.ok) return toast(r.msg || 'No se pudo eliminar', 'err');
+    CF.d.call = r.call; CFCALL = null; cfPintaUsuarios(); toast('Eliminado', 'ok');
+  } catch (e) { fallaRed(e); }
+}
+
+/* ---------- Pestaña Call Center ---------- */
+function cfCallResumenLideres(ls) {
+  if (!ls || !ls.length) return '<span class="cc-warn">sin líderes</span>';
+  const todos = ls.indexOf(CFCALL_TODOS) >= 0, sin = ls.indexOf(CFCALL_SIN) >= 0;
+  const n = ls.filter(x => x !== CFCALL_TODOS && x !== CFCALL_SIN).length;
+  const p = [];
+  if (todos) p.push('Todos los líderes'); else if (n) p.push(n + ' líder' + (n === 1 ? '' : 'es'));
+  if (sin) p.push('Sin líder');
+  return esc(p.join(' · '));
+}
+
+function cfPintaCall() {
+  if (!CFCALL) cfCallCargar();
+  const us = cfCallD().usuarios.filter(u => u.estado === 'ACTIVO');
+
+  const cuerpo = CFCALL.dias.length ? CFCALL.dias.map(d => `
+    <div class="cc-dia" data-d="${esc(d.dia)}">
+      <div class="cc-dia-h">
+        <b>${esc(cfCallLabel(d.dia))}</b>
+        <button class="cc-ico cc-ico-danger" data-ddel="${esc(d.dia)}" title="Quitar el día" aria-label="Quitar el día">${I.trash}</button>
+      </div>
+      <div class="cc-horas">
+        <div class="cfg-field"><label>Hora de inicio</label><input class="input" type="time" data-hi="${esc(d.dia)}" value="${esc(d.inicio || '')}" /></div>
+        <div class="cfg-field"><label>Hora de término</label><input class="input" type="time" data-hf="${esc(d.dia)}" value="${esc(d.fin || '')}" /></div>
+      </div>
+      ${d.usuarios.length ? `<ul class="cfg-list">${d.usuarios.map(u => `
+        <li class="cfg-row">
+          <div class="cfg-row-t">
+            <b>${esc(cfCallNombre(u.id))}</b>
+            <span class="cfg-row-s">${cfCallResumenLideres(u.lideres)}</span>
+          </div>
+          <div class="cfg-row-a">
+            <button class="cc-ico" data-uld="${esc(d.dia)}" data-ulu="${esc(u.id)}" title="Líderes que trabajará" aria-label="Líderes que trabajará">${I.sliders}</button>
+            <button class="cc-ico cc-ico-danger" data-udel="${esc(d.dia)}" data-uduu="${esc(u.id)}" title="Quitar del día" aria-label="Quitar del día">${I.x}</button>
+          </div>
+        </li>`).join('')}</ul>` : cfVacio('Nadie tiene acceso este día.')}
+      <div class="cfg-actions"><button class="btn btn-quiet" data-uadd="${esc(d.dia)}">${I.plus} Agregar usuario</button></div>
+    </div>`).join('') : cfVacio('Todavía no has agregado días de activación.');
+
+  const aviso = !us.length ? `<p class="cfg-hint" style="margin-bottom:10px;">⚠ No hay usuarios CENTER activos. Créalos primero en la pestaña <b>Usuarios</b>.</p>` : '';
+
+  $('#cf-body').innerHTML = cfCard('Días de Activación',
+    'Los días que opera el call center, su horario y quién entra cada día. Fuera de esa franja el PIN no abre la app.',
+    aviso + cuerpo + `<div class="cfg-actions"><button class="btn btn-quiet" id="cc-dia-add">${I.plus} Agregar día</button></div>`) +
+    `<div class="cfg-actions"><button class="btn btn-primary" id="cc-save">Guardar configuración</button></div>`;
+
+  $('#cc-dia-add').onclick = () => cfCallDiaAgregar();
+  $$('#cf-body [data-ddel]').forEach(b => b.onclick = () => { CFCALL.dias = CFCALL.dias.filter(d => d.dia !== b.dataset.ddel); cfPintaCall(); });
+  $$('#cf-body [data-hi]').forEach(i => i.onchange = () => { const d = CFCALL.dias.filter(x => x.dia === i.dataset.hi)[0]; if (d) d.inicio = i.value; });
+  $$('#cf-body [data-hf]').forEach(i => i.onchange = () => { const d = CFCALL.dias.filter(x => x.dia === i.dataset.hf)[0]; if (d) d.fin = i.value; });
+  $$('#cf-body [data-uadd]').forEach(b => b.onclick = () => cfCallUsuarioAgregar(b.dataset.uadd));
+  $$('#cf-body [data-uld]').forEach(b => b.onclick = () => cfCallLideresSheet(b.dataset.uld, b.dataset.ulu));
+  $$('#cf-body [data-udel]').forEach(b => b.onclick = () => {
+    const d = CFCALL.dias.filter(x => x.dia === b.dataset.udel)[0];
+    if (d) d.usuarios = d.usuarios.filter(u => u.id !== b.dataset.uduu);
+    cfPintaCall();
+  });
+  $('#cc-save').onclick = e => cfCallGuardar(e.currentTarget);
+  cfPintado();   /* 02/08: reabre el bloque y devuelve lo que estabas escribiendo */
+}
+
+function cfCallDiaAgregar() {
+  const libres = CFCALL_DIAS.filter(d => !CFCALL.dias.some(x => x.dia === d[0]));
+  if (!libres.length) return toast('Ya están los siete días', 'err');
+  openSheet(`<div class="grip"></div><h2 class="h2" style="margin-bottom:12px;">Agregar día</h2>
+    <div class="stack">${libres.map(d => `<button class="opt-row" data-v="${d[0]}">${d[1]}</button>`).join('')}
+    <button class="btn btn-quiet btn-block" data-close>Cancelar</button></div>`);
+  layer.querySelectorAll('.opt-row').forEach(b => b.onclick = () => {
+    CFCALL.dias.push({ dia: b.dataset.v, inicio: '08:00', fin: '17:00', usuarios: [] });
+    CFCALL.dias.sort((a, z) => CFCALL_DIAS.findIndex(d => d[0] === a.dia) - CFCALL_DIAS.findIndex(d => d[0] === z.dia));
+    closeLayer(); cfPintaCall();
+  });
+}
+
+function cfCallUsuarioAgregar(dia) {
+  const d = CFCALL.dias.filter(x => x.dia === dia)[0]; if (!d) return;
+  const libres = cfCallD().usuarios.filter(u => u.estado === 'ACTIVO' && !d.usuarios.some(x => x.id === u.id));
+  if (!libres.length) return toast('No quedan usuarios CENTER activos por agregar a este día', 'err');
+  openSheet(`<div class="grip"></div><h2 class="h2" style="margin-bottom:12px;">Agregar usuario · ${esc(cfCallLabel(dia))}</h2>
+    <div class="stack">${libres.map(u => `<button class="opt-row" data-v="${esc(u.id)}">${esc(u.nombre)}</button>`).join('')}
+    <button class="btn btn-quiet btn-block" data-close>Cancelar</button></div>`);
+  layer.querySelectorAll('.opt-row').forEach(b => b.onclick = () => {
+    d.usuarios.push({ id: b.dataset.v, lideres: [] });
+    closeLayer(); cfPintaCall();
+    cfCallLideresSheet(dia, b.dataset.v);   // sin líderes no vería nada: se pregunta de una
+  });
+}
+
+/* Checks de líderes. "Todos" y "Sin líder" son opciones aparte:
+   "Todos" = todos los líderes creados (hoy y los que se creen después);
+   "Sin líder" = los registros que nadie refirió. Se pueden combinar. */
+function cfCallLideresSheet(dia, idUsuario) {
+  const d = CFCALL.dias.filter(x => x.dia === dia)[0]; if (!d) return;
+  const u = d.usuarios.filter(x => x.id === idUsuario)[0]; if (!u) return;
+  const lideres = cfCallD().lideres;
+  const sel = {}; u.lideres.forEach(l => sel[l] = 1);
+
+  openSheet(`<div class="grip"></div>
+    <h2 class="h2">Líderes que trabajará</h2>
+    <p class="muted small">${esc(cfCallNombre(idUsuario))} · ${esc(cfCallLabel(dia))}</p>
+    <div class="stack" style="margin-top:12px;">
+      <label class="check cc-chk"><input type="checkbox" data-l="${CFCALL_TODOS}" ${sel[CFCALL_TODOS] ? 'checked' : ''} /><span><b>Todos los líderes</b></span></label>
+      <label class="check cc-chk"><input type="checkbox" data-l="${CFCALL_SIN}" ${sel[CFCALL_SIN] ? 'checked' : ''} /><span><b>Sin líder</b> <span class="muted">(registros que nadie refirió)</span></span></label>
+      <input class="input" id="cc-q" placeholder="Buscar líder…" autocomplete="off" />
+      <div class="cc-lista" id="cc-lista">
+        ${lideres.map(l => `<label class="check cc-chk cc-l" data-s="${esc((l.nombre + ' ' + l.codigo).toLowerCase())}">
+            <input type="checkbox" data-l="${esc(l.codigo)}" ${sel[l.codigo] ? 'checked' : ''} />
+            <span>${esc(l.nombre)} <span class="muted">· N° ${esc(l.codigo)}</span></span></label>`).join('')}
+      </div>
+      <button class="btn btn-primary btn-block" id="cc-l-ok">Listo</button>
+    </div>`);
+
+  const todosChk = layer.querySelector('[data-l="' + CFCALL_TODOS + '"]');
+  const marcaUno = () => layer.querySelectorAll('#cc-lista input').forEach(i => { i.disabled = todosChk.checked; });
+  marcaUno(); todosChk.onchange = marcaUno;
+
+  $('#cc-q').addEventListener('input', e => {
+    const q = String(e.target.value || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+    layer.querySelectorAll('.cc-l').forEach(el => {
+      const hay = el.dataset.s.normalize('NFD').replace(/[\u0300-\u036f]/g, '').includes(q);
+      el.style.display = hay ? '' : 'none';
+    });
+  });
+
+  $('#cc-l-ok').onclick = () => {
+    const out = [];
+    layer.querySelectorAll('input[data-l]').forEach(i => { if (i.checked) out.push(i.dataset.l); });
+    /* Con "Todos" marcado, los códigos sueltos sobran: se guardaría una lista
+       que miente sobre lo que se ve. */
+    u.lideres = out.indexOf(CFCALL_TODOS) >= 0 ? [CFCALL_TODOS].concat(out.indexOf(CFCALL_SIN) >= 0 ? [CFCALL_SIN] : []) : out;
+    closeLayer(); cfPintaCall();
+  };
+}
+
+async function cfCallGuardar(btn) {
+  /* Se valida aquí lo mismo que valida el backend: así el error sale antes
+     de gastar el viaje y dice exactamente qué día está mal. */
+  for (const d of CFCALL.dias) {
+    const L = cfCallLabel(d.dia);
+    if (!d.inicio || !d.fin) return toast(L + ': faltan las horas', 'err');
+    if (d.fin <= d.inicio) return toast(L + ': la hora de término debe ser mayor que la de inicio', 'err');
+    if (!d.usuarios.length) return toast(L + ': no has agregado usuarios', 'err');
+    for (const u of d.usuarios) if (!u.lideres.length) return toast(L + ' · ' + cfCallNombre(u.id) + ': no tiene líderes', 'err');
+  }
+  saving(btn, true);
+  try {
+    const r = await api('priv.cfgCallGuardar', {}, 'POST', Object.assign(cfAuth(), { dias: CFCALL.dias }));
+    saving(btn, false);
+    if (!r.ok) return toast(r.msg || 'No se pudo guardar', 'err');
+    CF.d.call = r.call; cfCallCargar(); cfPintaCall(); toast('Configuración guardada', 'ok');
+  } catch (e) { saving(btn, false); fallaRed(e); }
+}
+
+function cfPintaAvanzado() {
+  const a = CF.d.avanzado, cfg = CF.d.cfg;
+  const est = (ok2, si, no) => `<span class="cfg-est ${ok2 ? 'ok' : 'no'}">${ok2 ? I.check + ' ' + esc(si) : esc(no)}</span>`;
+
+  const bot = cfCard('🔐 BuilderBot / API (solo DESARROLLADOR)',
+    'El bot de WhatsApp que usan Líderes, Compromisos, Agenda y Servicios. Mismos nombres que en SEP-GROUP.',
+    `<div class="cfg-estados">${est(a.bot.url, 'Endpoint configurado', 'Falta el endpoint')}${est(a.bot.apikey, 'API key guardada', 'FALTA la API key: sin ella el bot no envía')}</div>
+     <div class="cfg-grid">
+      ${cfField('cf-k-BB_API_URL', 'BB_API_URL', cfg.BB_API_URL, 'Endpoint POST. https://app.builderbot.cloud/api/v2/…/messages', true)}
+      ${cfField('cf-k-BB_API_KEY', 'BB_API_KEY', cfg.BB_API_KEY, 'Se manda en el header x-api-builderbot.', true)}
+      ${cfField('cf-k-BB_ENDPOINT_BASE', 'BB_ENDPOINT_BASE', cfg.BB_ENDPOINT_BASE, 'Base del API, sin la ruta.', true)}
+      ${cfField('cf-k-BB_BOT_ID', 'BB_BOT_ID', cfg.BB_BOT_ID, '')}
+      ${cfField('cf-k-BB_PROJECT_ID', 'BB_PROJECT_ID', cfg.BB_PROJECT_ID, '')}
+      ${cfField('cf-k-BB_MANAGER_API', 'BB_MANAGER_API', cfg.BB_MANAGER_API, 'Llave del Manager API.', true)}
+     </div>
+     <div class="cfg-actions">
+       <button class="btn btn-quiet" id="cf-bot-test">Probar envío</button>
+       <button class="btn btn-primary" id="cf-bot-save">Guardar</button>
+     </div>`);
+
+  /* AJUSTE 23/07/2026 · aquí bajaron "Otros enlaces", "Imágenes y marca" y
+     "Otros ajustes", que antes estaban en la pestaña General. Van como
+     sub-bloques de esta misma tarjeta y los salva su botón Guardar. El cálculo
+     de "otras" (claves de la hoja CONFIG que no tienen sitio propio) se hace
+     aquí para que una clave nueva nunca quede invisible — ahora solo la ve el
+     DESARROLLADOR. */
+  const usadas = {};
+  CF_GENERAL.concat(CF_DEV_GRUPOS).forEach(g => g.keys.forEach(k => usadas[k[0]] = 1));
+  CF_APPS.forEach(x => usadas[x[0]] = 1);
+  usadas[CF_COMPARTIR_KEY] = 1;
+  CF_AGENDA_KEYS.forEach(k => usadas[k] = 1);
+  CF_CASA_KEYS.concat(CF_EM_KEYS, CF_AV_KEYS, CF_INICIO_KEYS, CF_OCULTAS, CF_MARCA_KEYS).forEach(k => usadas[k] = 1);
+  (CF.d.plantillas || []).forEach(p => usadas[p.clave] = 1);
+  const otras = Object.keys(cfg).filter(k => !usadas[k]).sort();
+
+  const infraSub = CF_DEV_GRUPOS.map(g => `
+     <div class="cfg-sub">
+       <h4 class="cfg-sub-h">${esc(g.titulo)}</h4>
+       ${g.sub ? `<p class="cfg-hint">${esc(g.sub)}</p>` : ''}
+       <div class="cfg-grid">${g.keys.map(k => cfField('cf-k-' + k[0], k[1], cfg[k[0]], k[2], true)).join('')}</div>
+     </div>`).join('') + (otras.length ? `
+     <div class="cfg-sub">
+       <h4 class="cfg-sub-h">Otros ajustes</h4>
+       <p class="cfg-hint">Claves de la hoja CONFIG que no tienen un sitio propio.</p>
+       <div class="cfg-grid">${otras.map(k => cfField('cf-k-' + k, k, cfg[k], (CF.d.meta[k] || {}).descripcion, true)).join('')}</div>
+     </div>` : '');
+
+  const infra = cfCard('Infraestructura', 'Solo el desarrollador ve esto.',
+    `<div class="cfg-estados">${est(a.firebase.cuentaServicio, 'Firebase: cuenta de servicio puesta', 'Firebase: falta la cuenta de servicio (los push no salen)')}</div>
+     <p class="cfg-hint">La cuenta de servicio de Firebase vive en las Propiedades del Script, no en la hoja. No se puede ver ni editar desde aquí.</p>
+     <div class="cfg-grid">
+      ${cfField('cf-k-DRIVE_QR_FOLDER', 'Carpeta Drive · QR', cfg.DRIVE_QR_FOLDER, '', true)}
+      ${cfField('cf-k-DRIVE_CASA_FOLDER', 'Carpeta Drive · Casa social', cfg.DRIVE_CASA_FOLDER, 'La crea setupModulo9().', true)}
+      ${cfField('cf-k-DRIVE_INICIO_FOLDER', 'Carpeta Drive · Inicio', cfg.DRIVE_INICIO_FOLDER, 'La crea setupModulo91().', true)}
+      ${cfField('cf-k-CAL_EVENTOS', 'Calendario · Eventos', cfg.CAL_EVENTOS, '', true)}
+      ${cfField('cf-k-CAL_AGENDA', 'Calendario · Agenda', cfg.CAL_AGENDA, '', true)}
+     </div>
+     ${infraSub}
+     <div class="cfg-hint" style="margin-top:10px;">Hoja de cálculo: <code>${esc(a.spreadsheetId)}</code></div>
+     <div class="cfg-actions"><button class="btn btn-primary" id="cf-inf-save">Guardar</button></div>`);
+
+  const elim = cfCard('🗑️ Clave de eliminación',
+    'Clave de 6 dígitos que se pide para ELIMINAR un registro en Base de Datos → Detalles → Eliminar. Solo el desarrollador la ve y la edita. Déjala vacía para bloquear la eliminación.',
+    `<div class="cfg-grid">
+      ${cfField('cf-k-CLAVE_ELIMINACION', 'Clave de eliminación', cfg.CLAVE_ELIMINACION, '6 dígitos numéricos.', true)}
+     </div>
+     <div class="cfg-actions"><button class="btn btn-primary" id="cf-elim-save">Guardar</button></div>`);
+
+  /* AGENDA ESTRICTA · 31/07/2026 (solo DESARROLLADOR).
+     En NO se cae todo el control: se puede volver a crear/editar/eliminar
+     sin restricciones. Es el interruptor de emergencia. */
+  const agEst = String(cfg.AGENDA_ESTRICTA || 'SI').trim().toUpperCase() === 'NO' ? 'NO' : 'SI';
+  const agestr = cfCard('🔒 Agenda estricta',
+    'Obliga a cerrar la agenda al día: si quedan reuniones PROGRAMADAS de días anteriores, o A REPROGRAMAR de meses anteriores, no se pueden crear ni editar reuniones de hoy en adelante. Además, una reunión de fecha pasada en PROGRAMADA o REALIZADA no se puede eliminar, solo editar. El DESARROLLADOR está exento siempre.',
+    `<div class="cfg-grid">
+      <div class="cfg-field full"><label>AGENDA_ESTRICTA</label>
+        <select class="input" id="cf-k-AGENDA_ESTRICTA">
+          <option value="SI"${agEst === 'SI' ? ' selected' : ''}>SÍ · control activo</option>
+          <option value="NO"${agEst === 'NO' ? ' selected' : ''}>NO · sin restricciones</option>
+        </select>
+      </div>
+     </div>
+     <div class="cfg-actions"><button class="btn btn-primary" id="cf-agestr-save">Guardar</button></div>`);
+
+  /* 11/11/2026 · motivos de POR CONFIRMAR (js/motivos-pc.js · CORE Motivos_PC.gs) */
+  const pcm = window.MOTIVOS_PC ? cfCard('📋 Motivos de POR CONFIRMAR',
+    'Los que se eligen en Base de datos → Consultar, en la plantilla de carga masiva y los que ve el líder en Validación de registros. Cambian según lo que reporte la Registraduría. No se borran: se desactivan, y los registros que ya los tienen se siguen leyendo.',
+    MOTIVOS_PC.inner(cfg)) : '';
+  $('#cf-body').innerHTML = cfMarcaCard() + cfEleccionCard() + pcm + bot + infra + elim + agestr;
+  if (window.MOTIVOS_PC) MOTIVOS_PC.bind();
+  $('#cf-agestr-save').onclick = e => cfGuardarClaves(e.currentTarget, ['AGENDA_ESTRICTA']);
+  const elimInp = $('#cf-k-CLAVE_ELIMINACION');
+  if (elimInp) { elimInp.setAttribute('inputmode', 'numeric'); elimInp.setAttribute('maxlength', '6'); onlyDigits(elimInp); }
+  $('#cf-elim-save').onclick = async e => {
+    const v = String((elimInp && elimInp.value) || '').replace(/\D/g, '');
+    if (v && !/^\d{6}$/.test(v)) return toast('La clave debe ser de 6 dígitos (o vacía para bloquear)', 'err');
+    const btn = e.currentTarget; saving(btn, true);
+    try {
+      const r = await api('priv.cfgGuardar', {}, 'POST', Object.assign(cfAuth(), { cambios: { CLAVE_ELIMINACION: v } }));
+      saving(btn, false);
+      if (!r.ok) return toast(r.msg || 'No se pudo guardar', 'err');
+      CF.d.cfg.CLAVE_ELIMINACION = v;
+      toast(v ? 'Clave guardada' : 'Clave borrada: eliminación bloqueada', 'ok');
+    } catch (err) { saving(btn, false); fallaRed(err); }
+  };
+  $('#cf-bot-save').onclick = e => cfGuardarClaves(e.currentTarget,
+    ['BB_API_URL', 'BB_API_KEY', 'BB_ENDPOINT_BASE', 'BB_BOT_ID', 'BB_PROJECT_ID', 'BB_MANAGER_API']);
+  $('#cf-inf-save').onclick = e => cfGuardarClaves(e.currentTarget,
+    ['DRIVE_QR_FOLDER', 'DRIVE_CASA_FOLDER', 'DRIVE_INICIO_FOLDER', 'CAL_EVENTOS', 'CAL_AGENDA']
+      .concat(CF_DEV_GRUPOS.reduce((acc, g) => acc.concat(g.keys.map(k => k[0])), []), otras));
+  $('#cf-bot-test').onclick = () => cfBotProbar();
+  cfMarcaBind();
+  cfEleccionBind();
+  cfPintado();   /* 02/08: reabre el bloque y devuelve lo que estabas escribiendo */
+}
+
+/* ---------- MARCA DE CAMPANA (27/07/2026 · Fase 2) ----------
+   Lo que hay que tocar para montar el mismo ecosistema con otro candidato y
+   otro municipio. Solo el DESARROLLADOR.
+
+   EL MUNICIPIO NO ES UN TEXTO. Es el filtro del Dashboard, del Simulador, de
+   la Votacion y de los Insights. Cambiarlo con registros cargados haria que
+   todos esos tableros contaran otra cosa SIN avisar. Por eso se bloquea en
+   cuanto PRINCIPAL tiene datos. El candado de verdad esta en el CORE
+   (marcaGuardaMunicipio_): esto de aqui es solo lo que se ve. */
+function cfMarcaCard() {
+  const m = (CF.d.avanzado && CF.d.avanzado.marca) || null;
+  if (!m) return '';                       // CORE viejo: no rompas la vista
+  const cfg = CF.d.cfg, ef = m.efectivo || {};
+  const bloq = !!m.municipioBloqueado;
+
+  const munVal = esc(m.claves.MARCA_MUNICIPIO || ef.municipio || '');
+  const municipio = bloq
+    ? `<div class="cfg-field full"><label>Municipio de la campaña</label>
+         <input class="input" id="cf-k-MARCA_MUNICIPIO" value="${munVal}" disabled />
+         <div class="cfg-hint"><b>Bloqueado: ya hay registros cargados.</b> El municipio es el filtro del
+           Dashboard, el Simulador, la Votación y los Insights. Si se cambia ahora, esos tableros pasan a
+           contar otra cosa sin avisar. Se fija una sola vez, al montar la campaña.</div></div>`
+    : `<div class="cfg-field full"><label>Municipio de la campaña</label>
+         <input class="input" id="cf-k-MARCA_MUNICIPIO" value="${munVal}" autocomplete="off" />
+         <div class="cfg-hint"><b>Se puede escribir porque la base está vacía.</b> En cuanto entre el primer
+           registro queda bloqueado para siempre. Escríbelo como aparece en la Registraduría.</div></div>`;
+
+  const campos = CF_MARCA_CAMPOS
+    .map(c => cfField('cf-k-' + c[0], c[1], cfg[c[0]], c[2], true)).join('');
+
+  return cfCard('🏷️ Marca de campaña',
+    'Lo que hay que cambiar para montar este mismo ecosistema con otro candidato y otro municipio. Solo el desarrollador.',
+    `<div class="cfg-hint" style="margin-bottom:10px;">Candidato(a): <b>${esc(ef.candidato || '')}</b>
+       · se edita en <b>General → Agenda</b>.</div>
+     <div class="cfg-grid">${municipio}${campos}</div>
+     <div class="cfg-hint" style="margin-top:10px;">
+       Opción de asistencia que se está usando: <b>${esc(ef.fueraOpcion || '')}</b>.
+       Las filas antiguas que digan otro municipio se siguen leyendo bien.<br>
+       Ejemplo de archivo exportado: <code>${esc(ef.exportEjemplo || '')}</code>
+     </div>
+     <div class="cfg-actions"><button class="btn btn-primary" id="cf-marca-save">Guardar</button></div>`);
+}
+
+function cfMarcaBind() {
+  const btn = $('#cf-marca-save');
+  if (!btn) return;
+  const m = (CF.d.avanzado && CF.d.avanzado.marca) || {};
+  btn.onclick = e => {
+    /* Los dos colores se revisan aqui para no mandar basura al PDF. El CORE
+       igual se defiende (marcaHex_ cae al color de fabrica), pero es mejor
+       decirlo antes que descubrirlo en un informe. */
+    const malos = ['MARCA_COLOR', 'MARCA_COLOR_700'].filter(k => {
+      const el = $('#cf-k-' + k), v = String((el && el.value) || '').trim();
+      return v && !/^#?[0-9A-Fa-f]{6}$/.test(v);
+    });
+    if (malos.length) return toast('Los colores van en HEX de 6 dígitos, por ejemplo #007BFF', 'err');
+    /* Si esta bloqueado, el municipio ni se manda: el input esta disabled y
+       ademas el CORE lo rechazaria. */
+    const keys = CF_MARCA_CAMPOS.map(c => c[0]);
+    if (!m.municipioBloqueado) keys.push('MARCA_MUNICIPIO');
+    cfGuardarClaves(e.currentTarget, keys);
+  };
+}
+
+/* ---------- ELECCIONES (17/07/2026) ----------
+   El día y las horas que alimentan los dos conteos regresivos. La fecha usa
+   la MISMA rueda iOS de Agenda/Eventos, con dos diferencias necesarias: mira
+   HACIA ADELANTE (de este año hasta +10) y no tiene tope de "hoy" al revés.
+   Las horas usan el mismo <input type="time"> de Agenda.
+   NO bloquea el registro de votos: es solo información. */
+const CF_ELEC_ANIOS = 10;
+/* Catálogo de puestos de votación (26/07/2026). Se pide aparte, al abrir
+   Avanzado, para no engordar priv.cfgTodo con algo que solo usa el DEV. */
+let CF_PUESTOS = null, CF_PUE_CARGANDO = false;
+function cfEleccionCard() {
+  const cfg = CF.d.cfg;
+  const hoy = new Date().getFullYear();
+  return cfCard('🗳️ Elecciones', 'El día y las horas de la votación. De aquí salen el conteo regresivo del Simulador y el de la vista Votación. No bloquea nada: los votos se pueden registrar cuando sea (pruebas).',
+    `<div class="cfg-grid">
+       <div class="cfg-field full">
+         ${campoFecha('cf-elec-fecha', 'Día de las elecciones', { anios: true, anioMin: hoy, anioMax: hoy + CF_ELEC_ANIOS })}
+         <div class="cfg-hint">Empieza y termina el mismo día.</div>
+       </div>
+       <div class="cfg-field"><label>Hora de inicio</label>
+         <input class="input" id="cf-elec-ini" type="time" value="${esc(cfg.ELECCION_HORA_INICIO || '')}" /></div>
+       <div class="cfg-field"><label>Hora de finalización</label>
+         <input class="input" id="cf-elec-fin" type="time" value="${esc(cfg.ELECCION_HORA_FIN || '')}" /></div>
+     </div>
+     <div class="cfg-actions">
+       <button class="btn btn-quiet cfg-danger" id="cf-elec-clr">Borrar fecha</button>
+       <button class="btn btn-primary" id="cf-elec-save">Guardar</button>
+     </div>
+     <div class="cfg-sub">
+       <h4 class="cfg-sub-h">Puestos de votación</h4>
+       <p class="cfg-hint">Los puestos del municipio. De esta lista salen las barras de <b>Base de datos → Dashboard → Por puesto</b>: lo que no esté aquí se junta en una sola barra <b>Otro municipio</b>. Renombrar uno cambia el nombre en todos los registros; eliminar solo se puede si está en cero.</p>
+       <div id="cf-pue-box"></div>
+       <div class="cfg-actions"><button class="btn btn-quiet" id="cf-pue-add">${I.plus} Agregar puesto</button></div>
+     </div>`);
+}
+
+/* ---------- PUESTOS DE VOTACIÓN (26/07/2026) ---------- */
+function cfPuestosPinta() {
+  const box = $('#cf-pue-box');
+  if (!box) return;
+  if (CF_PUE_CARGANDO) { box.innerHTML = loadingBox('Cargando puestos…'); return; }
+  if (!CF_PUESTOS) { box.innerHTML = `<p class="cfg-empty">No se pudo cargar el catálogo.</p>`; return; }
+  if (!CF_PUESTOS.length) {
+    box.innerHTML = cfVacio('Sin puestos todavía. Mientras la lista esté vacía, el tablero se comporta como antes: muestra todos los puestos tal como vienen.');
+    return;
+  }
+  box.innerHTML = `<ul class="cfg-list">${CF_PUESTOS.map(x => `
+    <li class="cfg-row">
+      <div class="cfg-row-t"><b>${esc(x.puesto)}</b><span class="cfg-row-s">${x.registros.toLocaleString('es-CO')} registro${x.registros === 1 ? '' : 's'}</span></div>
+      <div class="cfg-row-a">
+        <button class="bd-btn" data-pue="${esc(x.id)}" title="Renombrar">${I.pencil}</button>
+        <button class="bd-btn bd-btn-danger" data-puedel="${esc(x.id)}" title="${x.registros ? 'No se puede: tiene registros' : 'Eliminar'}"${x.registros ? ' disabled' : ''}>${I.trash}</button>
+      </div>
+    </li>`).join('')}</ul>`;
+  $$('#cf-pue-box [data-pue]').forEach(b => b.onclick = () => cfPuestoSheet(CF_PUESTOS.filter(x => x.id === b.dataset.pue)[0]));
+  $$('#cf-pue-box [data-puedel]').forEach(b => b.onclick = () => cfPuestoEliminar(CF_PUESTOS.filter(x => x.id === b.dataset.puedel)[0]));
+}
+
+async function cfPuestosCargar() {
+  if (!$('#cf-pue-box')) return;
+  CF_PUE_CARGANDO = true; cfPuestosPinta();
+  try {
+    const r = await api('priv.cfgPuestos', cfAuth());
+    CF_PUESTOS = r.ok ? (r.puestos || []) : null;
+  } catch (e) { CF_PUESTOS = null; }
+  CF_PUE_CARGANDO = false; cfPuestosPinta();
+}
+
+function cfPuestoSheet(x) {
+  openSheet(`<div class="grip"></div>
+    <h2 class="h2">${x ? 'Renombrar puesto' : 'Nuevo puesto'}</h2>
+    <div class="stack" style="margin-top:14px;">
+      ${field('Nombre', inputEl('cf-pue-n', `value="${esc(x ? x.puesto : '')}" placeholder="Ej. IE MANUELA OMAÑA"`))}
+      <p class="small muted">Se guarda sin acento y en mayúsculas. La Ñ sí se respeta.</p>
+      <div id="cf-pue-imp"></div>
+      <button class="btn btn-primary btn-block" id="cf-pue-save">${x ? 'Renombrar' : 'Agregar'}</button>
+      <button class="btn btn-quiet btn-block" data-close>Cancelar</button>
+    </div>`);
+  if (x) api('priv.cfgPuestoImpacto', Object.assign(cfAuth(), { id: x.id })).then(r => {
+    const box = $('#cf-pue-imp'); if (!box || !r.ok) return;
+    box.innerHTML = r.total
+      ? `<div class="cfg-warn">Renombrarlo cambia <b>${r.total.toLocaleString('es-CO')}</b> registro(s): ${r.detalle.map(d => esc(d.hoja) + ' (' + d.filas.toLocaleString('es-CO') + ')').join(', ')}.</div>`
+      : `<div class="cfg-hint">Ningún registro vota en este puesto todavía.</div>`;
+  }).catch(() => {});
+  $('#cf-pue-save').onclick = async e => {
+    const nombre = val('cf-pue-n');
+    if (!nombre) return toast('Escribe el nombre', 'err');
+    saving(e.currentTarget, true);
+    try {
+      const r = await api('priv.cfgPuesto', {}, 'POST', Object.assign(cfAuth(), { id: x ? x.id : '', puesto: nombre }));
+      saving(e.currentTarget, false);
+      if (!r.ok) return toast(r.msg || 'No se pudo', 'err');
+      CF_PUESTOS = r.puestos || []; closeLayer(); cfPuestosPinta();
+      toast(r.filas ? r.nombre + ' · ' + r.filas.toLocaleString('es-CO') + ' registro(s) actualizados' : 'Guardado como ' + r.nombre, 'ok');
+    } catch (err) { saving(e.currentTarget, false); fallaRed(err); }
+  };
+}
+
+async function cfPuestoEliminar(x) {
+  if (!x) return;
+  if (x.registros) return toast('No se puede eliminar: tiene registros', 'err');
+  if (!await confirmar('¿Eliminar este puesto?', crow('Puesto', x.puesto) + crow('Registros', '0') +
+    `<p class="muted small" style="margin-top:8px;">Solo sale del catálogo. Ningún registro cambia.</p>`)) return;
+  try {
+    const r = await api('priv.cfgPuestoEliminar', {}, 'POST', Object.assign(cfAuth(), { id: x.id }));
+    if (!r.ok) return toast(r.msg || 'No se pudo eliminar', 'err');
+    CF_PUESTOS = r.puestos || []; cfPuestosPinta();
+    toast('Puesto eliminado', 'ok');
+  } catch (e) { fallaRed(e); }
+}
+
+function cfEleccionBind() {
+  const f = $('#cf-elec-fecha');
+  if (!f) return;
+  /* CONFIG guarda dd/MM/yyyy (como toda fecha del proyecto); la rueda habla
+     ISO. Se traduce en los dos sentidos aquí y en ningún otro lado. */
+  f.value = ddmmToInput(CF.d.cfg.ELECCION_FECHA || '');
+  bindCampoFecha('cf-elec-fecha');
+  $('#cf-elec-clr').onclick = () => { f.value = ''; fechaSync('cf-elec-fecha'); };
+  $('#cf-pue-add').onclick = () => cfPuestoSheet(null);
+  cfPuestosCargar();
+  $('#cf-elec-save').onclick = async e => {
+    const btn = e.currentTarget;
+    const cambios = {
+      ELECCION_FECHA: inputToDDMM(f.value),
+      ELECCION_HORA_INICIO: val('cf-elec-ini'),
+      ELECCION_HORA_FIN: val('cf-elec-fin')
+    };
+    saving(btn, true);
+    try {
+      const r = await api('priv.cfgGuardar', {}, 'POST', Object.assign(cfAuth(), { cambios }));
+      saving(btn, false);
+      if (!r.ok) return toast(r.msg || 'No se pudo guardar', 'err');
+      Object.assign(CF.d.cfg, cambios);
+      toast(cambios.ELECCION_FECHA ? 'Guardado' : 'Fecha borrada: los conteos quedan en ceros', 'ok');
+    } catch (err) { saving(btn, false); fallaRed(err); }
+  };
+}
+
+function cfBotProbar() {
+  openSheet(`<div class="grip"></div>
+    <h2 class="h2">Probar el bot</h2>
+    <p class="small muted" style="margin-top:6px;">Se manda un WhatsApp de prueba. Guarda los cambios antes de probar.</p>
+    <div class="stack" style="margin-top:14px;">
+      ${field('Número', inputEl('cf-bot-n', 'inputmode="numeric" maxlength="10" placeholder="10 dígitos"'))}
+      <button class="btn btn-primary btn-block" id="cf-bot-go">Enviar prueba</button>
+      <button class="btn btn-quiet btn-block" data-close>Cancelar</button>
+    </div>`);
+  onlyDigits($('#cf-bot-n'));
+  $('#cf-bot-go').onclick = async e => {
+    saving(e.currentTarget, true);
+    try {
+      const r = await api('priv.cfgBotProbar', {}, 'POST', Object.assign(cfAuth(), { numero: val('cf-bot-n') }));
+      saving(e.currentTarget, false);
+      toast(r.msg || (r.ok ? 'Enviado' : 'No se pudo'), r.ok ? 'ok' : 'err');
+      if (r.ok) closeLayer();
+    } catch (err) { saving(e.currentTarget, false); fallaRed(err); }
+  };
+}
+
+/* ============================================================
+   MÓDULO 10 · MI BOT  (control del bot de WhatsApp)
+   ------------------------------------------------------------
+   Lo mismo que el "Mi Bot" de SEP-GROUP, adaptado a esta app: estado de la
+   conexión, QR para vincular, reiniciar, silenciar, eliminar sesión, y por
+   contacto bloquear/desbloquear/limpiar. Dos diferencias a propósito:
+     • ACCESO: aquí lo usan TODOS los roles (DEV, ADMIN y SEDE) — el rol SEDE
+       existe justo para que la casa social reconecte el bot sin llamar a nadie.
+       En SEP-GROUP está reservado a SUPERUSUARIO/DESARROLLADOR.
+     • LISTA DE BLOQUEADOS: aquí se MUESTRA. SEP-GROUP tiene el endpoint pero su
+       vista nunca lo llama, así que allá se bloquea a ciegas.
+   NO hay difusión masiva: mandar en lote por un WhatsApp personal es la vía
+   rápida al baneo del número. Los envíos siguen siendo 1:1 desde cada módulo.
+   Las llaves NUNCA llegan aquí: todo el fetch a BuilderBot lo hace el CORE.
+   Prefijo CSS: bot-
+   ============================================================ */
+const MB = { user: null, silenciado: false, poll: null, cargando: false };
+
+function mbAuth() { return { caller: MB.user ? MB.user.documento : '' }; }
+
+async function viewMiBot(user) {
+  MB.user = user;
+  mbPollStop();
+  appWide(true);   /* AJUSTES 16/07: en PC las tarjetas se reparten a 2 columnas */
+  app.innerHTML = `${backbar('Mi Bot')}
+    <div class="pad stack">
+      <div>
+        <p class="eyebrow">Tu asistente de WhatsApp</p>
+        <h1 class="h1">Mi Bot</h1>
+      </div>
+      <div id="bot-status" class="bot-status bot-unknown">
+        <div class="bot-status-ico"><span class="spinner spinner-brand"></span></div>
+        <div class="bot-status-tx"><b>Consultando el estado…</b><span>Un momento</span></div>
+      </div>
+      <div id="bot-body" class="bot-body">${loadingBox('Cargando…')}</div>
+    </div>`;
+  app.hidden = false; hideSplash();
+  /* Si el usuario se va con el QR abierto, el intervalo debe morir. Se usa el
+     mismo gancho que ya tiene la app para la vista de Votación. */
+  window.__votoTeardown = mbPollStop;
+  $('#backbtn').onclick = () => { mbPollStop(); window.__votoTeardown = null; go('home'); };
+  mbPintaCuerpo();
+  await mbEstado();
+}
+
+/* ---------- Estado ---------- */
+async function mbEstado(silencioso) {
+  const box = $('#bot-status'); if (!box) return;
+  try {
+    const r = await api('priv.botEstado', {}, 'POST', mbAuth());
+    if (!r) return;
+    MB.silenciado = !!r.silenciado;
+    const lbl = $('#bot-mute-lbl'); if (lbl) lbl.textContent = MB.silenciado ? 'Activar' : 'Silenciar';
+
+    if (r.configurado === false) {
+      const faltan = (r.faltantes || []).join(', ');
+      mbPintaEstado('bot-unknown', '⚙️', 'El bot no está configurado',
+        faltan ? `Faltan las llaves: ${faltan}. Se cargan en Configuración → Avanzado.`
+               : 'El desarrollador debe cargar las llaves en Configuración → Avanzado.');
+      return;
+    }
+    const st = String(r.status || 'UNKNOWN').toUpperCase();
+    if (st === 'ONLINE') mbPintaEstado('bot-online', '🟢', 'Tu bot está conectado', 'Funcionando y respondiendo mensajes.');
+    else if (st === 'READY_TO_SCAN') mbPintaEstado('bot-scan', '🟡', 'Esperando que escanees el QR', 'Genera el código aquí abajo y escanéalo.');
+    else if (st === 'OFFLINE' || st === 'FAILED') mbPintaEstado('bot-offline', '🔴', 'Tu bot está desconectado', 'Genera el QR para reconectarlo.');
+    else mbPintaEstado('bot-unknown', '⚪', `Estado: ${esc(st)}`, 'Toca Actualizar para reintentar.');
+  } catch (e) {
+    if (!silencioso) mbPintaEstado('bot-unknown', '⚪', 'No se pudo consultar', 'Revisa tu conexión y toca Actualizar.');
+  }
+}
+function mbPintaEstado(cls, ico, titulo, sub) {
+  const box = $('#bot-status'); if (!box) return;
+  box.className = 'bot-status ' + cls;
+  box.innerHTML = `<div class="bot-status-ico">${ico}</div>
+    <div class="bot-status-tx"><b>${esc(titulo)}</b><span>${esc(sub)}</span></div>
+    <button class="icon-btn" id="bot-refresh" title="Actualizar">${I.reload}</button>`;
+  const rf = $('#bot-refresh'); if (rf) rf.onclick = () => mbEstado();
+}
+
+/* ---------- Cuerpo: las 3 secciones ---------- */
+function mbPintaCuerpo() {
+  $('#bot-body').innerHTML = `
+    <div class="bot-card">
+      <h3 class="bot-card-t">📱 Conectar WhatsApp</h3>
+      <p class="bot-card-s">Escanea el código desde WhatsApp → Dispositivos vinculados. Si el bot ya estuvo vinculado, <b>elimina primero la sesión</b> aquí abajo: escanear encima de una sesión vieja deja la vinculación en bucle.</p>
+      <button class="btn btn-primary btn-block" id="bot-qr-btn">⚡ Inicializar conexión</button>
+      <div id="bot-qr-box" class="bot-qr-box"></div>
+    </div>
+
+    <div class="bot-card">
+      <h3 class="bot-card-t">🛠 Controles del bot</h3>
+      <div class="bot-grid">
+        <button class="bot-act" id="bot-reboot"><span class="bot-act-i">🔄</span>Reiniciar</button>
+        <button class="bot-act" id="bot-mute"><span class="bot-act-i">🔇</span><span id="bot-mute-lbl">Silenciar</span></button>
+      </div>
+      <button class="bot-act bot-act-danger bot-act-full" id="bot-logout"><span class="bot-act-i">🗑️</span>Eliminar sesión</button>
+    </div>
+
+    <div class="bot-card">
+      <h3 class="bot-card-t">👤 Gestionar un contacto</h3>
+      <p class="bot-card-s">Escribe el número con código de país (ej. 573001234567).</p>
+      <input id="bot-num" class="input" inputmode="numeric" placeholder="573001234567" />
+      <div class="bot-grid" style="margin-top:10px;">
+        <button class="bot-act" id="bot-block"><span class="bot-act-i">🚫</span>Bloquear</button>
+        <button class="bot-act" id="bot-unblock"><span class="bot-act-i">✅</span>Desbloquear</button>
+      </div>
+      <button class="bot-act bot-act-full" id="bot-clear"><span class="bot-act-i">🧹</span>Limpiar conversación</button>
+    </div>
+
+    <div class="bot-card">
+      <h3 class="bot-card-t">🚫 Números bloqueados</h3>
+      <p class="bot-card-s">A estos el bot no les responde.</p>
+      <div id="bot-bl">${loadingBox('Cargando…')}</div>
+    </div>`;
+
+  $('#bot-qr-btn').onclick = mbQR;
+  $('#bot-reboot').onclick = mbReiniciar;
+  $('#bot-mute').onclick = mbMute;
+  $('#bot-logout').onclick = mbEliminarSesion;
+  $('#bot-block').onclick = () => mbContacto('priv.botBloquear', 'Bloquear número', 'El bot dejará de responderle.');
+  $('#bot-unblock').onclick = () => mbContacto('priv.botDesbloquear', 'Desbloquear número', 'El bot volverá a responderle.');
+  $('#bot-clear').onclick = () => mbContacto('priv.botLimpiar', 'Limpiar conversación', 'Se borra el historial de esa conversación en el bot.');
+  $('#bot-num').oninput = e => { e.target.value = e.target.value.replace(/\D/g, ''); };
+  mbBlacklist();
+}
+
+/* ---------- QR ---------- */
+async function mbQR() {
+  const box = $('#bot-qr-box'), btn = $('#bot-qr-btn');
+  saving(btn, true);
+  box.innerHTML = loadingBox('Preparando la conexión… si el bot estaba apagado puede tardar unos segundos.');
+  try {
+    const r = await api('priv.botQR', {}, 'POST', mbAuth());
+    saving(btn, false);
+    const qr = r && r.qr ? String(r.qr) : '';
+    if (!qr) {
+      btn.textContent = '📲 Generar QR';
+      box.innerHTML = `<p class="small muted center">${esc((r && r.error) || 'Conexión inicializada. Toca Generar QR para ver el código.')}</p>`;
+      return;
+    }
+    const src = qr.indexOf('data:') === 0 ? qr : (/^https?:\/\//.test(qr) ? qr : 'data:image/png;base64,' + qr);
+    box.innerHTML = `<img class="bot-qr" id="bot-qr-img" src="${esc(src)}" alt="Código QR de WhatsApp" />
+      <p class="small muted center">Escanéalo desde WhatsApp → <b>Dispositivos vinculados</b>. El código se renueva cada cierto tiempo.</p>
+      <button class="bot-act bot-act-full" id="bot-qr-regen"><span class="bot-act-i">🔄</span>Regenerar QR</button>`;
+    btn.textContent = '📲 Generar QR';
+    $('#bot-qr-regen').onclick = mbQR;
+    mbPollStart();
+  } catch (e) {
+    saving(btn, false);
+    box.innerHTML = `<p class="small muted center">No se pudo generar el QR. Revisa tu conexión.</p>`;
+  }
+}
+
+/* Mientras el QR está en pantalla, se revisa el estado cada 60s. Al conectar,
+   se detiene y se marca el QR como usado. */
+function mbPollStart() {
+  mbPollStop();
+  MB.poll = setInterval(async () => {
+    const img = $('#bot-qr-img');
+    if (!img) return mbPollStop();
+    await mbEstado(true);
+    const st = $('#bot-status');
+    if (st && st.classList.contains('bot-online')) {
+      mbPollStop();
+      img.classList.add('bot-qr-ok');
+      if (!$('#bot-qr-msg')) img.insertAdjacentHTML('afterend',
+        `<div class="bot-qr-done" id="bot-qr-msg">🟢 <b>WhatsApp conectado</b><br><span class="small">Ya puedes salir de esta vista.</span></div>`);
+      mbBlacklist();
+    }
+  }, 60000);
+}
+function mbPollStop() { if (MB.poll) { clearInterval(MB.poll); MB.poll = null; } }
+
+/* ---------- Controles ---------- */
+async function mbReiniciar() {
+  if (!await confirmar('¿Reiniciar el bot?', crow('Qué pasa', 'Se reinicia y tarda unos segundos') + crow('La sesión de WhatsApp', 'NO se pierde'))) return;
+  const b = $('#bot-reboot'); saving(b, true);
+  try {
+    const r = await api('priv.botReiniciar', {}, 'POST', mbAuth());
+    saving(b, false);
+    toast(r.msg || (r.ok ? 'Bot reiniciado' : 'No se confirmó'), r.ok ? 'ok' : 'err');
+    setTimeout(() => mbEstado(), 2500);
+  } catch (e) { saving(b, false); fallaRed(e); }
+}
+
+async function mbMute() {
+  const nuevo = !MB.silenciado;
+  const ok = await confirmar(nuevo ? '¿Silenciar el bot?' : '¿Activar el bot?',
+    nuevo ? crow('Qué pasa', 'Deja de responder mensajes') + crow('Se revierte', 'Sí, cuando quieras')
+          : crow('Qué pasa', 'Vuelve a responder mensajes'));
+  if (!ok) return;
+  const b = $('#bot-mute'); saving(b, true);
+  try {
+    const r = await api('priv.botMute', {}, 'POST', Object.assign(mbAuth(), { flag: nuevo }));
+    saving(b, false);
+    if (r.ok) {
+      MB.silenciado = nuevo;
+      const l = $('#bot-mute-lbl'); if (l) l.textContent = nuevo ? 'Activar' : 'Silenciar';
+    }
+    toast(r.msg || 'Listo', r.ok ? 'ok' : 'err');
+  } catch (e) { saving(b, false); fallaRed(e); }
+}
+
+async function mbEliminarSesion() {
+  const ok = await confirmar('¿Eliminar la sesión de WhatsApp?',
+    crow('Qué pasa', 'El bot se desconecta') +
+    crow('Para volver', 'Hay que escanear un QR nuevo') +
+    crow('Mientras tanto', 'El bot NO responde a nadie'));
+  if (!ok) return;
+  const b = $('#bot-logout'); saving(b, true);
+  try {
+    const r = await api('priv.botEliminarSesion', {}, 'POST', mbAuth());
+    saving(b, false);
+    toast(r.msg || 'Listo', r.ok ? 'ok' : 'err');
+    setTimeout(() => mbEstado(), 2500);
+  } catch (e) { saving(b, false); fallaRed(e); }
+}
+
+/* ---------- Por contacto ---------- */
+async function mbContacto(accion, titulo, queHace) {
+  const num = String($('#bot-num').value || '').replace(/\D/g, '');
+  if (num.length < 8) return toast('Escribe el número con código de país (ej. 573001234567)', 'err');
+  if (!await confirmar(titulo + '?', crow('Número', num) + crow('Qué pasa', queHace))) return;
+  try {
+    const r = await api(accion, {}, 'POST', Object.assign(mbAuth(), { numero: num }));
+    toast(r.msg || 'Listo', r.ok ? 'ok' : 'err');
+    if (r.ok && accion !== 'priv.botLimpiar') { $('#bot-num').value = ''; mbBlacklist(); }
+  } catch (e) { fallaRed(e); }
+}
+
+/* ---------- Lista de bloqueados ---------- */
+async function mbBlacklist() {
+  const box = $('#bot-bl'); if (!box) return;
+  try {
+    const r = await api('priv.botBlacklist', {}, 'POST', mbAuth());
+    if (!r || r.configurado === false) { box.innerHTML = `<p class="small muted">Se ve cuando el bot esté configurado.</p>`; return; }
+    const ph = r.phones || [];
+    if (!ph.length) { box.innerHTML = `<p class="small muted">No hay ningún número bloqueado.</p>`; return; }
+    box.innerHTML = `<ul class="bot-bl">${ph.map(n => `<li class="bot-bl-row">
+        <span class="bot-bl-n">${esc(n)}</span>
+        <button class="bd-btn" data-unb="${esc(n)}" title="Desbloquear">${I.check}</button>
+      </li>`).join('')}</ul>`;
+    $$('#bot-bl [data-unb]').forEach(b => b.onclick = async () => {
+      const n = b.dataset.unb;
+      if (!await confirmar('¿Desbloquear ' + n + '?', crow('Qué pasa', 'El bot vuelve a responderle'))) return;
+      try {
+        const r2 = await api('priv.botDesbloquear', {}, 'POST', Object.assign(mbAuth(), { numero: n }));
+        toast(r2.msg || 'Listo', r2.ok ? 'ok' : 'err');
+        if (r2.ok) mbBlacklist();
+      } catch (e) { fallaRed(e); }
+    });
+  } catch (e) { box.innerHTML = `<p class="small muted">No se pudo cargar la lista.</p>`; }
+}

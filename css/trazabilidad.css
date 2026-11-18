@@ -1,0 +1,104 @@
+/* ============ TRAZABILIDAD (BD → Detalles · 07/11/2026) ============ */
+.tz-head { align-items: flex-start; }
+.tz-quien { display: flex; gap: 12px; align-items: center; min-width: 0; }
+.tz-quien .h2 { margin: 0; line-height: 1.2; }
+.tz-tabs { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; border-bottom: 1px solid var(--line); margin: 4px 0 14px; padding-bottom: 8px; }
+.tz-tab { border: 0; background: transparent; font: 700 .9rem var(--font-display); color: var(--muted); padding: 8px 12px; border-radius: 10px; cursor: pointer; }
+.tz-tab.on { background: var(--brand-050); color: var(--brand); }
+.tz-const { margin-left: auto; padding: 9px 14px; font-size: .85rem; display: inline-flex; gap: 6px; align-items: center; }
+.tz-const svg { width: 16px; height: 16px; }
+.tz-kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 8px; margin-bottom: 12px; }
+.tz-kpis > div { background: var(--brand-050); border-radius: 14px; padding: 10px 12px; display: flex; flex-direction: column; gap: 2px; min-height: 64px; }
+.tz-kpis b { font: 800 1.35rem/1 var(--font-display); color: var(--brand); }
+.tz-kpis span { font-size: .76rem; color: var(--muted); font-weight: 600; }
+.tz-kpis i { font-style: normal; font-size: .7rem; color: #15803d; font-weight: 700; }
+.tz-kpis .tz-k-voto { background: rgba(21,128,61,.1); }
+.tz-kpis .tz-k-voto b { color: #15803d; }
+.tz-skel { min-height: 64px; border-radius: 14px; background: linear-gradient(90deg, var(--line), var(--surface), var(--line)); background-size: 200% 100%; animation: tzsk 1.2s infinite; }
+@keyframes tzsk { to { background-position: -200% 0; } }
+.tz-chips { margin: 0 0 10px; }
+.tz-chips .bd-chip i { font-style: normal; opacity: .7; }
+.tz-line { list-style: none; margin: 0; padding: 0 0 0 4px; position: relative; display: flex; flex-direction: column; gap: 4px; }
+.tz-line::before { content: ''; position: absolute; left: 21px; top: 8px; bottom: 8px; width: 2px; background: var(--line); border-radius: 2px; }
+.tz-item { position: relative; display: flex; gap: 12px; padding: 8px 6px; border-radius: 14px; }
+.tz-item:hover { background: var(--brand-050); }
+.tz-ico { position: relative; z-index: 1; flex: 0 0 34px; width: 34px; height: 34px; border-radius: 50%; display: grid; place-items: center; background: var(--surface); border: 2px solid currentColor; }
+.tz-ico svg { width: 16px; height: 16px; }
+.tz-c { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; padding-top: 2px; }
+.tz-r1 { display: flex; gap: 8px; align-items: flex-start; justify-content: space-between; }
+.tz-r1 b { font-size: .92rem; line-height: 1.3; color: var(--ink, inherit); }
+.tz-c p { margin: 0; font-size: .82rem; color: var(--muted); line-height: 1.4; word-break: break-word; }
+.tz-f { font-size: .72rem; color: var(--muted); font-weight: 600; }
+.tz-est { flex: 0 0 auto; font-size: .68rem; font-weight: 800; padding: 3px 8px; border-radius: 999px; background: var(--line); color: var(--muted); white-space: nowrap; }
+.tz-e-ok { background: rgba(21,128,61,.12); color: #15803d; }
+.tz-e-no { background: rgba(214,69,69,.12); color: #c0392b; }
+.tz-e-pend { background: #FFF4E5; color: #8A4B00; }
+.tz-c-base { color: #64748b; } .tz-c-lider { color: #d4a017; } .tz-c-serv { color: #0ea5e9; } .tz-c-comp { color: #16a34a; }
+.tz-c-tarea { color: #7c3aed; } .tz-c-ev { color: #e11d48; } .tz-c-idea { color: #f59e0b; } .tz-c-form { color: var(--brand); }
+.tz-c-voto { color: #15803d; } .tz-c-com { color: #db2777; } .tz-c-res { color: #eab308; } .tz-c-seg { color: #0d9488; }
+.tz-skel-i i { width: 34px; height: 34px; border-radius: 50%; background: var(--line); flex: 0 0 34px; }
+.tz-skel-i b, .tz-skel-i span { display: block; height: 12px; border-radius: 6px; background: var(--line); margin: 4px 0; }
+.tz-skel-i b { width: 60%; } .tz-skel-i span { width: 35%; }
+/* 08/11/2026 · antes '.tz-sheet { position: relative; }' le quitaba el position: fixed de .sheet:
+   la hoja de Detalles se pintaba al final de la lista (miles de tarjetas) y no se veía.
+   Con fixed sigue sirviendo de contenedor para la vista previa de la Constancia. */
+/* 08/11/2026 · barra de acciones al pie de la ficha (Editar · Inactivar · Eliminar), visible en las dos pestañas */
+.tz-acc { position: sticky; bottom: calc(-1 * max(22px, env(safe-area-inset-bottom))); z-index: 2;
+  display: flex; gap: 8px; justify-content: flex-end; flex-wrap: wrap;
+  margin: 16px -22px calc(-1 * max(22px, env(safe-area-inset-bottom)));
+  padding: 12px 22px max(14px, env(safe-area-inset-bottom));
+  background: var(--surface); border-top: 1px solid var(--line); box-shadow: 0 -8px 18px rgba(0,0,0,.06); }
+.tz-acc[hidden] { display: none; }
+.tz-acc .btn { display: inline-flex; align-items: center; justify-content: center; gap: 7px; padding: 10px 16px; font-size: .88rem; }
+.tz-acc .btn svg { width: 17px; height: 17px; flex: 0 0 17px; }
+.tz-acc .btn[disabled] { opacity: .55; }
+.btn-wa { background: #25D366; color: #fff; border: 0; }
+.btn-wa svg { width: 18px; height: 18px; }
+html.oscuro .tz-ico { background: var(--surface); }
+html.oscuro .tz-e-pend { background: #3a2a0c; color: #F5C26B; }
+@media (max-width: 560px) {
+  .tz-const { margin-left: 0; width: 100%; justify-content: center; }
+  .tz-kpis { grid-template-columns: repeat(3, 1fr); }
+  .tz-acc { justify-content: stretch; }
+  .tz-acc .btn { flex: 1 1 0; padding: 10px 8px; }
+}
+
+/* ============ ANÁLISIS → RESEÑAS de Solicitudes y Gestiones (07/11/2026) ============ */
+.rsg-top { display: grid; grid-template-columns: minmax(180px, 260px) 1fr; gap: 12px; margin-bottom: 12px; }
+.rsg-prom { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px; text-align: center; }
+.rsg-prom > b { font: 800 2.6rem/1 var(--font-display); color: var(--ink, inherit); }
+.rsg-prom > span { font-size: .8rem; color: var(--muted); }
+.rsg-st { display: inline-flex; gap: 2px; }
+.rsg-st i { width: 17px; height: 17px; display: inline-flex; }
+.rsg-st svg { width: 100%; height: 100%; fill: var(--line); }
+.rsg-st i.on svg { fill: #F5B301; }
+.rsg-prom .rsg-st i { width: 22px; height: 22px; }
+.rsg-dist { display: flex; flex-direction: column; gap: 6px; justify-content: center; }
+.rsg-drow, .rsg-bar { display: grid; grid-template-columns: 44px 1fr 34px; gap: 10px; align-items: center; border: 0; background: transparent; padding: 3px 6px; border-radius: 10px; cursor: pointer; text-align: left; color: inherit; font: inherit; }
+.rsg-drow:hover, .rsg-bar:hover, .rsg-drow.on, .rsg-bar.on { background: var(--brand-050); }
+.rsg-drow span:first-child { font-weight: 800; font-size: .85rem; }
+.rsg-drow em, .rsg-bar em { font-style: normal; font-size: .8rem; color: var(--muted); text-align: right; }
+.rsg-bt { height: 10px; border-radius: 999px; background: var(--line); overflow: hidden; }
+.rsg-bt i { display: block; height: 100%; border-radius: inherit; background: #F5B301; }
+.rsg-bars { display: flex; flex-direction: column; gap: 4px; }
+.rsg-bar { grid-template-columns: minmax(90px, 1.2fr) 2fr 52px 28px; }
+.rsg-bl { font-size: .84rem; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.rsg-bar b { font-size: .8rem; }
+.rsg-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 10px; }
+.rsg-card { background: var(--surface); border: 1px solid var(--line); border-radius: 16px; padding: 12px 14px; display: flex; flex-direction: column; gap: 6px; }
+.rsg-card p { margin: 0; font-size: .9rem; line-height: 1.4; }
+.rsg-baja { border-color: rgba(214,69,69,.45); background: linear-gradient(135deg, rgba(214,69,69,.06), transparent); }
+.rsg-r1 { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.rsg-meta { font-size: .78rem; color: var(--muted); }
+.rsg-limpiar { border: 0; background: none; color: var(--brand); font-weight: 700; cursor: pointer; padding: 0; }
+@media (max-width: 640px) { .rsg-top { grid-template-columns: 1fr; } }
+
+/* ============ CONFIG → Casa social: redes con su logo (08/11/2026) ============ */
+.cfg-row-red { align-items: center; gap: 12px; }
+.cfg-row-red > .red-logo { width: 34px; height: 34px; flex: 0 0 34px; border-radius: 9px; }
+.cf-redsel { display: grid; grid-template-columns: repeat(auto-fill, minmax(78px, 1fr)); gap: 8px; margin-top: 6px; }
+.cf-redop { display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 10px 4px 8px; border-radius: 14px; border: 2px solid var(--line); background: var(--surface); color: inherit; font: 700 .74rem var(--font-body, inherit); cursor: pointer; }
+.cf-redop .red-logo { width: 34px; height: 34px; border-radius: 9px; }
+.cf-redop.on { border-color: var(--brand); background: var(--brand-050); }
+#cf-rd-av { color: #8A4B00; }
+html.oscuro #cf-rd-av { color: #F5C26B; }
