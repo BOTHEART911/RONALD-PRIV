@@ -2745,3 +2745,10 @@ body.wide-xl .an-tabs { max-width: 640px; }
 .bd-card.bd-otro      { background: #FDF5F5; }
 html.oscuro .bd-card.bd-flandes, html.oscuro .bd-card.bd-sin, html.oscuro .bd-card.bd-espera,
 html.oscuro .bd-card.bd-confirmar, html.oscuro .bd-card.bd-otro { background: var(--surface); }
+
+/* ---------- Arrastre horizontal con el mouse (js/arrastre-x.js, 19/11/2026) ---------- */
+@media (pointer: fine) {
+  .ax-puede { cursor: grab; }
+  html.ax-arrastre, html.ax-arrastre * { cursor: grabbing !important; user-select: none; -webkit-user-select: none; }
+  .ax-arrastrando { scroll-behavior: auto; }
+}
