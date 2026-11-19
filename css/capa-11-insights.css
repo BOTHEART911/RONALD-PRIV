@@ -313,7 +313,7 @@
 
 /* ---------- Aviso de la tarjeta de Configuración ---------- */
 .ia-cfg-aviso {
-  border-left: 3px solid var(--danger);
+  border: 2px solid var(--danger);
   padding-left: 10px;
 }
 
